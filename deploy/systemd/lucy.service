@@ -1,0 +1,68 @@
+[Unit]
+Description=Lucy the Goose voice companion
+Documentation=file:///opt/lucy/src/README.md file:///opt/lucy/src/docs/OPERATIONS.md
+# No wait for network-online: if Wi-Fi is down, Lucy says so out loud instead of staying silent.
+Wants=network.target
+After=sound.target network.target
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=lucy
+Group=lucy
+SupplementaryGroups=audio gpio
+WorkingDirectory=/opt/lucy
+Environment=PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+# The API key is handed over as a credential: readable only by this service, never in the environment.
+LoadCredential=groq_api_key:/etc/lucy/credentials/groq_api_key
+# "+" runs as root outside the sandbox: let the lucy group switch CPU governors (lucy.adapters.power).
+ExecStartPre=+/bin/sh -c 'for f in /sys/devices/system/cpu/cpufreq/policy*/scaling_governor; do [ -e "$$f" ] && chgrp lucy "$$f" && chmod g+w "$$f"; done; true'
+ExecStart=/opt/lucy/venv/bin/lucy --config /etc/lucy/config.toml run
+
+# Self-healing: restart on crash or a wedged event loop, but not on a configuration error (exit 78).
+Restart=always
+RestartSec=2
+RestartPreventExitStatus=78
+WatchdogSec=30
+TimeoutStartSec=120
+TimeoutStopSec=15
+
+# Responsiveness: Lucy wins CPU contention against background housekeeping.
+Nice=-5
+OOMScoreAdjust=-500
+MemoryHigh=700M
+MemoryMax=1G
+
+# Only privilege: toggling Wi-Fi power saving with `iw`.
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+
+# Sandbox. /sys stays writable (ProtectKernelTunables=no) for the CPU governor files only
+# the lucy group may write; everything else on disk is read-only.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=no
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+DevicePolicy=closed
+DeviceAllow=char-alsa rw
+DeviceAllow=char-gpiochip rw
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

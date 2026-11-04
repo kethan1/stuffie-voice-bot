@@ -1,0 +1,96 @@
+# Lucy the Goose: runtime configuration (installed to /etc/lucy/config.toml).
+#
+# Every key is optional. Anything left out uses the built-in default shown here.
+# Unknown keys are rejected, so typos are caught at start-up. Check changes with:
+#   sudo lucy doctor
+#
+# The Groq API key does NOT go in this file. See README.md, "API key".
+
+log_level = "info"
+# system_prompt_file = "/etc/lucy/system_prompt.txt"   # replace Lucy's built-in personality
+
+[api]
+base_url = "https://api.groq.com/openai/v1"   # any OpenAI-compatible endpoint works
+connect_timeout_s = 3.0
+keepalive_s = 120.0                           # keep the TLS connection warm between turns
+
+[stt]
+model = "whisper-large-v3-turbo"
+language = "en"                # pinning the language skips detection: faster and more accurate
+prompt = ""                    # optional spelling hints, e.g. "Lucy, goose"
+timeout_s = 8.0
+no_speech_threshold = 0.6      # drop segments Whisper thinks are not speech
+
+[llm]
+model = "openai/gpt-oss-20b"
+fallback_model = "openai/gpt-oss-120b"   # separate free-tier quota; "" disables fallback
+timeout_s = 10.0
+history_exchanges = 6                    # how many back-and-forths Lucy remembers
+
+[llm.params]                             # sent verbatim with every chat request
+reasoning_effort = "low"
+include_reasoning = false
+max_completion_tokens = 512              # includes the (few) reasoning tokens
+temperature = 0.8
+
+[llm.fallback_params]
+reasoning_effort = "low"
+include_reasoning = false
+max_completion_tokens = 512
+temperature = 0.8
+
+[safety]
+screen = true                  # on-device distress screen; keep this on for children
+extra_patterns = []            # more regular expressions that route to "tell a grown-up"
+
+[tts]
+voice = "/opt/lucy/voices/en_US-amy-medium.onnx"
+threads = 3                    # leave one core free for audio and the event loop
+length_scale = 1.0             # > 1.0 speaks more slowly
+volume = 0.9
+
+[audio]
+input_device = ""              # "" = ALSA default (configured by deploy/alsa/asound.conf)
+output_device = ""
+input_sample_rate = 16000      # Whisper's native rate
+output_latency_s = 0.08
+output_blocksize = 1024
+
+[button]
+backend = "gpio"               # "keyboard" = press Enter to talk (bring-up over SSH)
+chip = "/dev/gpiochip0"
+line = 17                      # BCM numbering: physical pin 11; wire the button to GND
+active_low = true
+debounce_ms = 15
+
+[led]
+enabled = true
+chip = "/dev/gpiochip0"
+line = 27                      # BCM 27 = physical pin 13, through a 330 ohm resistor
+active_low = false
+
+[power]
+manage_cpu_governor = true
+active_governor = "performance"
+standby_governor = "ondemand"
+dormant_governor = "powersave"
+manage_wifi = true             # Wi-Fi power save off while talking, on while dormant
+wifi_interface = "wlan0"
+
+[turn]
+min_speech_s = 0.3
+speech_threshold_dbfs = -50.0  # check your mic with `lucy doctor --listen`
+sentence_pause_s = 0.2
+clause_pause_s = 0.08
+first_clause_min_words = 4
+max_chunk_words = 30
+log_transcripts = false        # privacy: keep children's words out of the journal
+
+[session]
+tap_max_s = 0.3                # a shorter press is a tap: stops Lucy, or explains how to talk
+max_record_s = 15.0
+awake_s = 45.0                 # stay fast this long after a turn, then go dormant
+forget_after_s = 300.0         # then forget the conversation entirely
+max_turns_per_hour = 120       # protects the API quota from a stuck or hammered button
+greet_on_start = true
+earcons = true

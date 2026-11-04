@@ -1,0 +1,98 @@
+"""Ports: the interfaces the core depends on.
+
+The core (controller, pipeline, conversation) only ever talks to these
+protocols. Concrete adapters (Groq over HTTP, Piper, PortAudio, libgpiod, ...)
+live in :mod:`lucy.adapters` and are wired together in :mod:`lucy.app`. Tests
+substitute in-memory fakes, so the whole conversation flow is exercised
+without a network, a sound card, or a Raspberry Pi.
+"""
+
+import asyncio
+from collections.abc import AsyncGenerator, AsyncIterator, Sequence
+from typing import Protocol
+
+from lucy.core.audio import Pcm
+from lucy.core.types import Assessment, ButtonEvent, Message, PowerMode, Status
+
+
+class SpeechToText(Protocol):
+    async def transcribe(self, speech: Pcm) -> str:
+        """Return what was said (empty if nothing intelligible)."""
+        ...
+
+
+class ChatModel(Protocol):
+    def stream(self, messages: Sequence[Message]) -> AsyncGenerator[str, None]:
+        """Stream the reply as text deltas, as soon as the model produces them."""
+        ...
+
+
+class Moderator(Protocol):
+    async def assess(self, text: str) -> Assessment:
+        """Decide whether a child's message may be answered by the language model."""
+        ...
+
+
+class TextToSpeech(Protocol):
+    @property
+    def sample_rate(self) -> int: ...
+
+    async def synthesize(self, text: str) -> Pcm:
+        """Render one short chunk of text (a sentence or clause)."""
+        ...
+
+
+class Microphone(Protocol):
+    async def start(self) -> None:
+        """Open the capture device and start recording."""
+        ...
+
+    async def stop(self) -> Pcm:
+        """Stop recording, close the device, and return everything captured."""
+        ...
+
+
+class Speaker(Protocol):
+    def enqueue(self, audio: Pcm) -> asyncio.Future[None]:
+        """Queue audio for gapless playback.
+
+        The future resolves once the clip has been handed to the sound card.
+        Cancelling the future removes the clip if it has not started playing.
+        """
+        ...
+
+    def stop(self) -> bool:
+        """Silence immediately and drop everything queued. True if anything was playing."""
+        ...
+
+    async def open(self) -> None:
+        """Open the output device ahead of time so the first word is not delayed."""
+        ...
+
+    async def close(self) -> None:
+        """Release the output device so the amplifier and sound card can idle."""
+        ...
+
+
+class Button(Protocol):
+    def events(self) -> AsyncIterator[ButtonEvent]:
+        """Debounced press/release events, for as long as the iterator is consumed."""
+        ...
+
+
+class Indicator(Protocol):
+    def show(self, status: Status) -> None: ...
+
+
+class PowerControl(Protocol):
+    async def apply(self, mode: PowerMode) -> None: ...
+
+    async def restore(self) -> None:
+        """Put the system back the way it was before Lucy started."""
+        ...
+
+
+class Prewarmable(Protocol):
+    def prewarm(self) -> None:
+        """Start getting ready (DNS, TCP, TLS) for a request that is about to come."""
+        ...

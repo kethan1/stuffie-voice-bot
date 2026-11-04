@@ -1,0 +1,23 @@
+# >>> lucy >>>
+# Lucy the Goose: headless power tuning for the Raspberry Pi 4B.
+# Managed by deploy/install.sh --tune; edit or delete this block to undo.
+# (config.txt does not allow comments on the same line as a setting.)
+# [all] first: config.txt may end inside a model-specific section such as [cm4].
+[all]
+
+# The onboard 3.5 mm audio is unused: Lucy plays through I2S or USB.
+dtparam=audio=off
+
+# The Bluetooth radio is unused.
+dtoverlay=disable-bt
+
+# Board LEDs off: saves a little power and stops them glowing through the plush.
+dtparam=act_led_trigger=none
+dtparam=act_led_activelow=off
+dtparam=pwr_led_trigger=none
+dtparam=pwr_led_activelow=off
+
+# No camera or display is ever attached, so skip probing for them at boot.
+camera_auto_detect=0
+display_auto_detect=0
+# <<< lucy <<<

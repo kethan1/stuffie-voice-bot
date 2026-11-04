@@ -1,0 +1,198 @@
+"""``lucy doctor``: check everything Lucy needs, and say what to fix.
+
+Run it after installing, after rewiring, or whenever Lucy is quiet. It checks
+the configuration, API key, voice, sound devices, GPIO lines, network/API
+access, and power controls. With ``--listen`` it also records three seconds so
+microphone levels can be checked against ``turn.speech_threshold_dbfs``.
+"""
+
+import asyncio
+import inspect
+import os
+import shutil
+import time
+from collections.abc import Awaitable, Callable
+from pathlib import Path
+
+from lucy.adapters.power import CPUFREQ_ROOT
+from lucy.app import build_cloud, load_voice
+from lucy.config import Config, device, read_api_key
+from lucy.core.audio import level_dbfs, trim_silence
+from lucy.core.errors import LucyError
+
+OK, WARN, FAIL = "✔", "!", "✘"
+
+Probe = Callable[[Config], Awaitable[str] | str]
+
+
+async def doctor(config: Config, config_path: Path | None, *, listen: bool) -> int:
+    print(f"Lucy doctor (config: {config_path or 'built-in defaults'})")
+    probes: list[tuple[str, Probe]] = [
+        ("API key", api_key),
+        ("Piper voice", voice),
+        ("speaker", speaker),
+        ("microphone", microphone),
+    ]
+    if listen:
+        probes.append(("microphone level", microphone_level))
+    if config.button.backend == "gpio":
+        probes.append(("button GPIO", button_line))
+    if config.led.enabled:
+        probes.append(("LED GPIO", led_line))
+    probes.append(("AI service", service))
+    if config.power.manage_cpu_governor:
+        probes.append(("CPU governor", cpu_governor))
+    if config.power.manage_wifi:
+        probes.append(("Wi-Fi power save", wifi_power_save))
+
+    failures = 0
+    for name, probe in probes:
+        mark, detail = await _run(probe, config)
+        failures += mark == FAIL
+        print(f" {mark} {name}" + (f": {detail}" if detail else ""))
+    print("\nall good, honk!" if not failures else f"\n{failures} problem(s) found")
+    return 1 if failures else 0
+
+
+async def _run(probe: Probe, config: Config) -> tuple[str, str]:
+    try:
+        result = probe(config)
+        return OK, await result if inspect.isawaitable(result) else result
+    except Warning as warning:
+        return WARN, str(warning)
+    except Exception as error:  # every failure is reported; none aborts the run
+        return FAIL, f"{type(error).__name__}: {error}"
+
+
+def api_key(config: Config) -> str:
+    key = read_api_key(config.api)
+    if not key:
+        raise LucyError(
+            f"missing: set {config.api.api_key_env} or install /etc/lucy/credentials/"
+            f"{config.api.api_key_credential} (see README)"
+        )
+    return f"present ({len(key)} characters)"
+
+
+async def voice(config: Config) -> str:
+    tts = await asyncio.to_thread(load_voice, config)
+    try:
+        await asyncio.to_thread(tts.warm_up)
+        started = time.perf_counter()
+        audio = await tts.synthesize("Honk! Did you know that geese can fly very far?")
+        rtf = (time.perf_counter() - started) / audio.duration
+    finally:
+        tts.close()
+    detail = f"{config.tts.voice.name}, {tts.sample_rate} Hz, real-time factor {rtf:.2f}"
+    if rtf > 0.5:
+        raise Warning(f"{detail} (slow: try a '-low' voice or more tts.threads)")
+    return detail
+
+
+def speaker(config: Config) -> str:
+    import sounddevice as sd
+
+    out = device(config.audio.output_device)
+    info = sd.query_devices(out, "output")
+    sd.check_output_settings(device=out, samplerate=22_050, channels=1, dtype="int16")
+    return str(info["name"])
+
+
+def microphone(config: Config) -> str:
+    import sounddevice as sd
+
+    mic = device(config.audio.input_device)
+    info = sd.query_devices(mic, "input")
+    rate = config.audio.input_sample_rate
+    sd.check_input_settings(device=mic, samplerate=rate, channels=1, dtype="int16")
+    return f"{info['name']} at {rate} Hz"
+
+
+async def microphone_level(config: Config) -> str:
+    from lucy.adapters.sound import SoundDeviceMicrophone
+
+    mic = SoundDeviceMicrophone(
+        sample_rate=config.audio.input_sample_rate, device=device(config.audio.input_device)
+    )
+    print("   … speak normally for 3 seconds")
+    await mic.start()
+    await asyncio.sleep(3.0)
+    audio = await mic.stop()
+    threshold = config.turn.speech_threshold_dbfs
+    speech = trim_silence(audio, threshold)
+    detail = (
+        f"level {level_dbfs(audio):.0f} dBFS, "
+        f"{speech.duration:.1f}s above the {threshold:.0f} dBFS speech threshold"
+    )
+    if speech.duration < 1.0:
+        raise Warning(f"{detail} (too quiet: raise the capture gain with `alsamixer`)")
+    return detail
+
+
+def button_line(config: Config) -> str:
+    return _gpio_line(config.button.chip, config.button.line, "button")
+
+
+def led_line(config: Config) -> str:
+    return _gpio_line(config.led.chip, config.led.line, "LED")
+
+
+def _gpio_line(chip: str, line: int, label: str) -> str:
+    import gpiod
+
+    if not os.path.exists(chip):
+        raise LucyError(f"{chip} does not exist")
+    if not os.access(chip, os.R_OK | os.W_OK):
+        raise LucyError(f"no permission on {chip} (add the user to the 'gpio' group)")
+    with gpiod.Chip(chip) as handle:
+        info = handle.get_line_info(line)
+    if info.used and info.consumer not in ("lucy-button", "lucy-led"):
+        raise LucyError(f"line {line} is in use by {info.consumer!r}")
+    held = f" (held by the running service as {info.consumer})" if info.used else ""
+    return f"{label} on {chip} line {line}{held}"
+
+
+async def service(config: Config) -> str:
+    cloud = build_cloud(config)
+    try:
+        started = time.perf_counter()
+        body = await cloud.api.get_json("models")
+        elapsed_ms = (time.perf_counter() - started) * 1000
+    finally:
+        await cloud.api.aclose()
+    available = {model.get("id") for model in body.get("data", []) if isinstance(model, dict)}
+    wanted = [config.stt.model, config.llm.model, config.llm.fallback_model]
+    missing = [model for model in wanted if model and model not in available]
+    if missing:
+        raise LucyError(f"model(s) not offered by the API: {', '.join(missing)}")
+    return f"{config.api.base_url} answered in {elapsed_ms:.0f} ms; all models available"
+
+
+def cpu_governor(config: Config) -> str:
+    files = sorted(CPUFREQ_ROOT.glob("policy*/scaling_governor"))
+    if not files:
+        raise Warning("no cpufreq support on this machine")
+    current = files[0].read_text().strip()
+    if not all(os.access(path, os.W_OK) for path in files):
+        raise Warning(f"'{current}', not writable (lucy.service grants this when it starts)")
+    return f"currently '{current}', writable"
+
+
+async def wifi_power_save(config: Config) -> str:
+    iw = shutil.which("iw") or shutil.which("iw", path="/usr/sbin:/sbin")
+    if iw is None:
+        raise Warning("`iw` is not installed (sudo apt install iw)")
+    interface = config.power.wifi_interface
+    process = await asyncio.create_subprocess_exec(
+        iw,
+        "dev",
+        interface,
+        "get",
+        "power_save",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    out, err = await process.communicate()
+    if process.returncode != 0:
+        raise Warning(err.decode().strip() or "cannot query power save")
+    return f"{interface}: {out.decode().strip()}"
