@@ -2,22 +2,28 @@
 
 The question is synthesised with Lucy's own voice, resampled to 16 kHz, and then
 pushed through the same STT → LLM → chunker → TTS path a real turn uses. The
-first round includes connection set-up (a cold start). Later rounds show the
-warm, steady-state latency a child will experience.
+first round includes set-up (a cold connection, or loading the local models).
+Later rounds show the warm, steady-state latency a child will experience.
+
+``--brain local`` measures the offline backup (faster-whisper + Ollama) instead
+of Groq.
 """
 
 import asyncio
 import statistics
 import time
-from contextlib import aclosing
+from contextlib import AsyncExitStack, aclosing
 
 import numpy as np
 
 from lucy.adapters.piper_tts import PiperSpeech
-from lucy.app import Cloud, build_cloud, load_voice
-from lucy.config import Config
+from lucy.app import load_voice
+from lucy.brains import build_cloud, build_local
+from lucy.config import Config, read_system_prompt
 from lucy.core.audio import Pcm
 from lucy.core.chunker import SentenceChunker
+from lucy.core.errors import ConfigError
+from lucy.core.pipeline import Brain
 from lucy.core.textnorm import to_speakable
 from lucy.core.types import Message, Role
 from lucy.persona import LUCY
@@ -31,7 +37,8 @@ def resample(audio: Pcm, rate: int) -> Pcm:
     return Pcm.from_float(np.interp(positions, np.arange(samples.size), samples), rate)
 
 
-async def bench(config: Config, question: str, rounds: int) -> int:
+async def bench(config: Config, question: str, rounds: int, *, brain_name: str = "cloud") -> int:
+    system_prompt = read_system_prompt(config, LUCY.system_prompt)
     print("loading voice…")
     tts = await asyncio.to_thread(load_voice, config)
     await asyncio.to_thread(tts.warm_up)
@@ -44,21 +51,36 @@ async def bench(config: Config, question: str, rounds: int) -> int:
     )
     speech = resample(spoken, config.audio.input_sample_rate)
 
-    cloud = build_cloud(config)
     results: list[dict[str, float]] = []
-    try:
+    async with AsyncExitStack() as stack:
+        stack.callback(tts.close)
+        if brain_name == "local":
+            local = build_local(config)
+            if local is None:
+                raise ConfigError("the local brain is not enabled ([local] enabled = true)")
+            stack.push_async_callback(local.aclose)
+            print("loading the local brain (speech model + Ollama model)…")
+            started = time.perf_counter()
+            await local.preload(system_prompt)
+            print(f"local brain loaded in {time.perf_counter() - started:.1f}s")
+            brain = local.brain()
+        else:
+            cloud = build_cloud(config)
+            stack.push_async_callback(cloud.aclose)
+            brain = cloud.brain()
+
         for index in range(1, rounds + 1):
-            timings = await _one_round(cloud, tts, speech)
+            timings = await _one_round(brain, tts, speech, system_prompt)
             results.append(timings)
             label = "cold" if index == 1 else "warm"
             row = "  ".join(f"{s}={timings[s] * 1000:.0f}ms" for s in STAGES if s in timings)
             print(f"round {index} ({label}): {row}")
-    finally:
-        await cloud.api.aclose()
-        tts.close()
 
     warm = results[1:] or results
-    print("\nmedian of warm rounds, measured from button release (excludes audio output latency):")
+    print(
+        f"\nmedian of warm rounds on the {brain_name} brain, measured from button release "
+        "(excludes audio output latency):"
+    )
     for stage in STAGES:
         values = [r[stage] for r in warm if stage in r]
         if values:
@@ -66,7 +88,9 @@ async def bench(config: Config, question: str, rounds: int) -> int:
     return 0
 
 
-async def _one_round(cloud: Cloud, tts: PiperSpeech, speech: Pcm) -> dict[str, float]:
+async def _one_round(
+    brain: Brain, tts: PiperSpeech, speech: Pcm, system_prompt: str
+) -> dict[str, float]:
     timings: dict[str, float] = {}
     origin = time.perf_counter()
 
@@ -77,12 +101,12 @@ async def _one_round(cloud: Cloud, tts: PiperSpeech, speech: Pcm) -> dict[str, f
         await tts.synthesize(to_speakable(text) or "Honk!")
         mark("first_audio")
 
-    text = await cloud.stt.transcribe(speech)
+    text = await brain.stt.transcribe(speech)
     mark("stt")
-    messages = [Message(Role.SYSTEM, LUCY.system_prompt), Message(Role.USER, text)]
+    messages = [Message(Role.SYSTEM, system_prompt), Message(Role.USER, text)]
     chunker = SentenceChunker()
     first_voice: asyncio.Task[None] | None = None
-    async with aclosing(cloud.chat.stream(messages)) as deltas:
+    async with aclosing(brain.chat.stream(messages)) as deltas:
         async for delta in deltas:
             mark("first_token")
             for chunk in chunker.feed(delta):

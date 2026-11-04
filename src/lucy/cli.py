@@ -8,7 +8,7 @@ from pathlib import Path
 
 from lucy import __version__
 from lucy.config import Config, default_config_path, load_config
-from lucy.core.errors import ConfigError
+from lucy.core.errors import ConfigError, LucyError
 from lucy.platform.logs import configure_logging
 
 log = logging.getLogger("lucy")
@@ -32,6 +32,9 @@ def main(argv: list[str] | None = None) -> int:
     bench = commands.add_parser("bench", help="measure end-to-end latency without a microphone")
     bench.add_argument("--question", default="Why do geese fly in a V shape?")
     bench.add_argument("--rounds", type=int, default=4)
+    bench.add_argument(
+        "--brain", choices=("cloud", "local"), default="cloud", help="which brain to measure"
+    )
 
     doctor = commands.add_parser("doctor", help="check hardware, voice, network, and permissions")
     doctor.add_argument("--listen", action="store_true", help="also record 3 s to check mic level")
@@ -57,7 +60,9 @@ def main(argv: list[str] | None = None) -> int:
             case "bench":
                 from lucy.tools.bench import bench as run_bench
 
-                return asyncio.run(run_bench(config, args.question, max(1, args.rounds)))
+                return asyncio.run(
+                    run_bench(config, args.question, max(1, args.rounds), brain_name=args.brain)
+                )
             case "doctor":
                 from lucy.tools.doctor import doctor as run_doctor
 
@@ -65,6 +70,9 @@ def main(argv: list[str] | None = None) -> int:
     except ConfigError as error:
         log.error("%s", error)
         return 78
+    except LucyError as error:  # e.g. bench while offline: one clear line, not a traceback
+        log.error("%s: %s", type(error).__name__, error)
+        return 1
     except KeyboardInterrupt:
         return 130
     return 2

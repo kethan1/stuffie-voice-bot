@@ -17,9 +17,15 @@ class Conversation:
     def __len__(self) -> int:
         return len(self._exchanges)
 
-    def prompt(self, system_prompt: str, user_text: str) -> list[Message]:
+    def prompt(
+        self, system_prompt: str, user_text: str, *, max_exchanges: int | None = None
+    ) -> list[Message]:
+        """System prompt, recent exchanges (all or the last ``max_exchanges``), question."""
+        exchanges = list(self._exchanges)
+        if max_exchanges is not None:
+            exchanges = exchanges[len(exchanges) - max_exchanges :] if max_exchanges > 0 else []
         messages = [Message(Role.SYSTEM, system_prompt)]
-        for asked, answered in self._exchanges:
+        for asked, answered in exchanges:
             messages.append(Message(Role.USER, asked))
             messages.append(Message(Role.ASSISTANT, answered))
         messages.append(Message(Role.USER, user_text))

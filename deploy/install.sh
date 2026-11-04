@@ -8,6 +8,8 @@
 #   --capture-card NAME    ALSA card id for the microphone (default: auto-detect)
 #   --voice NAME           Piper voice, e.g. en_US-amy-medium (default)
 #   --tune                 power tuning: boot config, unused services off, journal in RAM
+#   --local-backup         an offline brain on the Pi (faster-whisper + Ollama with Gemma 3 1B),
+#                          used when GroqCloud is unreachable; needs ~2 GB of SD card space
 #   --read-only            make the root filesystem read-only (overlayfs); do this last
 #   --no-start             install everything but do not (re)start the service
 #
@@ -33,7 +35,20 @@ declare -A UV_SHA256=(
   [x86_64]=2e2b37e9811e17675a9e70bed5e1a58fc8c0388be63d751d72cc735188c149ff
 )
 UV="$PREFIX/bin/uv"
-I2S_AMP=0 TUNE=0 READ_ONLY=0 START=1 PLAYBACK_CARD="" CAPTURE_CARD=""
+# The offline brain. Ollama is pinned and checksum-verified (aarch64 build); only its CPU
+# libraries are unpacked, skipping ~1.5 GB of CUDA libraries a Pi cannot use.
+OLLAMA_VERSION=v0.40.7
+OLLAMA_SHA256=c74249e87795b1437ce0f484adfd05b4628d7497472c475b13ec6db69ecc69cf
+LOCAL_LLM=gemma3:1b
+STT_MODEL=faster-whisper-tiny.en
+STT_MODEL_URL=https://huggingface.co/Systran/faster-whisper-tiny.en/resolve/0d3d19a32d3338f10357c0889762bd8d64bbdeba
+declare -A STT_MODEL_SHA256=(
+  [config.json]=14b1b421a90349bc551b881461426b561a874049cb9e4c4864f2ca384f6a7cc5
+  [model.bin]=1a5afae06a4db91c975c9a9d78be5cc110ee4ea022ad57d55492e4550e936b2a
+  [tokenizer.json]=929c5252409436dce1b38a75d1abbcb5e132d170d8e324e4e04ed915fa2d22df
+  [vocabulary.txt]=ff77588746d3a2595d32ab5b69ffd7b95ce2441ac57533cb66fc3eb575a115cf
+)
+I2S_AMP=0 TUNE=0 READ_ONLY=0 START=1 LOCAL_BACKUP=0 PLAYBACK_CARD="" CAPTURE_CARD=""
 
 log() { printf '\033[1;33m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;31m!!\033[0m %s\n' "$*" >&2; }
@@ -46,9 +61,10 @@ while [[ $# -gt 0 ]]; do
     --capture-card) CAPTURE_CARD="${2:?}"; shift ;;
     --voice) VOICE="${2:?}"; shift ;;
     --tune) TUNE=1 ;;
+    --local-backup) LOCAL_BACKUP=1 ;;
     --read-only) READ_ONLY=1 ;;
     --no-start) START=0 ;;
-    -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,18p' "$0"; exit 0 ;;
     *) die "unknown option: $1 (see --help)" ;;
   esac
   shift
@@ -78,6 +94,52 @@ set_block() {
   printf '%s\n' "$content" >>"$file"
 }
 
+# Download $2 to $1 unless present, then check it against the sha256 $3 (removed on mismatch).
+fetch_verified() {
+  local dest=$1 url=$2 sha=$3
+  if [[ ! -s $dest ]]; then
+    curl -fsSL --retry 3 -o "$dest.part" "$url"
+    mv "$dest.part" "$dest"
+  fi
+  echo "$sha  $dest" | sha256sum --check --quiet ||
+    { rm -f "$dest"; die "checksum mismatch for $dest (download removed; re-run to retry)"; }
+}
+
+# Stream Ollama's release archive straight into place: hashed on the way in, CPU parts only,
+# and nothing installed unless the checksum matches.
+install_ollama() {
+  if [[ "$(/usr/local/bin/ollama --version 2>&1)" == *"${OLLAMA_VERSION#v}"* ]]; then return; fi
+  [[ $(uname -m) == aarch64 ]] || die "the pinned Ollama build is for 64-bit Raspberry Pi OS (aarch64)"
+  local tmp; tmp=$(mktemp -d)
+  mkfifo "$tmp/archive"
+  sha256sum <"$tmp/archive" >"$tmp/sum" &
+  local hasher=$!
+  mkdir "$tmp/root"
+  curl -fsSL --retry 3 \
+    "https://github.com/ollama/ollama/releases/download/$OLLAMA_VERSION/ollama-linux-arm64.tar.zst" |
+    tee "$tmp/archive" | zstd -dcq |
+    tar -x -C "$tmp/root" --exclude='lib/ollama/cuda_*' --exclude='lib/ollama/rocm*' \
+      --exclude='lib/ollama/vulkan*'
+  wait "$hasher"
+  if [[ "$(cut -d' ' -f1 "$tmp/sum")" != "$OLLAMA_SHA256" ]]; then
+    rm -rf "$tmp"
+    die "checksum mismatch for Ollama $OLLAMA_VERSION (nothing was installed)"
+  fi
+  install -m 0755 "$tmp/root/bin/ollama" /usr/local/bin/ollama
+  rm -rf /usr/local/lib/ollama
+  mv "$tmp/root/lib/ollama" /usr/local/lib/ollama
+  rm -rf "$tmp"
+}
+
+# True if an installed config already turns the local brain on (so upgrades keep it).
+local_backup_configured() {
+  [[ -f $ETC/config.toml ]] && python3 -c '
+import sys, tomllib
+with open(sys.argv[1], "rb") as f:
+    sys.exit(0 if tomllib.load(f).get("local", {}).get("enabled") is True else 1)
+' "$ETC/config.toml" 2>/dev/null
+}
+
 # The id of an ALSA card with a PCM of the given kind (p = playback, c = capture).
 # USB devices win over the onboard outputs; HDMI audio is never chosen.
 detect_card() {
@@ -92,11 +154,18 @@ detect_card() {
   echo "$fallback"
 }
 
+if [[ $LOCAL_BACKUP -eq 0 ]] && local_backup_configured; then
+  LOCAL_BACKUP=1
+  log "keeping the offline brain that $ETC/config.toml enables"
+fi
+EXTRAS=(--extra pi)
+[[ $LOCAL_BACKUP -eq 0 ]] || EXTRAS+=(--extra local)
+
 log "installing system packages"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq --no-install-recommends \
-  python3 libportaudio2 alsa-utils iw ca-certificates curl rsync >/dev/null
+  python3 libportaudio2 alsa-utils iw ca-certificates curl rsync zstd >/dev/null
 
 log "creating the '$SERVICE_USER' service account"
 getent group gpio >/dev/null || groupadd --system gpio
@@ -130,7 +199,7 @@ rsync -a --delete --exclude '.venv' --exclude '.git' --exclude '__pycache__' \
 # now because the sandboxed service cannot write it.
 UV_CACHE_DIR=/var/cache/lucy/uv UV_PROJECT_ENVIRONMENT="$PREFIX/venv" UV_PYTHON_DOWNLOADS=never \
   "$UV" sync --quiet --project "$PREFIX/src" --python /usr/bin/python3 --locked --no-dev \
-  --extra pi --no-editable --no-build --compile-bytecode
+  "${EXTRAS[@]}" --no-editable --no-build --compile-bytecode
 UV_CACHE_DIR=/var/cache/lucy/uv "$UV" cache prune --quiet
 
 log "fetching the Piper voice $VOICE"
@@ -138,14 +207,11 @@ IFS=- read -r lang name quality <<<"$VOICE"
 [[ -n ${quality:-} ]] || die "voice must look like en_US-amy-medium"
 for file in "$VOICE.onnx" "$VOICE.onnx.json"; do
   dest="$PREFIX/voices/$file"
-  if [[ ! -s $dest ]]; then
-    curl -fsSL --retry 3 -o "$dest.part" "$VOICE_BASE/${lang%%_*}/$lang/$name/$quality/$file"
-    mv "$dest.part" "$dest"
-  fi
+  url="$VOICE_BASE/${lang%%_*}/$lang/$name/$quality/$file"
   if [[ -n ${VOICE_SHA256[$file]:-} ]]; then
-    echo "${VOICE_SHA256[$file]}  $dest" | sha256sum --check --quiet ||
-      { rm -f "$dest"; die "checksum mismatch for $file (download removed; re-run to retry)"; }
+    fetch_verified "$dest" "$url" "${VOICE_SHA256[$file]}"
   else
+    [[ -s $dest ]] || { curl -fsSL --retry 3 -o "$dest.part" "$url" && mv "$dest.part" "$dest"; }
     warn "no pinned checksum for $file; trusting the download"
   fi
 done
@@ -166,6 +232,31 @@ if [[ ! -s $KEY_FILE ]]; then
   [[ -s $KEY_FILE ]] || warn "no API key yet: put it in $KEY_FILE (root-only, mode 600)"
 fi
 [[ ! -e $KEY_FILE ]] || chmod 0600 "$KEY_FILE"
+
+if [[ $LOCAL_BACKUP -eq 1 ]]; then
+  log "installing the offline brain: speech model $STT_MODEL"
+  install -d -m 0755 "$PREFIX/models/$STT_MODEL"
+  for file in "${!STT_MODEL_SHA256[@]}"; do
+    fetch_verified "$PREFIX/models/$STT_MODEL/$file" "$STT_MODEL_URL/$file" "${STT_MODEL_SHA256[$file]}"
+  done
+  chmod -R a+rX "$PREFIX/models"
+
+  log "installing the offline brain: Ollama $OLLAMA_VERSION and $LOCAL_LLM"
+  install_ollama
+  install -m 0644 "$REPO_DIR/deploy/systemd/ollama.service" /etc/systemd/system/ollama.service
+  systemctl daemon-reload
+  systemctl enable --now ollama.service >/dev/null
+  systemctl restart ollama.service
+  for _ in $(seq 30); do ollama list &>/dev/null && break; sleep 1; done
+  ollama pull "$LOCAL_LLM"
+
+  if grep -q '^\[local\]' "$ETC/config.toml"; then
+    sed -i '/^\[local\]/,/^\[/ s/^enabled = false/enabled = true/' "$ETC/config.toml"
+  else
+    printf '\n[local]\nenabled = true\n' >>"$ETC/config.toml"
+  fi
+  local_backup_configured || warn "could not enable [local] in $ETC/config.toml; set enabled = true there"
+fi
 
 log "configuring audio"
 if [[ $I2S_AMP -eq 1 ]]; then

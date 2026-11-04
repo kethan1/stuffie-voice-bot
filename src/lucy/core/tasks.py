@@ -32,6 +32,11 @@ def _first_failure(group: BaseExceptionGroup[BaseException]) -> BaseException:
     return group.exceptions[0]
 
 
+def detach(future: asyncio.Future[Any]) -> None:
+    """Let a future we will never await finish quietly (no "exception was never retrieved")."""
+    future.add_done_callback(lambda done: done.cancelled() or done.exception())
+
+
 class BackgroundTasks:
     """Owns fire-and-forget tasks: keeps them referenced, logs failures, cancels on shutdown."""
 

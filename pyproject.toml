@@ -20,6 +20,9 @@ dependencies = [
 [project.optional-dependencies]
 # Only needed on the Pi (or any Linux board with a GPIO character device).
 pi = ["gpiod>=2.2,<3"]
+local = [
+    "faster-whisper>=1.1,<2",
+]
 
 [project.scripts]
 lucy = "lucy.cli:main"
@@ -70,5 +73,5 @@ warn_unreachable = true
 mypy_path = "src"
 
 [[tool.mypy.overrides]]
-module = ["sounddevice", "onnxruntime", "piper", "piper.*", "gpiod", "gpiod.*"]
+module = ["sounddevice", "onnxruntime", "piper", "piper.*", "gpiod", "gpiod.*", "faster_whisper"]
 ignore_missing_imports = true

@@ -31,7 +31,7 @@ from lucy.core.errors import AudioDeviceError
 from lucy.core.metrics import RateBudget, TurnTimer
 from lucy.core.phrases import Phrase
 from lucy.core.ports import Button, Indicator, Microphone, PowerControl, Prewarmable, Speaker
-from lucy.core.tasks import BackgroundTasks
+from lucy.core.tasks import BackgroundTasks, detach
 from lucy.core.types import PowerMode, Status
 
 log = logging.getLogger(__name__)
@@ -161,7 +161,7 @@ class Controller:
             self._press = _Press(at, interrupted)
             self._indicator.show(Status.LISTENING)
             if self._earcons:
-                self._speaker.enqueue(self._earcons.listening)
+                detach(self._speaker.enqueue(self._earcons.listening))
             else:
                 self._tasks.spawn(self._speaker.open(), "speaker-open")
             loop = asyncio.get_running_loop()
@@ -196,7 +196,7 @@ class Controller:
 
             self._indicator.show(Status.THINKING)
             if self._earcons:
-                self._speaker.enqueue(self._earcons.thinking)
+                detach(self._speaker.enqueue(self._earcons.thinking))
             timer = TurnTimer(origin=at, clock=self._clock)
             self._start_turn(self._pipeline.respond(recording, timer))
 

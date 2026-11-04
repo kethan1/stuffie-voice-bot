@@ -64,6 +64,24 @@ class LlmSettings:
 
 
 @dataclass(frozen=True, slots=True)
+class LocalSettings:
+    """Lucy's own brain on the Pi, used when the cloud cannot be reached."""
+
+    enabled: bool = False
+    stt_model: Path = Path("/opt/lucy/models/faster-whisper-tiny.en")
+    stt_threads: int = 4
+    base_url: str = "http://127.0.0.1:11434/v1"
+    """Ollama's OpenAI-compatible endpoint (localhost only)."""
+    model: str = "gemma3:1b"
+    params: dict[str, Any] = field(default_factory=lambda: {"max_tokens": 100, "temperature": 0.7})
+    history_exchanges: int = 2
+    """A 1B model on a Pi 4 reads prompts slowly, so it gets less history than the cloud."""
+    timeout_s: float = 60.0
+    preload: bool = True
+    """Load both models at start-up, so the first offline answer does not wait for them."""
+
+
+@dataclass(frozen=True, slots=True)
 class SafetySettings:
     screen: bool = True
     """On-device distress screen (see lucy.core.safety). Strongly recommended."""
@@ -127,6 +145,7 @@ class Config:
     api: ApiSettings = field(default_factory=ApiSettings)
     stt: SttSettings = field(default_factory=SttSettings)
     llm: LlmSettings = field(default_factory=LlmSettings)
+    local: LocalSettings = field(default_factory=LocalSettings)
     safety: SafetySettings = field(default_factory=SafetySettings)
     tts: TtsSettings = field(default_factory=TtsSettings)
     audio: AudioSettings = field(default_factory=AudioSettings)
@@ -197,6 +216,10 @@ def _validate(config: Config) -> None:
         problems.append("tts.volume must be between 0 and 2")
     if config.audio.input_sample_rate not in (8_000, 16_000, 22_050, 24_000, 44_100, 48_000):
         problems.append("audio.input_sample_rate must be a standard rate (16000 recommended)")
+    if config.local.enabled and config.audio.input_sample_rate != 16_000:
+        problems.append("local.enabled needs audio.input_sample_rate = 16000")
+    if config.local.history_exchanges < 0 or config.local.stt_threads < 1:
+        problems.append("local.history_exchanges must be >= 0 and local.stt_threads >= 1")
     if config.session.tap_max_s >= config.session.max_record_s:
         problems.append("session.tap_max_s must be shorter than session.max_record_s")
     if config.session.awake_s <= 0 or config.session.forget_after_s <= 0:

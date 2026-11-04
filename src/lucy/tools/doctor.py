@@ -15,10 +15,12 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from lucy.adapters.power import CPUFREQ_ROOT
-from lucy.app import build_cloud, load_voice
-from lucy.config import Config, device, read_api_key
-from lucy.core.audio import level_dbfs, trim_silence
+from lucy.app import load_voice
+from lucy.brains import build_cloud, build_local
+from lucy.config import Config, device, read_api_key, read_system_prompt
+from lucy.core.audio import Pcm, level_dbfs, trim_silence
 from lucy.core.errors import LucyError
+from lucy.persona import LUCY
 
 OK, WARN, FAIL = "✔", "!", "✘"
 
@@ -40,6 +42,9 @@ async def doctor(config: Config, config_path: Path | None, *, listen: bool) -> i
     if config.led.enabled:
         probes.append(("LED GPIO", led_line))
     probes.append(("AI service", service))
+    if config.local.enabled:
+        probes.append(("local speech model", local_speech))
+        probes.append(("local brain (Ollama)", local_brain))
     if config.power.manage_cpu_governor:
         probes.append(("CPU governor", cpu_governor))
     if config.power.manage_wifi:
@@ -196,3 +201,37 @@ async def wifi_power_save(config: Config) -> str:
     if process.returncode != 0:
         raise Warning(err.decode().strip() or "cannot query power save")
     return f"{interface}: {out.decode().strip()}"
+
+
+async def local_speech(config: Config) -> str:
+    local = build_local(config)
+    assert local is not None
+    try:
+        started = time.perf_counter()
+        await local.stt.preload()
+        loaded_s = time.perf_counter() - started
+        started = time.perf_counter()
+        await local.stt.transcribe(Pcm.silence(2.0, 16_000))
+        run_s = time.perf_counter() - started
+    finally:
+        await local.aclose()
+    return f"{config.local.stt_model.name} loaded in {loaded_s:.1f}s, 2 s of audio in {run_s:.1f}s"
+
+
+async def local_brain(config: Config) -> str:
+    local = build_local(config)
+    assert local is not None
+    try:
+        body = await local.api.get_json("models")
+        available = {str(m.get("id")) for m in body.get("data", []) if isinstance(m, dict)}
+        if config.local.model not in available:
+            raise LucyError(
+                f"Ollama has no {config.local.model!r} (installed: {', '.join(sorted(available))})"
+                f"; run: ollama pull {config.local.model}"
+            )
+        started = time.perf_counter()
+        await local.preload(read_system_prompt(config, LUCY.system_prompt))
+        ready_s = time.perf_counter() - started
+    finally:
+        await local.aclose()
+    return f"{config.local.model} loaded and answered in {ready_s:.1f}s"

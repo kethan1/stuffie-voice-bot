@@ -1,10 +1,13 @@
 VOICE := en_US-amy-medium
 VOICE_URL := https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/amy/medium
+# The offline brain's speech model, at the same pinned revision deploy/install.sh uses.
+STT_MODEL := models/faster-whisper-tiny.en
+STT_MODEL_URL := https://huggingface.co/Systran/faster-whisper-tiny.en/resolve/0d3d19a32d3338f10357c0889762bd8d64bbdeba
 
-.PHONY: dev check lint typecheck test integration voice lock clean
+.PHONY: dev check lint typecheck test integration voice stt-model lock clean
 
 dev:
-	uv sync --extra pi
+	uv sync --extra pi --extra local
 
 check: lint typecheck test
 
@@ -25,8 +28,17 @@ voices/$(VOICE).onnx:
 	curl -fsSL -o $@.json $(VOICE_URL)/$(VOICE).onnx.json
 	curl -fsSL -o $@ $(VOICE_URL)/$(VOICE).onnx
 
-integration: voice
-	LUCY_TEST_VOICE=voices/$(VOICE).onnx uv run pytest -q tests/test_integration.py
+stt-model: $(STT_MODEL)/model.bin
+
+$(STT_MODEL)/model.bin:
+	mkdir -p $(STT_MODEL)
+	for f in config.json tokenizer.json vocabulary.txt model.bin; do \
+		curl -fsSL -o $(STT_MODEL)/$$f $(STT_MODEL_URL)/$$f || exit 1; done
+
+# End-to-end tests with the real voice and speech model (Groq and Ollama are mocked).
+integration: voice stt-model
+	LUCY_TEST_VOICE=voices/$(VOICE).onnx LUCY_TEST_STT_MODEL=$(STT_MODEL) \
+		uv run pytest -q tests/test_integration.py tests/test_local.py
 
 # Re-resolve every dependency to its newest release that is at least two weeks old
 # (exclude-newer in pyproject.toml). uv.lock is universal: it also pins the Pi's aarch64 wheels.

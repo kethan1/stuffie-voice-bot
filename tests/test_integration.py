@@ -18,7 +18,7 @@ from lucy.adapters.piper_tts import PiperSpeech
 from lucy.core.conversation import Conversation
 from lucy.core.metrics import TurnTimer
 from lucy.core.phrases import PhraseBook
-from lucy.core.pipeline import TurnPipeline, TurnSettings
+from lucy.core.pipeline import Brain, TurnPipeline, TurnSettings
 from lucy.core.safety import DistressScreen
 from lucy.persona import LUCY
 from tests.fakes import FakeIndicator, FakeSpeaker, tone
@@ -43,8 +43,11 @@ async def test_full_turn_with_real_voice() -> None:
     api = ApiClient("https://api.test/openai/v1", "sk", transport=httpx.MockTransport(groq))
     speaker = FakeSpeaker()
     pipeline = TurnPipeline(
-        stt=WhisperTranscriber(api, model="whisper-large-v3-turbo", language="en"),
-        chat=StreamingChat(api, ChatModelSpec("openai/gpt-oss-20b")),
+        brain=Brain(
+            "cloud",
+            WhisperTranscriber(api, model="whisper-large-v3-turbo", language="en"),
+            StreamingChat(api, ChatModelSpec("openai/gpt-oss-20b")),
+        ),
         tts=tts,
         moderator=DistressScreen(),
         speaker=speaker,
@@ -66,3 +69,67 @@ async def test_full_turn_with_real_voice() -> None:
     first_audio = timer.get("first_audio")
     assert first_audio is not None
     assert first_audio < 2.0
+
+
+STT_MODEL = os.environ.get("LUCY_TEST_STT_MODEL")
+
+
+@pytest.mark.skipif(not STT_MODEL, reason="set LUCY_TEST_STT_MODEL to a faster-whisper model")
+async def test_offline_turn_uses_the_local_brain() -> None:
+    from lucy.adapters.local_stt import FasterWhisperTranscriber
+    from lucy.tools.bench import resample
+
+    assert VOICE is not None
+    assert STT_MODEL is not None
+
+    def no_network(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("Temporary failure in name resolution", request=request)
+
+    asked: list[str] = []
+
+    def ollama(request: httpx.Request) -> httpx.Response:
+        asked.append(json.loads(request.read())["messages"][-1]["content"])
+        events = [{"choices": [{"delta": {"content": p}}]} for p in ["Honk! ", "They like warmth."]]
+        body = "".join(f"data: {json.dumps(e)}\n\n" for e in events) + "data: [DONE]\n\n"
+        return httpx.Response(200, content=body.encode())
+
+    tts = PiperSpeech(Path(VOICE), threads=2)
+    cloud_api = ApiClient(
+        "https://api.test/openai/v1", "sk", transport=httpx.MockTransport(no_network)
+    )
+    local_api = ApiClient(
+        "http://127.0.0.1:11434/v1", "ollama", transport=httpx.MockTransport(ollama)
+    )
+    local_stt = FasterWhisperTranscriber(Path(STT_MODEL), threads=2)
+    speaker = FakeSpeaker()
+    pipeline = TurnPipeline(
+        brain=Brain(
+            "cloud",
+            WhisperTranscriber(cloud_api, model="whisper-large-v3-turbo", language="en"),
+            StreamingChat(cloud_api, ChatModelSpec("openai/gpt-oss-20b")),
+            reachable=cloud_api.reachable,
+        ),
+        backup=Brain("local", local_stt, StreamingChat(local_api, ChatModelSpec("gemma3:1b"))),
+        tts=tts,
+        moderator=DistressScreen(),
+        speaker=speaker,
+        indicator=FakeIndicator(),
+        phrases=PhraseBook(LUCY.lines, tts),
+        conversation=Conversation(2),
+        system_prompt=LUCY.system_prompt,
+        settings=TurnSettings(),
+    )
+    question = resample(await tts.synthesize("Why do geese fly south in the winter?"), 16_000)
+    try:
+        await pipeline.respond(question, TurnTimer())
+        assert not cloud_api.reachable()  # remembered: the next turn skips the cloud
+        await pipeline.respond(question, TurnTimer())
+    finally:
+        await cloud_api.aclose()
+        await local_api.aclose()
+        local_stt.close()
+        tts.close()
+    assert len(asked) == 2
+    assert "geese" in asked[0].lower()
+    # Each turn: "thinking with my own brain", then "Honk!" and "They like warmth."
+    assert len(speaker.played) == 6

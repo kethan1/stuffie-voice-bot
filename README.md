@@ -25,6 +25,10 @@ one to three short, friendly sentences, usually starting within about a second.
   Wi-Fi?"). She falls back to a second model when rate-limited, is restarted
   by the systemd watchdog if wedged, and supports a read-only root filesystem
   for power yanks.
+* **Works offline (optional):** with `--local-backup`, Lucy keeps answering
+  when GroqCloud is unreachable. She uses faster-whisper and Gemma 3 1B
+  (Ollama) on the Pi itself, says she is "thinking with her own goose brain",
+  and switches back to the cloud as soon as it is reachable again.
 
 The design rationale (technology choices, latency budget, power strategy,
 safety model, and failure handling) is in
@@ -48,6 +52,7 @@ safety model, and failure handling) is in
    ```bash
    git clone <this repository> lucy && cd lucy
    sudo deploy/install.sh --i2s-amp --tune     # paste the API key when asked
+   # optional offline brain (~2 GB):  add --local-backup
    sudo reboot
    ```
 

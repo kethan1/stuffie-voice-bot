@@ -5,7 +5,7 @@
 | Part | Notes |
 |---|---|
 | Raspberry Pi 4 Model B, 4 GB | Fit a small heatsink: it lives inside a plush. |
-| 32 GB microSD, A1 or A2 rated | A1/A2 cards handle small random reads/writes far better. |
+| 32 GB microSD, A1 or A2 rated | A1/A2 cards handle small random reads/writes far better. The optional offline brain (`--local-backup`) needs about 2 GB more, and loads faster from a fast card. |
 | USB mini microphone | Plug-and-play. Ideally one that supports 16 kHz natively (`arecord --dump-hw-params -D hw:CARD=<id>`). |
 | MAX98357A I2S amplifier breakout + 3 W, 4 Ω speaker | Loud, efficient, and gated by the kernel when idle. A USB speaker also works. |
 | Momentary push button | Sewn into the wing. A 12 mm tactile switch or a soft "squeeze" switch. |

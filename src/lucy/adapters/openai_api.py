@@ -12,6 +12,12 @@ Latency choices:
   talking instead of after they let go.
 * Keep-alive is long, so a conversation stays on one warm connection.
 
+Reachability: once a connection attempt fails, the client reports itself as
+unreachable (:meth:`ApiClient.reachable`) until some request gets *any* HTTP
+response again. Turns therefore go straight to Lucy's local brain instead of
+waiting on a connect timeout each time. While unreachable, every button press
+sends a probe, so recovery is noticed as soon as the network returns.
+
 Every httpx failure is translated into a :mod:`lucy.core.errors` type here,
 so the rest of the program never sees a transport exception.
 """
@@ -47,6 +53,7 @@ class ApiClient:
     ) -> None:
         self._prewarm_after_idle_s = prewarm_after_idle_s
         self._last_used = -float("inf")
+        self._reachable = True
         self._warming: asyncio.Task[None] | None = None
         self._connect_timeout_s = connect_timeout_s
         if transport is None:
@@ -72,10 +79,19 @@ class ApiClient:
             self._warming.cancel()
         await self._http.aclose()
 
+    def reachable(self) -> bool:
+        """False from a failed connection attempt until the service answers again."""
+        return self._reachable
+
     def prewarm(self) -> None:
-        """Open (or refresh) the connection in the background if it may have gone cold."""
+        """Open (or refresh) the connection in the background if it may have gone cold.
+
+        While the service is unreachable this doubles as a recovery probe.
+        """
+        if self._warming is not None and not self._warming.done():
+            return
         idle = time.monotonic() - self._last_used
-        if idle < self._prewarm_after_idle_s or (self._warming and not self._warming.done()):
+        if self._reachable and idle < self._prewarm_after_idle_s:
             return
         self._warming = asyncio.create_task(self._warm(), name="api-prewarm")
 
@@ -144,12 +160,24 @@ class ApiClient:
         try:
             async with self._http.stream(method, path, timeout=timeout, **kwargs) as response:
                 self._last_used = time.monotonic()
+                self._mark_reachable(True)
                 if response.status_code >= 400:
                     await response.aread()
                     raise _status_error(response)
                 yield response
         except httpx.HTTPError as error:
-            raise _translate(error) from error
+            translated = _translate(error)
+            if isinstance(translated, ServiceUnreachable):
+                self._mark_reachable(False)
+            raise translated from error
+
+    def _mark_reachable(self, reachable: bool) -> None:
+        if reachable != self._reachable:
+            self._reachable = reachable
+            if reachable:
+                log.info("%s is reachable again", self._http.base_url.host)
+            else:
+                log.warning("%s is unreachable", self._http.base_url.host)
 
 
 def _translate(error: httpx.HTTPError) -> ServiceError:

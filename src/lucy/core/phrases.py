@@ -24,6 +24,7 @@ class Phrase(StrEnum):
     DIDNT_HEAR = "didnt_hear"
     HOLD_TO_TALK = "hold_to_talk"
     OFFLINE = "offline"
+    OWN_BRAIN = "own_brain"
     TIRED = "tired"
     TANGLED = "tangled"
     NEEDS_HELP = "needs_help"

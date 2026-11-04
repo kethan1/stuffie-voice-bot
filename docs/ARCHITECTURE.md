@@ -36,7 +36,10 @@ microphone, a speaker, and the decision from the research assignment
  │  wing button ──GPIO17──┐                ┌──I2S──► MAX98357A ─► speaker│
  │  eye LED ◄────GPIO27───┤  Raspberry Pi  │                             │
  │  USB microphone ──USB──┤  4B · 4 GB     ├──Wi-Fi──┐                   │
- │                        └────────────────┘         │                   │
+ │                        └───────┬────────┘         │                   │
+ │      optional offline brain    │ localhost        │                   │
+ │      faster-whisper tiny.en ◄──┤                  │                   │
+ │      Ollama · gemma3:1b ◄──────┘                  │                   │
  └───────────────────────────────────────────────────┼───────────────────┘
                                                      │ HTTPS (HTTP/2, one connection)
                                                      ▼
@@ -52,6 +55,11 @@ Text-to-speech runs **on the Pi**. That keeps Lucy able to speak (including
 error messages) when the network is down, avoids a second round trip per
 sentence, and costs nothing.
 
+With `install.sh --local-backup`, Lucy also gets an **offline brain** on the Pi
+itself: speech recognition with faster-whisper and replies from Gemma 3 1B served
+by Ollama. It is slower, so it is used only when GroqCloud cannot be reached
+(§5.4).
+
 ---
 
 ## 3. Technology decisions
@@ -62,6 +70,7 @@ sentence, and costs nothing.
 | **Speech-to-text** | Groq `whisper-large-v3-turbo` | Fast (hundreds of times real time), accurate on children's speech, and on the same API and connection as the LLM. Local Whisper on a Pi 4 would take seconds per utterance and eat the RAM Piper needs. |
 | **LLM** | Groq `openai/gpt-oss-20b`, `reasoning_effort=low` | About 1,000 tokens/s on Groq, so a whole 40-word answer arrives in well under a second. Low reasoning effort keeps hidden "thinking" to a few dozen tokens. |
 | **LLM fallback** | Groq `openai/gpt-oss-120b` | Free-tier limits are per model, so falling back on a 429 roughly doubles the usable daily quota. It accepts the same request parameters. (`llama-3.1-8b-instant` was retired from the free tier in Aug 2026.) |
+| **Offline brain** (optional) | faster-whisper `tiny.en` (int8) + Ollama serving `gemma3:1b` | Used only when Groq is unreachable. Gemma 3 1B (~0.8 GB) is the local model the research chose, and it fits in 4 GB beside Piper. Ollama is what the Raspberry Pi Foundation tutorial uses, detects the Pi 4's CPU features at run time, and speaks the same OpenAI-compatible protocol, so no new chat code was needed. Local speech recognition is required too: without the cloud, Groq's Whisper is gone as well. faster-whisper installs from prebuilt wheels; whisper.cpp would have to be compiled on the Pi. |
 | **Text-to-speech** | Piper (`piper-tts` 1.x), voice `en_US-amy-medium` | Runs in real time on a Pi 4 with no network. Groq's hosted TTS (Orpheus) is a preview model with a small daily request limit. |
 | **Moderation** | On-device distress screen + system prompt + gpt-oss safety training | Groq retired Llama Guard 4 in March 2026. Its replacement (`gpt-oss-safeguard-20b`) is a preview model at 3 requests/minute on the free tier, so it cannot screen every turn. See §8. |
 | **Audio I/O** | PortAudio via `sounddevice`, ALSA `plug` for rate conversion | Callback-driven: no polling, and gapless output. `plug` converts rates in C, so Lucy records at Whisper's native 16 kHz and plays at Piper's 22.05 kHz on any hardware. |
@@ -87,7 +96,9 @@ interfaces, and a single composition root wires them together.
   Button ───────►│  Controller ──────► TurnPipeline ──► Conversation, PhraseBook       │
   (port)         │  (state machine)    (stream STT→LLM→TTS→speaker)                    │
                  │       │                  │  uses: SentenceChunker, to_speakable,    │
-                 │       ▼                  ▼        DistressScreen, TurnTimer          │
+                 │       │                  │        DistressScreen, TurnTimer          │
+                 │       │                  │  thinks with: Brain (cloud) → Brain (local) │
+                 │       ▼                  ▼                                           │
                  │  PowerControl,     SpeechToText, ChatModel, TextToSpeech,           │
                  │  Indicator,        Moderator, Speaker, Microphone      ◄── ports     │
                  │  Prewarmable                                                        │
@@ -98,11 +109,13 @@ interfaces, and a single composition root wires them together.
      sound.py       SoundDeviceMicrophone, SoundDeviceSpeaker (PortAudio)
      piper_tts.py   PiperSpeech (onnxruntime)
      cloud.py       WhisperTranscriber, StreamingChat, FallbackChat
+     local_stt.py   FasterWhisperTranscriber (on-device speech for the offline brain)
      openai_api.py  ApiClient (httpx, HTTP/2, prewarm, error translation)
      power.py       PowerManager, CpuGovernor, WifiPowerSave
      console.py     KeyboardButton, LogIndicator (bring-up / development)
 
    lucy.app         composition root: config → adapters → core; lifecycle and shutdown
+   lucy.brains      assembles the cloud brain (Groq) and the optional local brain (Ollama)
    lucy.platform    systemd notify/watchdog, journald-aware logging
    lucy.tools       `lucy doctor`, `lucy bench`
    lucy.persona     Lucy's system prompt and fixed lines
@@ -190,7 +203,48 @@ conversation, so a follow-up "why?" still makes sense.
 | `tts` worker | Piper synthesis (onnxruntime, 3 intra-op threads) | No (spinning disabled) |
 | PortAudio output callback | feed the speaker | Only while the speaker is open (a conversation is active) |
 | PortAudio input callback | capture the mic | Only while the wing is squeezed |
+| `local-stt` worker (optional) | faster-whisper, only when the cloud is unreachable | No |
 | GPIO | none: edges arrive on a file descriptor in the event loop | No |
+
+### 5.4 When the cloud is unreachable: the offline brain
+
+A turn is answered by a `Brain`: a speech-to-text plus a chat model. The cloud
+brain is Groq. The optional local brain is faster-whisper plus Ollama on the Pi.
+
+```
+ release ─► cloud known down? ──yes──► local brain ─► "let me think with my own goose brain"
+               │ no
+               ▼
+           Groq Whisper ── connect fails ──► local brain (+ that line) ─► local Whisper
+               ▼
+           Groq gpt-oss ── connect fails before the first word ──► local brain (+ that line)
+```
+
+* **Only for unreachability.** Connection failures (no Wi-Fi, DNS failure,
+  connect timeout) move a turn to the local brain. A rate limit still falls
+  back to gpt-oss-120b, and a bad API key still asks for a grown-up. Those are
+  problems another *cloud* model or a person must fix, and a slower local
+  answer would hide them.
+* **Outages are remembered.** The HTTP client marks Groq unreachable after a
+  failed connection, and keeps it marked until any request gets an HTTP
+  response back. Later turns go straight to the local brain instead of waiting
+  on a connect timeout each time. While Groq is marked down, the press-time
+  connection warm-up (§6.2) doubles as a recovery probe, so Lucy returns to the
+  cloud on the first turn after the network comes back.
+* **Never two brains in one answer.** The switch can only happen before the
+  first word of a reply, exactly like the 20B → 120B fallback.
+* **Expectations are set.** A 1B model on a Pi 4 takes several seconds, so Lucy
+  first says "My cloud is far away right now, so let me think all by myself."
+  The line is pre-rendered, queued without waiting, and covers most of the
+  delay.
+* **Smaller prompts.** The local model gets only the last 2 exchanges (the cloud
+  gets 6), because reading a prompt is slow on a Pi 4. Ollama caches the system
+  prompt, which is evaluated once at start-up (`preload`), so only the new
+  question has to be read.
+* **Resident models.** Both models are loaded at start-up, after Lucy is
+  already awake, and stay in RAM (about 1.2 GB together). Idle RAM costs no
+  power, while reading 0.8 GB from an SD card mid-conversation would cost a
+  child tens of seconds.
 
 ---
 
@@ -214,6 +268,11 @@ own breakdown (`stt=… first_token=… first_synth=… first_audio=…`).
 | Piper, first clause | ~150–600 ms | Short first chunk, warmed-up session, cores at full clock (ACTIVE governor) |
 | Audio output buffer | ~80 ms | `output_latency_s` |
 | **First word heard** | **≈ 0.8–1.6 s** | |
+
+Offline turns are much slower. Rough estimates for a Pi 4 (measure with
+`lucy bench --brain local`): local speech recognition 1–3 s, then the first
+sentence from Gemma 3 1B after another 3–8 s (a few tokens per second). The "own
+goose brain" line plays during that wait.
 
 ### 6.2 Techniques used
 
@@ -267,6 +326,10 @@ Process-level savings:
   SD pin from the PCM state, so closing the speaker stream powers the amp down
   (and silences idle hiss inside the plush).
 
+The optional offline brain is designed to cost RAM, not power, while idle. Both
+models sit loaded in memory and do no inference until the cloud is unreachable.
+(Check on your Pi with `top` that `ollama` stays near 0 % CPU between turns.)
+
 System-level savings (`deploy/install.sh --tune`): headless OS Lite, onboard
 audio, Bluetooth, and board LEDs off, no camera or display probing, unused
 services disabled, and the journal kept in RAM (no SD-card write wake-ups).
@@ -307,6 +370,7 @@ it in `app.py`.
 | The recording (only while the wing is held, silence trimmed) | Groq Whisper | Not stored on the Pi. Groq: not retained by default, may be logged up to 30 days for abuse/reliability unless **Zero Data Retention** is enabled (console → Settings → Data Controls). |
 | The transcript and the last ≤ 6 exchanges | Groq gpt-oss | Same as above. Held in Pi RAM only, forgotten after 5 minutes of quiet. |
 | Distress-screen matches | Nowhere | Answered locally. |
+| Anything during an offline turn | Nowhere | Answered entirely on the Pi. Ollama is localhost-only, and `OLLAMA_NO_CLOUD=1` disables Ollama's own cloud features. |
 | Logs | Pi RAM (volatile journal) | Contain timings and error types only, **no transcripts** unless `log_transcripts = true`. |
 
 **Account ownership:** Groq's Services Agreement requires account holders to
@@ -321,7 +385,9 @@ children use Lucy.
 
 | Failure | Behaviour |
 |---|---|
-| Wi-Fi down / DNS failure | Lucy says she can't reach her thinking cloud and asks for a grown-up. Piper is local, so she can always speak. |
+| Wi-Fi down / DNS failure | With the offline brain, Lucy says she will think on her own and answers locally, more slowly. Without it, she says she can't reach her thinking cloud and asks for a grown-up. Piper is local, so she can always speak. |
+| Network comes back | The next button press probes Groq while the child talks. The first successful answer switches turns back to the cloud. |
+| Offline brain also unavailable (Ollama stopped, model missing) | Same as having no offline brain. `lucy doctor` checks both local models. |
 | Groq rate limit on gpt-oss-20b | Transparent fallback to gpt-oss-120b (before the first word only, never mid-sentence). If both are limited, "I need a little rest". |
 | Groq error mid-reply | Lucy stops after what she has already said (no stitched-together reply). |
 | Whisper hears noise | Silence is trimmed locally and never uploaded. Segments with high `no_speech_prob` are dropped. |
@@ -342,6 +408,11 @@ children use Lucy.
   system-call set and address families, and no privilege escalation.
 * **One capability, `CAP_NET_ADMIN`,** is granted ambiently so `iw` can toggle
   Wi-Fi power saving.
+* **The offline brain** runs in its own service (`deploy/systemd/ollama.service`)
+  as a systemd `DynamicUser` that owns only its model store. It has no
+  capabilities, no devices, and a 2 GB memory cap, and under memory pressure the
+  kernel prefers to kill it rather than Lucy (`OOMScoreAdjust`). It listens on
+  127.0.0.1 only.
 * **The API key** lives in `/etc/lucy/credentials/groq_api_key` (root, mode 600)
   and reaches the service only through `LoadCredential=`. It is not in the
   config file, the environment, the logs, or the repository.
@@ -350,7 +421,10 @@ children use Lucy.
   `uv sync --locked --no-build`: prebuilt wheels only, and a lock that is out of
   step with `pyproject.toml` is refused. `uv_build` runs inside uv, so no build
   tool is downloaded either. The installer fetches a pinned uv release, and it
-  and the default Piper voice are checksum-verified.
+  and the default Piper voice are checksum-verified. So are Ollama (a pinned
+  release, hashed while it streams in, and installed only if the hash matches)
+  and the faster-whisper model (a pinned Hugging Face commit plus a SHA-256 per
+  file). Ollama verifies the Gemma model by digest when it pulls it.
 
 ---
 
@@ -363,8 +437,10 @@ children use Lucy.
 | HTTP adapters (SSE parsing, error translation, fallback, prewarm) | `httpx.MockTransport` |
 | Audio adapters (gapless splicing, stop, cancel, open failure, mic capping) | A simulated `sounddevice` whose thread calls the real callbacks |
 | Config, power knobs, systemd notify | Temp files, a fake sysfs tree, a real Unix datagram socket |
+| Offline brain (fallback at each stage, remembered outages, recovery, history limit, never mixing brains) | Fakes in `tests/test_pipeline.py`; a simulated faster-whisper in `tests/test_local.py` |
 | Real voice end to end | `tests/test_integration.py` (runs when `LUCY_TEST_VOICE` is set) |
-| On the device | `lucy doctor --listen`, `lucy say`, `lucy run --keyboard`, `lucy bench` |
+| Real offline turn: Piper speaks a question, faster-whisper hears it, a mocked Ollama answers | `tests/test_integration.py`, `tests/test_local.py` (with `LUCY_TEST_STT_MODEL`) |
+| On the device | `lucy doctor --listen`, `lucy say`, `lucy run --keyboard`, `lucy bench [--brain local]` |
 
 The suite runs in about a second, with no network or hardware, under `ruff`
 and `mypy --strict`.
@@ -376,10 +452,10 @@ and `mypy --strict`.
 * **Another provider:** set `api.base_url` and the model names. Any
   OpenAI-compatible endpoint works (OpenAI, a local Ollama server on another
   machine, …).
-* **Offline brain:** implement `ChatModel` for a local model and wrap it with
-  `FallbackChat` so it is used only when Groq is unreachable. On a 4 GB Pi 4,
-  a 1B model (for example Gemma 3 1B, about 0.8 GB) fits alongside Piper but
-  answers slowly. See the research comparison in `instructions.pdf`.
+* **A different offline model:** `ollama pull` it and set `local.model`. For
+  example, `gemma3:270m` is faster but simpler, and anything above about 2 GB
+  will not fit beside Piper on a 4 GB Pi. A more accurate local speech model is
+  `base.en` (point `local.stt_model` at it; roughly twice as slow).
 * **A different voice:** download any Piper voice and point `tts.voice` at it.
   `-low` voices are faster and `-high` voices are slower.
 * **A cloud moderator:** implement `Moderator.assess()` (see §8.1).

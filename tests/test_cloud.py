@@ -169,3 +169,33 @@ class TestPrewarm:
         assert api._warming is not None
         await api._warming
         await api.aclose()
+
+
+class TestReachability:
+    async def test_down_after_a_failed_connection_until_any_answer(self) -> None:
+        online = False
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if not online:
+                raise httpx.ConnectError("network is unreachable", request=request)
+            return httpx.Response(401, json={"error": {"message": "bad key"}})
+
+        api = client(handler)
+        assert api.reachable()
+        with pytest.raises(ServiceUnreachable):
+            await api.get_json("models")
+        assert not api.reachable()
+
+        online = True
+        api.prewarm()  # while down, every press probes, even right after a request
+        assert api._warming is not None
+        await api._warming
+        assert api.reachable()  # an error response still proves the service is reachable
+        await api.aclose()
+
+    async def test_slow_or_broken_answers_do_not_count_as_unreachable(self) -> None:
+        api = client(lambda _: httpx.Response(503, json={"error": {"message": "overloaded"}}))
+        with pytest.raises(ServiceError):
+            await api.get_json("models")
+        assert api.reachable()
+        await api.aclose()

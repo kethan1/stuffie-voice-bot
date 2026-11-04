@@ -11,3 +11,4 @@ voices/
 *.onnx
 *.onnx.json
 .env
+models/

@@ -9,22 +9,20 @@ import contextlib
 import logging
 import signal
 from contextlib import AsyncExitStack
-from dataclasses import dataclass
 
 from lucy import __version__
-from lucy.adapters.cloud import ChatModelSpec, FallbackChat, StreamingChat, WhisperTranscriber
 from lucy.adapters.console import KeyboardButton, LogIndicator
-from lucy.adapters.openai_api import ApiClient
 from lucy.adapters.piper_tts import PiperSpeech
 from lucy.adapters.power import CpuGovernor, NoPowerControl, PowerKnob, PowerManager, WifiPowerSave
 from lucy.adapters.sound import SoundDeviceMicrophone, SoundDeviceSpeaker
-from lucy.config import Config, device, read_api_key, read_system_prompt
+from lucy.brains import Local, build_cloud, build_local
+from lucy.config import Config, device, read_system_prompt
 from lucy.core.controller import Controller, Earcons
 from lucy.core.conversation import Conversation
-from lucy.core.errors import ConfigError
+from lucy.core.errors import ConfigError, LucyError
 from lucy.core.phrases import Phrase, PhraseBook
 from lucy.core.pipeline import TurnPipeline
-from lucy.core.ports import Button, ChatModel, Indicator, PowerControl
+from lucy.core.ports import Button, Indicator, PowerControl
 from lucy.core.safety import AllowAll, DistressScreen
 from lucy.core.tasks import BackgroundTasks
 from lucy.core.types import PowerMode
@@ -34,48 +32,6 @@ from lucy.platform.systemd import SystemdNotifier
 log = logging.getLogger(__name__)
 
 EXIT_CONFIG = 78  # EX_CONFIG: systemd is told not to restart on this (see lucy.service)
-
-
-@dataclass(frozen=True, slots=True)
-class Cloud:
-    api: ApiClient
-    stt: WhisperTranscriber
-    chat: ChatModel
-
-
-def build_cloud(config: Config) -> Cloud:
-    api_key = read_api_key(config.api)
-    if not api_key:
-        log.error(
-            "no API key: install it as the systemd credential %r or set %s; "
-            "Lucy will ask for a grown-up's help until then",
-            config.api.api_key_credential,
-            config.api.api_key_env,
-        )
-    api = ApiClient(
-        config.api.base_url,
-        api_key,
-        connect_timeout_s=config.api.connect_timeout_s,
-        keepalive_s=config.api.keepalive_s,
-    )
-    stt = WhisperTranscriber(
-        api,
-        model=config.stt.model,
-        language=config.stt.language,
-        prompt=config.stt.prompt,
-        timeout_s=config.stt.timeout_s,
-        no_speech_threshold=config.stt.no_speech_threshold,
-    )
-    llm = config.llm
-    chat: ChatModel = StreamingChat(
-        api, ChatModelSpec(llm.model, llm.params), timeout_s=llm.timeout_s
-    )
-    if llm.fallback_model:
-        fallback = StreamingChat(
-            api, ChatModelSpec(llm.fallback_model, llm.fallback_params), timeout_s=llm.timeout_s
-        )
-        chat = FallbackChat(chat, fallback)
-    return Cloud(api, stt, chat)
 
 
 def load_voice(config: Config) -> PiperSpeech:
@@ -150,7 +106,10 @@ async def run(config: Config, *, keyboard: bool = False) -> int:
         await asyncio.to_thread(tts.warm_up)
 
         cloud = build_cloud(config)
-        stack.push_async_callback(cloud.api.aclose)
+        stack.push_async_callback(cloud.aclose)
+        local = build_local(config)
+        if local is not None:
+            stack.push_async_callback(local.aclose)
         speaker = SoundDeviceSpeaker(
             sample_rate=tts.sample_rate,
             device=device(config.audio.output_device),
@@ -169,8 +128,8 @@ async def run(config: Config, *, keyboard: bool = False) -> int:
         conversation = Conversation(config.llm.history_exchanges)
         phrases = PhraseBook(LUCY.lines, tts)
         pipeline = TurnPipeline(
-            stt=cloud.stt,
-            chat=cloud.chat,
+            brain=cloud.brain(),
+            backup=local.brain() if local is not None else None,
             tts=tts,
             moderator=DistressScreen(extra=config.safety.extra_patterns)
             if config.safety.screen
@@ -198,7 +157,7 @@ async def run(config: Config, *, keyboard: bool = False) -> int:
         background = BackgroundTasks()
         stack.push_async_callback(background.cancel_all)
         background.spawn(notifier.watchdog(), "watchdog")
-        background.spawn(phrases.preload(), "preload-phrases")
+        background.spawn(_warm_up(phrases, local, config, system_prompt), "warm-up")
         button = build_button(config, keyboard)
 
         notifier.ready(f"Lucy {__version__} is awake")
@@ -217,6 +176,18 @@ async def run(config: Config, *, keyboard: bool = False) -> int:
         notifier.stopping()
         log.info("Lucy is going to sleep")
     return exit_code
+
+
+async def _warm_up(
+    phrases: PhraseBook, local: Local | None, config: Config, system_prompt: str
+) -> None:
+    """Pre-render Lucy's fixed lines, then load the local brain: one after the other, gently."""
+    await phrases.preload()
+    if local is not None and config.local.preload:
+        try:
+            await local.preload(system_prompt)
+        except LucyError as error:
+            log.warning("local brain is not ready, so Lucy needs the cloud for now: %s", error)
 
 
 async def _explain_failure(serving: asyncio.Task[None], pipeline: TurnPipeline) -> int:

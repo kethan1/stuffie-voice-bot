@@ -39,6 +39,22 @@ include_reasoning = false
 max_completion_tokens = 512
 temperature = 0.8
 
+[local]
+# Lucy's own brain on the Pi, used only when GroqCloud cannot be reached.
+# Installed and switched on by: sudo deploy/install.sh --local-backup
+enabled = false
+stt_model = "/opt/lucy/models/faster-whisper-tiny.en"   # speech recognition (faster-whisper)
+stt_threads = 4
+base_url = "http://127.0.0.1:11434/v1"   # Ollama, localhost only
+model = "gemma3:1b"
+history_exchanges = 2          # a 1B model on a Pi reads long prompts slowly
+timeout_s = 60.0
+preload = true                 # load both models at start-up, not during the first offline turn
+
+[local.params]
+max_tokens = 100
+temperature = 0.7
+
 [safety]
 screen = true                  # on-device distress screen; keep this on for children
 extra_patterns = []            # more regular expressions that route to "tell a grown-up"

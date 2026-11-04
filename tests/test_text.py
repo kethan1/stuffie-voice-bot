@@ -92,6 +92,18 @@ class TestConversation:
         contents = [m.content for m in conversation.prompt("s", "now")]
         assert contents == ["s", "q3", "a3", "q4", "a4", "now"]
 
+    def test_history_can_be_limited_per_request(self) -> None:
+        conversation = Conversation(max_exchanges=4)
+        for i in range(3):
+            conversation.record(f"q{i}", f"a{i}")
+        assert [m.content for m in conversation.prompt("s", "now", max_exchanges=1)] == [
+            "s",
+            "q2",
+            "a2",
+            "now",
+        ]
+        assert [m.content for m in conversation.prompt("s", "now", max_exchanges=0)] == ["s", "now"]
+
     def test_ignores_unanswered_and_clears(self) -> None:
         conversation = Conversation(max_exchanges=2)
         conversation.record("q", "")

@@ -3,7 +3,8 @@ Description=Lucy the Goose voice companion
 Documentation=file:///opt/lucy/src/README.md file:///opt/lucy/src/docs/OPERATIONS.md
 # No wait for network-online: if Wi-Fi is down, Lucy says so out loud instead of staying silent.
 Wants=network.target
-After=sound.target network.target
+# Ordered after the optional offline brain (no hard dependency: Lucy runs without it).
+After=sound.target network.target ollama.service
 StartLimitIntervalSec=120
 StartLimitBurst=5
 
@@ -32,8 +33,9 @@ TimeoutStopSec=15
 # Responsiveness: Lucy wins CPU contention against background housekeeping.
 Nice=-5
 OOMScoreAdjust=-500
-MemoryHigh=700M
-MemoryMax=1G
+# Headroom for the optional on-device speech model (faster-whisper tiny.en, ~150 MB).
+MemoryHigh=1G
+MemoryMax=1500M
 
 # Only privilege: toggling Wi-Fi power saving with `iw`.
 AmbientCapabilities=CAP_NET_ADMIN

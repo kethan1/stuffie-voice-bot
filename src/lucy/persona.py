@@ -55,6 +55,12 @@ LINES: Mapping[Phrase, Sequence[str]] = {
     Phrase.OFFLINE: (
         "Uh oh, I can't reach my thinking cloud right now. Can a grown-up check the Wi-Fi?",
     ),
+    Phrase.OWN_BRAIN: (
+        "Hmm, my thinking cloud is out of reach, so I'll think with my own goose brain. "
+        "Just a moment!",
+        "My cloud is far away right now, so let me think all by myself. This takes a little "
+        "longer!",
+    ),
     Phrase.TIRED: (
         "Whew, my goose brain needs a little rest. Let's talk again in a minute!",
         "Honk, I need a tiny nap. Ask me again in a minute, okay?",

@@ -10,12 +10,19 @@ Lucy starts talking as soon as the first clause has been synthesised. That
 clause plays while the next one is synthesised, and the next while the LLM is
 still writing. The queue to the speaker is bounded, which keeps memory flat and
 limits wasted work when a child interrupts.
+
+Speech recognition and the reply come from a :class:`Brain`: normally Groq in
+the cloud. When the cloud cannot be reached and a backup brain is configured
+(models running on the Pi), the turn moves to it, at the start if the cloud is
+already known to be down, or the moment a request fails to connect. Lucy says
+she is "thinking with her own goose brain" so the slower local answer is
+expected rather than a mystery.
 """
 
 import asyncio
 import logging
 from collections import deque
-from collections.abc import Sequence
+from collections.abc import AsyncGenerator, Callable
 from contextlib import aclosing
 from dataclasses import dataclass, field
 
@@ -34,9 +41,9 @@ from lucy.core.errors import (
 from lucy.core.metrics import TurnTimer
 from lucy.core.phrases import Phrase, PhraseBook
 from lucy.core.ports import ChatModel, Indicator, Moderator, Speaker, SpeechToText, TextToSpeech
-from lucy.core.tasks import run_together
+from lucy.core.tasks import detach, run_together
 from lucy.core.textnorm import to_speakable
-from lucy.core.types import Concern, Message, Status
+from lucy.core.types import Concern, Status
 
 log = logging.getLogger(__name__)
 
@@ -55,9 +62,27 @@ class TurnSettings:
     """Privacy: children's words are kept out of the logs unless this is enabled."""
 
 
+def _always() -> bool:
+    return True
+
+
+@dataclass(frozen=True, slots=True)
+class Brain:
+    """Where Lucy's understanding and answers come from: the cloud, or models on the Pi."""
+
+    name: str
+    stt: SpeechToText
+    chat: ChatModel
+    history_exchanges: int | None = None
+    """Send at most this many past exchanges (a small local model is slow to read long prompts)."""
+    reachable: Callable[[], bool] = _always
+    """False while this brain is known to be unreachable, so turns skip it without waiting."""
+
+
 @dataclass(slots=True)
 class _Turn:
     timer: TurnTimer
+    brain: Brain
     spoken: list[str] = field(default_factory=list)
 
 
@@ -65,8 +90,8 @@ class TurnPipeline:
     def __init__(
         self,
         *,
-        stt: SpeechToText,
-        chat: ChatModel,
+        brain: Brain,
+        backup: Brain | None = None,
         tts: TextToSpeech,
         moderator: Moderator,
         speaker: Speaker,
@@ -76,8 +101,8 @@ class TurnPipeline:
         system_prompt: str,
         settings: TurnSettings,
     ) -> None:
-        self._stt = stt
-        self._chat = chat
+        self._brain = brain
+        self._backup = backup
         self._tts = tts
         self._moderator = moderator
         self._speaker = speaker
@@ -89,21 +114,27 @@ class TurnPipeline:
 
     async def respond(self, recording: Pcm, timer: TurnTimer) -> None:
         """Answer one recording. Never raises except for cancellation (barge-in)."""
-        turn = _Turn(timer)
+        turn = _Turn(timer, self._brain)
         try:
             await self._respond(recording, turn)
         except asyncio.CancelledError:
-            log.info("turn interrupted: %s", timer.report())
+            log.info("turn interrupted (%s brain): %s", turn.brain.name, timer.report())
             raise
         except Exception as error:
             if isinstance(error, LucyError):
-                log.warning("turn failed: %s: %s (%s)", type(error).__name__, error, timer.report())
+                log.warning(
+                    "turn failed (%s brain): %s: %s (%s)",
+                    turn.brain.name,
+                    type(error).__name__,
+                    error,
+                    timer.report(),
+                )
             else:
                 log.exception("turn failed unexpectedly (%s)", timer.report())
             if not turn.spoken:
                 await self.say(phrase_for(error), status=Status.ERROR)
         else:
-            log.info("turn complete: %s", timer.report())
+            log.info("turn complete (%s brain): %s", turn.brain.name, timer.report())
 
     async def say(self, phrase: Phrase, *, status: Status = Status.SPEAKING) -> None:
         """Speak one of Lucy's fixed lines. Never raises except for cancellation."""
@@ -124,7 +155,9 @@ class TurnPipeline:
             await self.say(Phrase.DIDNT_HEAR)
             return
 
-        text = (await self._stt.transcribe(speech)).strip()
+        if not self._brain.reachable():
+            await self._fall_back(turn, "still unreachable")
+        text = (await self._transcribe(speech, turn)).strip()
         turn.timer.mark("stt")
         if not text:
             log.info("transcript was empty (%.2fs of sound)", speech.duration)
@@ -143,14 +176,62 @@ class TurnPipeline:
             )
             return
 
-        messages = self._conversation.prompt(self._system_prompt, text)
         try:
-            await self._stream_reply(messages, turn)
+            await self._stream_reply(text, turn)
         finally:
             # Remember what was actually said, even when interrupted, so "why?" still works.
             self._conversation.record(text, " ".join(turn.spoken))
 
-    async def _stream_reply(self, messages: Sequence[Message], turn: _Turn) -> None:
+    async def _transcribe(self, speech: Pcm, turn: _Turn) -> str:
+        try:
+            return await turn.brain.stt.transcribe(speech)
+        except ServiceUnreachable:
+            if not await self._fall_back(turn, "unreachable"):
+                raise
+        return await turn.brain.stt.transcribe(speech)
+
+    async def _reply(self, text: str, turn: _Turn) -> AsyncGenerator[str, None]:
+        """Stream the reply, moving to the backup brain if the cloud cannot be reached.
+
+        The switch only happens before the first word: a reply is never stitched
+        together from two brains.
+        """
+        produced = False
+        try:
+            async with aclosing(self._ask(turn.brain, text)) as deltas:
+                async for delta in deltas:
+                    produced = True
+                    yield delta
+        except ServiceUnreachable:
+            if produced or not await self._fall_back(turn, "unreachable"):
+                raise
+        else:
+            return
+        async with aclosing(self._ask(turn.brain, text)) as deltas:
+            async for delta in deltas:
+                yield delta
+
+    def _ask(self, brain: Brain, text: str) -> AsyncGenerator[str, None]:
+        messages = self._conversation.prompt(
+            self._system_prompt, text, max_exchanges=brain.history_exchanges
+        )
+        return brain.chat.stream(messages)
+
+    async def _fall_back(self, turn: _Turn, why: str) -> bool:
+        """Move this turn to the backup brain. False if there is none, or it is already in use."""
+        if self._backup is None or turn.brain is self._backup:
+            return False
+        log.warning("%s brain %s; using the %s brain", turn.brain.name, why, self._backup.name)
+        turn.brain = self._backup
+        turn.timer.mark("fallback")
+        try:
+            # Queued, not awaited: the local brain starts work while Lucy explains the wait.
+            detach(self._speaker.enqueue(await self._phrases.render(Phrase.OWN_BRAIN)))
+        except Exception:
+            log.warning("could not say that Lucy is thinking locally", exc_info=True)
+        return True
+
+    async def _stream_reply(self, text: str, turn: _Turn) -> None:
         settings = self._settings
         texts: asyncio.Queue[Chunk | None] = asyncio.Queue()
         clips: asyncio.Queue[tuple[str, Pcm] | None] = asyncio.Queue(maxsize=1)
@@ -160,7 +241,7 @@ class TurnPipeline:
                 first_clause_min_words=settings.first_clause_min_words,
                 max_words=settings.max_chunk_words,
             )
-            async with aclosing(self._chat.stream(messages)) as deltas:
+            async with aclosing(self._reply(text, turn)) as deltas:
                 async for delta in deltas:
                     turn.timer.mark("first_token")
                     for chunk in chunker.feed(delta):

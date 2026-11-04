@@ -7,7 +7,7 @@ from lucy.core.conversation import Conversation
 from lucy.core.errors import RateLimited, ServiceError, ServiceUnreachable
 from lucy.core.metrics import TurnTimer
 from lucy.core.phrases import Phrase, PhraseBook
-from lucy.core.pipeline import TurnPipeline, TurnSettings, phrase_for
+from lucy.core.pipeline import Brain, TurnPipeline, TurnSettings, phrase_for
 from lucy.core.safety import DistressScreen
 from lucy.core.types import Role, Status
 from lucy.persona import LUCY
@@ -15,16 +15,28 @@ from tests.fakes import FakeChat, FakeIndicator, FakeSpeaker, FakeSTT, FakeTTS, 
 
 
 class Rig:
-    def __init__(self, *, stt: FakeSTT | None = None, chat: FakeChat | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        stt: FakeSTT | None = None,
+        chat: FakeChat | None = None,
+        local: tuple[FakeSTT, FakeChat] | None = None,
+        cloud_reachable: bool = True,
+    ) -> None:
         self.stt = stt or FakeSTT()
         self.chat = chat or FakeChat()
+        self.cloud_reachable = cloud_reachable
+        self.local_stt, self.local_chat = local or (FakeSTT(), FakeChat())
+        backup = (
+            Brain("local", self.local_stt, self.local_chat, history_exchanges=1) if local else None
+        )
         self.tts = FakeTTS()
         self.speaker = FakeSpeaker()
         self.indicator = FakeIndicator()
         self.conversation = Conversation(4)
         self.pipeline = TurnPipeline(
-            stt=self.stt,
-            chat=self.chat,
+            brain=Brain("cloud", self.stt, self.chat, reachable=lambda: self.cloud_reachable),
+            backup=backup,
             tts=self.tts,
             moderator=DistressScreen(),
             speaker=self.speaker,
@@ -135,3 +147,79 @@ async def test_barge_in_cancels_cleanly_and_keeps_partial_reply() -> None:
     assert all(future.done() for _, future in rig.speaker.queued)
     remembered = rig.conversation.prompt("s", "next")[-2].content
     assert remembered.startswith("Honk!")
+
+
+UNREACHABLE = ServiceUnreachable("no route to api.groq.com")
+LOCAL_REPLY = ("Honk! I think ", "it is the sun. ")
+
+
+async def test_cloud_unreachable_at_speech_moves_to_the_local_brain() -> None:
+    rig = Rig(
+        stt=FakeSTT(error=UNREACHABLE),
+        local=(FakeSTT(text="why is the sky blue"), FakeChat(deltas=LOCAL_REPLY)),
+    )
+    await rig.respond()
+    assert rig.chat.calls == []  # the cloud was never asked for a reply
+    assert len(rig.local_stt.calls) == 1
+    assert rig.spoken_phrase(Phrase.OWN_BRAIN)
+    assert rig.tts.texts[-2:] == ["Honk!", "I think it is the sun."]
+    assert rig.timer.get("fallback") is not None
+
+
+async def test_cloud_unreachable_at_reply_moves_to_the_local_brain() -> None:
+    rig = Rig(chat=FakeChat(error=UNREACHABLE), local=(FakeSTT(), FakeChat(deltas=LOCAL_REPLY)))
+    await rig.respond()
+    assert len(rig.stt.calls) == 1  # the cloud transcript is kept
+    assert rig.local_stt.calls == []
+    assert len(rig.local_chat.calls) == 1
+    assert rig.spoken_phrase(Phrase.OWN_BRAIN)
+    assert rig.tts.texts[-1] == "I think it is the sun."
+
+
+async def test_known_outage_skips_the_cloud_entirely() -> None:
+    rig = Rig(local=(FakeSTT(), FakeChat(deltas=LOCAL_REPLY)), cloud_reachable=False)
+    await rig.respond()
+    assert rig.stt.calls == []
+    assert rig.chat.calls == []
+    assert len(rig.local_chat.calls) == 1
+    # Lucy explains the wait before the slower local answer.
+    own_brain = next(i for i, t in enumerate(rig.tts.texts) if t in LUCY.lines[Phrase.OWN_BRAIN])
+    assert own_brain < rig.tts.texts.index("Honk!")
+
+
+async def test_local_brain_gets_less_history() -> None:
+    rig = Rig(local=(FakeSTT(), FakeChat(deltas=LOCAL_REPLY)), cloud_reachable=False)
+    for i in range(3):
+        rig.conversation.record(f"q{i}", f"a{i}")
+    await rig.respond()
+    sent = [m.content for m in rig.local_chat.calls[0][1:]]
+    assert sent == ["q2", "a2", "why is the sky blue"]
+
+
+async def test_other_cloud_failures_do_not_use_the_local_brain() -> None:
+    rig = Rig(chat=FakeChat(error=RateLimited("busy")), local=(FakeSTT(), FakeChat()))
+    await rig.respond()
+    assert rig.local_chat.calls == []
+    assert rig.spoken_phrase(Phrase.TIRED)
+
+
+async def test_never_mixes_brains_mid_reply() -> None:
+    cloud = FakeChat(deltas=["Honk! ", "The sky"], error=UNREACHABLE, error_after=1)
+    rig = Rig(chat=cloud, local=(FakeSTT(), FakeChat(deltas=LOCAL_REPLY)))
+    await rig.respond()
+    assert rig.local_chat.calls == []  # the cloud had started answering: no switch
+    assert "I think it is the sun." not in rig.tts.texts
+
+
+async def test_offline_everywhere_says_so() -> None:
+    rig = Rig(stt=FakeSTT(error=UNREACHABLE), local=(FakeSTT(error=UNREACHABLE), FakeChat()))
+    await rig.respond()
+    assert rig.spoken_phrase(Phrase.OFFLINE)
+
+
+async def test_without_a_backup_an_outage_is_reported() -> None:
+    rig = Rig(stt=FakeSTT(error=UNREACHABLE), cloud_reachable=False)
+    await rig.respond()
+    assert len(rig.stt.calls) == 1  # with no backup, the cloud is still tried
+    assert rig.spoken_phrase(Phrase.OFFLINE)
+    assert not rig.spoken_phrase(Phrase.OWN_BRAIN)

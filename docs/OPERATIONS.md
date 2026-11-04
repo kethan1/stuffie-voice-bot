@@ -33,6 +33,7 @@ sudo reboot
 | `--playback-card ID`, `--capture-card ID` | Auto-detection picked the wrong sound card (`aplay -l`, `arecord -l`) |
 | `--voice en_US-lessac-medium` | You want a different Piper voice |
 | `--tune` | Always, for a finished toy: boot-time power savings, unused services off, journal in RAM |
+| `--local-backup` | You want Lucy to keep answering when GroqCloud is unreachable (no Wi-Fi, school firewall, outage). Installs Ollama with Gemma 3 1B and an on-device speech model: about 2 GB of SD card space and a ~2.5 GB one-time download. Answers offline take several seconds. |
 | `--read-only` | Last step, once everything works: protects the SD card from sudden power loss |
 
 To set or replace the API key later:
@@ -60,17 +61,38 @@ sudo lucy bench                    # latency breakdown, measured on this Pi
 `first_audio` is high, compare `stt` and `first_token` (network or Groq) with
 the gap to `first_audio` (Piper on the Pi).
 
+### Offline brain (if installed with `--local-backup`)
+
+```bash
+sudo lucy doctor                   # includes "local speech model" and "local brain (Ollama)"
+sudo lucy bench --brain local      # offline latency on this Pi
+```
+
+To rehearse an outage without touching the Wi-Fi (which would also drop your
+SSH session), point Lucy at an address that can never resolve, then put it back:
+
+```bash
+sudo sed -i 's|^base_url = "https://api.groq.com|base_url = "https://offline.invalid|' /etc/lucy/config.toml
+sudo systemctl restart lucy        # squeeze the wing: Lucy says she'll think on her own
+sudo sed -i 's|^base_url = "https://offline.invalid|base_url = "https://api.groq.com|' /etc/lucy/config.toml
+sudo systemctl restart lucy
+```
+
+The journal shows `cloud brain unreachable; using the local brain` and
+`turn complete (local brain): …`.
+
 ## 5. Day-to-day
 
 | Task | Command |
 |---|---|
-| Live logs | `journalctl -u lucy -f` |
+| Live logs | `journalctl -u lucy -f` (and `journalctl -u ollama -f` for the offline brain) |
 | Status | `systemctl status lucy` |
 | Restart after a config change | `sudo systemctl restart lucy` |
 | Temperature / throttling | `vcgencmd measure_temp; vcgencmd get_throttled` |
 
 Every turn logs one line such as
-`turn complete: stt=0.41s first_token=0.68s first_synth=0.93s first_audio=0.93s total=7.12s`.
+`turn complete (cloud brain): stt=0.41s first_token=0.68s first_synth=0.93s first_audio=0.93s total=7.12s`.
+Offline turns say `(local brain)` and include `fallback=…`.
 Children's words are **not** logged unless `turn.log_transcripts = true`.
 
 ## 6. Tuning
@@ -85,6 +107,8 @@ All settings are in `/etc/lucy/config.toml` (documented inline).
 | Fewer "I didn't hear that" | Lower `turn.speech_threshold_dbfs` (e.g. `-55`), or raise mic gain in `alsamixer` |
 | Answers that are less creative and more steady | `llm.params.temperature = 0.5` |
 | More context for follow-ups | `llm.history_exchanges = 10` (slightly slower and costlier) |
+| Faster offline answers | `sudo ollama pull gemma3:270m`, then `local.model = "gemma3:270m"` (quicker but simpler answers); `local.params.max_tokens = 60` |
+| More accurate offline hearing | A `base.en` faster-whisper model in `local.stt_model` (about twice as slow as `tiny.en`) |
 
 ## 7. Updating
 
@@ -97,6 +121,8 @@ sudo deploy/install.sh --read-only && sudo reboot           # only if it was rea
 
 Edited config files are never overwritten. If the template changed, the new
 version is written next to yours as `config.toml.new` so you can compare them.
+If your config enables the offline brain, re-running the installer keeps it
+installed and up to date without `--local-backup`.
 
 ## 8. Troubleshooting
 
@@ -111,13 +137,19 @@ version is written next to yours as `config.toml.new` so you can compare them.
 | Crackles or gaps | CPU starved or weak power | `vcgencmd get_throttled` (non-zero = under-voltage); raise `audio.output_latency_s` to `0.12` |
 | Button does nothing | Wiring or pin number | `lucy doctor`; `gpioinfo` shows `lucy-button` on line 17 |
 | `CPU governor ... not writable` in doctor | Service never started since boot | Start it once; its `ExecStartPre` grants access |
+| Lucy "thinks on her own" though the Wi-Fi works | Groq is blocked (firewall, DNS) | `curl -sI https://api.groq.com`; the next press re-checks automatically |
+| Offline: "Can a grown-up check the Wi-Fi?" | The offline brain is not running | `systemctl status ollama`; `ollama list` should show `gemma3:1b`; `sudo lucy doctor` |
+| Journal: `local brain is not ready` | Ollama started after Lucy, or the model is missing | `sudo ollama pull gemma3:1b && sudo systemctl restart lucy` |
 
 ## 9. Uninstall
 
 ```bash
-sudo systemctl disable --now lucy
+sudo systemctl disable --now lucy ollama
 sudo rm -rf /opt/lucy /etc/lucy /var/cache/lucy /usr/local/bin/lucy /etc/systemd/system/lucy.service \
   /etc/systemd/journald.conf.d/lucy.conf
+# Only if --local-backup was used: Ollama, its libraries, and its models
+sudo rm -rf /usr/local/bin/ollama /usr/local/lib/ollama /etc/systemd/system/ollama.service \
+  /var/lib/private/ollama /var/lib/ollama
 sudo userdel lucy
 sudo mv /etc/asound.conf.lucy-backup /etc/asound.conf 2>/dev/null || sudo rm -f /etc/asound.conf
 sudo cp /boot/firmware/config.txt.lucy-backup /boot/firmware/config.txt   # if --tune/--i2s-amp was used
