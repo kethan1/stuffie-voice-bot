@@ -440,6 +440,7 @@ children use Lucy.
 | Offline brain (fallback at each stage, remembered outages, recovery, history limit, never mixing brains) | Fakes in `tests/test_pipeline.py`; a simulated faster-whisper in `tests/test_local.py` |
 | Real voice end to end | `tests/test_integration.py` (runs when `LUCY_TEST_VOICE` is set) |
 | Real offline turn: Piper speaks a question, faster-whisper hears it, a mocked Ollama answers | `tests/test_integration.py`, `tests/test_local.py` (with `LUCY_TEST_STT_MODEL`) |
+| On a laptop | `make doctor`, `make say`, `make run`, `make bench` with `dev.toml`: the same code on the laptop's mic and speakers, Enter as the button, no GPIO or power knobs |
 | On the device | `lucy doctor --listen`, `lucy say`, `lucy run --keyboard`, `lucy bench [--brain local]` |
 
 The suite runs in about a second, with no network or hardware, under `ruff`

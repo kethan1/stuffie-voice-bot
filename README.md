@@ -67,39 +67,56 @@ safety model, and failure handling) is in
 
 The key is stored in `/etc/lucy/credentials/groq_api_key` (root-only) and
 reaches the service only as a systemd credential. It never goes in the config
-file or the repository. For development on a laptop, export `GROQ_API_KEY`
-instead.
+file or the repository. On a laptop, put it in `.env` instead (see below).
 
 ## Development
 
-Requires Python 3.11+ and [uv](https://docs.astral.sh/uv/). On Linux, the
-audio adapters also need PortAudio (`sudo apt install libportaudio2`).
+Requires Python 3.11+ and [uv](https://docs.astral.sh/uv/), on Linux or macOS. On
+Linux, the audio adapters also need PortAudio (`sudo apt install libportaudio2`).
+The macOS wheels include it.
 
 ```bash
 make dev          # uv sync: create .venv with Lucy and the dev tools from uv.lock
 make check        # ruff + mypy --strict + pytest (no hardware or network needed)
-make voice        # download the default Piper voice into ./voices
 make integration  # end-to-end test with the real voice and a mocked Groq
 make lock         # re-resolve uv.lock to the newest releases at least two weeks old
-
-export GROQ_API_KEY=...            # then, on a laptop with a mic and speakers:
-uv run lucy --config dev.toml run --keyboard
 ```
 
 Add or change dependencies with `uv add` / `uv remove` so `uv.lock` stays in step;
 the installer refuses a stale lock.
 
-`dev.toml` only needs the settings that differ from the defaults, for example:
+### Running Lucy on a laptop
 
-```toml
-[tts]
-voice = "voices/en_US-amy-medium.onnx"
-[led]
-enabled = false
-[power]
-manage_cpu_governor = false
-manage_wifi = false
+Lucy runs on a laptop's own microphone and speakers, with the Enter key standing
+in for her wing. [`dev.toml`](dev.toml) holds the few settings that differ from
+the Pi. It uses the voice in `./voices` and the keyboard button, has no LED, and
+leaves the laptop's CPU governor and Wi-Fi alone. Everything else, including
+the Groq models, the safety screen, and the streaming pipeline, is the same code
+and configuration the Pi runs.
+
+Put your Groq key in a file named `.env` (gitignored) in the repository as
+`GROQ_API_KEY=gsk_...`, or export `GROQ_API_KEY`. Lucy reads `.env` from the
+directory you run her in. Then:
+
+```bash
+make doctor       # fetches the voice the first time; checks key, mic, speakers, Groq (speak when asked)
+make say          # Lucy says hello through the speakers (TEXT="..." to change it)
+make run          # talk to her: Enter to start, Enter again to stop; Ctrl-C quits
+make bench        # latency breakdown, measured from this laptop
 ```
+
+These are shorthand for `uv run lucy --config dev.toml <command>`,
+which also takes any other option (`lucy --help`). Use `CONFIG=my.toml` to try a
+different config. With `dev.toml`, the log shows what Lucy heard on each turn.
+
+* **Other sound devices:** `uv run python -m sounddevice` lists them. Put a name
+  in `audio.input_device` / `audio.output_device` in `dev.toml`.
+* **The offline brain:** run `make stt-model`, install [Ollama](https://ollama.com),
+  run `ollama pull gemma3:1b`, and set `[local] enabled = true` in `dev.toml`.
+  `make doctor` then checks it too, and `uv run lucy --config dev.toml bench
+  --brain local` measures it. To rehearse an outage, start Lucy
+  with the laptop's Wi-Fi off. She answers with her own goose brain, and goes
+  back to the cloud a turn or so after the Wi-Fi returns.
 
 ## Project layout
 
@@ -114,6 +131,7 @@ src/lucy/
   app.py         composition root
   config.py      strict TOML configuration
 deploy/          installer, systemd unit, ALSA routing, boot tuning
+dev.toml         laptop settings for development (`make run`)
 uv.lock          hash-locked dependencies for every platform, including the Pi
 tests/           fast tests with fakes for every port (no hardware, no network)
 docs/            architecture, hardware, operations

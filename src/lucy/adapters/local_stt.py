@@ -78,7 +78,8 @@ class FasterWhisperTranscriber:
         if not (self._model_dir / "model.bin").is_file():
             raise ConfigError(
                 f"local speech model not found in {self._model_dir} "
-                "(run deploy/install.sh --local-backup)"
+                "(deploy/install.sh --local-backup installs it on the Pi, "
+                "`make stt-model` on a laptop)"
             )
         try:
             from faster_whisper import WhisperModel

@@ -1,0 +1,33 @@
+# Lucy on a laptop, for development: `make run` (see README.md, "Running Lucy on a laptop").
+#
+# Only the settings that differ on a laptop are here. Everything else is the same as on
+# the Pi (deploy/config.toml documents every key). Relative paths are relative to this file.
+# The Groq API key goes in a gitignored .env file (GROQ_API_KEY=...) or the environment.
+
+[tts]
+voice = "voices/en_US-amy-medium.onnx"   # `make voice` downloads it
+
+[audio]
+# "" = the laptop's default microphone and speakers. To pick others, list them with
+# `uv run python -m sounddevice` and put a name (or part of one) or an index here.
+input_device = ""
+output_device = ""
+
+[button]
+backend = "keyboard"           # Enter starts talking, Enter again stops
+
+[led]
+enabled = false                # no LED: status changes are logged at debug level
+
+[power]
+manage_cpu_governor = false    # leave the laptop's own power management alone
+manage_wifi = false
+
+[turn]
+log_transcripts = true         # show what Lucy heard (your own voice, in your own terminal)
+
+[local]
+# The offline brain, as on the Pi. To try it: `make stt-model`, install Ollama
+# (https://ollama.com), `ollama pull gemma3:1b`, then set enabled = true.
+enabled = false
+stt_model = "models/faster-whisper-tiny.en"

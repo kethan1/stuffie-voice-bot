@@ -27,6 +27,22 @@ class TestConfig:
         config = load_config(REPO / "deploy" / "config.toml")
         assert config.button.backend == "gpio"
 
+    def test_laptop_config_leaves_the_laptop_alone(self) -> None:
+        config = load_config(REPO / "dev.toml")
+        assert config.button.backend == "keyboard"
+        assert not config.led.enabled
+        assert not config.power.manage_cpu_governor
+        assert not config.power.manage_wifi
+        assert config.tts.voice == REPO / "voices" / "en_US-amy-medium.onnx"  # `make voice`
+        assert config.local.stt_model == REPO / "models" / "faster-whisper-tiny.en"
+
+    def test_relative_paths_are_relative_to_the_config_file(self, tmp_path: Path) -> None:
+        path = tmp_path / "c.toml"
+        path.write_text('[tts]\nvoice = "voices/x.onnx"\n[local]\nstt_model = "/m/tiny"\n')
+        config = load_config(path)
+        assert config.tts.voice == tmp_path / "voices" / "x.onnx"
+        assert config.local.stt_model == Path("/m/tiny")
+
     def test_overrides_and_types(self, tmp_path: Path) -> None:
         path = tmp_path / "c.toml"
         path.write_text(
@@ -61,13 +77,34 @@ class TestConfig:
         with pytest.raises(ConfigError, match=message):
             load_config(path)
 
-    def test_api_key_prefers_systemd_credential(self, tmp_path: Path) -> None:
+    def test_api_key_prefers_credential_then_environment_then_env_file(
+        self, tmp_path: Path
+    ) -> None:
         (tmp_path / "groq_api_key").write_text("from-credential\n")
+        env_file = tmp_path / ".env"
+        env_file.write_text("GROQ_API_KEY=from-file\n")
         settings = Config().api
         environ = {"CREDENTIALS_DIRECTORY": str(tmp_path), "GROQ_API_KEY": "from-env"}
-        assert read_api_key(settings, environ) == "from-credential"
-        assert read_api_key(settings, {"GROQ_API_KEY": " from-env "}) == "from-env"
-        assert read_api_key(settings, {}) == ""
+        assert read_api_key(settings, environ, env_file) == "from-credential"
+        assert read_api_key(settings, {"GROQ_API_KEY": " from-env "}, env_file) == "from-env"
+        assert read_api_key(settings, {}, env_file) == "from-file"
+        assert read_api_key(settings, {}, tmp_path / "absent.env") == ""
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "GROQ_API_KEY=gsk_x",
+            "export GROQ_API_KEY=gsk_x",
+            " GROQ_API_KEY = gsk_x ",
+            'GROQ_API_KEY="gsk_x"',
+            "GROQ_API_KEY='gsk_x'  # the class key",
+            "GROQ_API_KEY=gsk_x # the class key",
+        ],
+    )
+    def test_env_file_syntax(self, tmp_path: Path, line: str) -> None:
+        env_file = tmp_path / ".env"
+        env_file.write_text(f"# Lucy\n\n# GROQ_API_KEY=old\nOTHER=1\n{line}\n")
+        assert read_api_key(Config().api, {}, env_file) == "gsk_x"
 
 
 def fake_sysfs(tmp_path: Path, governor: str = "ondemand") -> Path:

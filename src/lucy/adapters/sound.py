@@ -33,6 +33,17 @@ log = logging.getLogger(__name__)
 Device = int | str | None
 
 
+def import_sounddevice() -> Any:
+    """Import ``sounddevice``, or say how to install the PortAudio library it loads."""
+    try:
+        import sounddevice
+    except OSError as error:  # its macOS and Windows wheels bundle PortAudio; Linux needs it
+        raise AudioDeviceError(
+            f"{error} (on Debian or Ubuntu: sudo apt install libportaudio2)"
+        ) from error
+    return sounddevice
+
+
 class SoundDeviceMicrophone:
     def __init__(
         self,
@@ -42,9 +53,7 @@ class SoundDeviceMicrophone:
         max_seconds: float = 20.0,
         block_s: float = 0.05,
     ) -> None:
-        import sounddevice
-
-        self._sd = sounddevice
+        self._sd = import_sounddevice()
         self._sample_rate = sample_rate
         self._device = device
         self._max_bytes = round(max_seconds * sample_rate) * SAMPLE_WIDTH
@@ -113,9 +122,7 @@ class SoundDeviceSpeaker:
         latency_s: float = 0.08,
         blocksize: int = 1024,
     ) -> None:
-        import sounddevice
-
-        self._sd = sounddevice
+        self._sd = import_sounddevice()
         self._sample_rate = sample_rate
         self._device = device
         self._latency_s = latency_s

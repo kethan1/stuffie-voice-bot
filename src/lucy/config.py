@@ -3,9 +3,12 @@
 * Every setting has a sensible default, so an empty file is a valid file.
 * Unknown keys are errors. A typo such as ``max_recrod_s`` fails loudly at
   start-up instead of being silently ignored.
+* Relative paths are relative to the config file, so a config such as the
+  repository's ``dev.toml`` works from any working directory.
 * The API key never lives in the TOML file. It is read from the systemd
   credential ``groq_api_key`` (``LoadCredential=``; only the service can read
-  it) or, for development, from the ``GROQ_API_KEY`` environment variable.
+  it) or, for development, from ``GROQ_API_KEY`` in the environment or in a
+  ``.env`` file in the working directory.
 """
 
 import dataclasses
@@ -166,7 +169,7 @@ def load_config(path: Path | None) -> Config:
         raise ConfigError(f"config file not found: {path}") from error
     except tomllib.TOMLDecodeError as error:
         raise ConfigError(f"{path} is not valid TOML: {error}") from error
-    config = _build(Config, data, "")
+    config = _build(Config, data, "", path.parent)
     _validate(config)
     return config
 
@@ -177,13 +180,44 @@ def default_config_path(environ: Mapping[str, str] = os.environ) -> Path | None:
     return DEFAULT_CONFIG_PATH if DEFAULT_CONFIG_PATH.is_file() else None
 
 
-def read_api_key(settings: ApiSettings, environ: Mapping[str, str] = os.environ) -> str:
-    """Return the API key from a systemd credential or the environment ("" if absent)."""
+def read_api_key(
+    settings: ApiSettings,
+    environ: Mapping[str, str] = os.environ,
+    env_file: Path = Path(".env"),
+) -> str:
+    """Return the API key from a systemd credential, the environment, or ``env_file``.
+
+    Returns "" if none has it. The environment wins over ``env_file``, as with any
+    ``.env`` loader, and the key read from the file is not added to the environment.
+    """
     if credentials := environ.get("CREDENTIALS_DIRECTORY"):
         path = Path(credentials) / settings.api_key_credential
         if path.is_file():
             return path.read_text(encoding="utf-8").strip()
-    return environ.get(settings.api_key_env, "").strip()
+    if key := environ.get(settings.api_key_env, "").strip():
+        return key
+    return _read_env_file(env_file).get(settings.api_key_env, "")
+
+
+def _read_env_file(path: Path) -> dict[str, str]:
+    """Parse a ``.env`` file: ``NAME=value`` lines, optionally quoted or after ``export``."""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:  # usually absent; a key problem must never stop Lucy from starting
+        return {}
+    values = {}
+    for line in lines:
+        name, sep, value = line.strip().removeprefix("export ").partition("=")
+        if not sep or name.startswith("#"):
+            continue
+        value = value.strip()
+        quote = value[:1]
+        if quote in ("'", '"'):
+            value = value[1:].partition(quote)[0]
+        else:
+            value = value.partition(" #")[0].rstrip()  # drop a trailing comment
+        values[name.strip()] = value
+    return values
 
 
 def read_system_prompt(config: Config, default: str) -> str:
@@ -233,7 +267,7 @@ def _validate(config: Config) -> None:
 T = TypeVar("T")
 
 
-def _build(cls: type[T], table: Any, where: str) -> T:
+def _build(cls: type[T], table: Any, where: str, base: Path) -> T:
     label = f"[{where}]" if where else "the top level"
     if not isinstance(table, Mapping):
         raise ConfigError(f"{label} must be a table")
@@ -243,19 +277,19 @@ def _build(cls: type[T], table: Any, where: str) -> T:
         raise ConfigError(f"unknown setting(s) in {label}: {', '.join(unknown)}")
     hints = typing.get_type_hints(cls)
     values = {
-        name: _coerce(hints[name], value, f"{where}.{name}" if where else name)
+        name: _coerce(hints[name], value, f"{where}.{name}" if where else name, base)
         for name, value in table.items()
     }
     return cls(**values)
 
 
-def _coerce(kind: Any, value: Any, where: str) -> Any:
+def _coerce(kind: Any, value: Any, where: str, base: Path) -> Any:
     origin, args = typing.get_origin(kind), typing.get_args(kind)
     if dataclasses.is_dataclass(kind):
-        return _build(kind, value, where)  # type: ignore[arg-type]
+        return _build(kind, value, where, base)  # type: ignore[arg-type]
     if origin in (typing.Union, types.UnionType):
         (inner,) = [arg for arg in args if arg is not type(None)]
-        return _coerce(inner, value, where)
+        return _coerce(inner, value, where, base)
     if kind is Any:
         return value
     if kind is bool and isinstance(value, bool):
@@ -267,9 +301,9 @@ def _coerce(kind: Any, value: Any, where: str) -> Any:
     if kind is str and isinstance(value, str):
         return value
     if kind is Path and isinstance(value, str):
-        return Path(value)
+        return base / value  # an absolute value replaces base entirely
     if origin is tuple and isinstance(value, list):
-        return tuple(_coerce(args[0], item, f"{where}[]") for item in value)
+        return tuple(_coerce(args[0], item, f"{where}[]", base) for item in value)
     if origin is dict and isinstance(value, Mapping):
         return dict(value)
     expected = getattr(kind, "__name__", str(kind))

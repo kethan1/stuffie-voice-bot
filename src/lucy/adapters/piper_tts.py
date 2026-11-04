@@ -49,7 +49,7 @@ class PiperSpeech:
         if not model_path.is_file() or not config_path.is_file():
             raise ConfigError(
                 f"Piper voice not found: need {model_path} and {config_path} "
-                "(run deploy/install.sh or `python -m piper.download_voices`)"
+                "(deploy/install.sh installs it on the Pi, `make voice` on a laptop)"
             )
         options = onnxruntime.SessionOptions()
         options.intra_op_num_threads = max(1, threads)

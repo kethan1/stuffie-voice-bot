@@ -18,8 +18,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Only needed on the Pi (or any Linux board with a GPIO character device).
-pi = ["gpiod>=2.2,<3"]
+# Only needed on the Pi (or any Linux board with a GPIO character device). The marker lets
+# `make dev` work on a Mac, where gpiod cannot be built.
+pi = ["gpiod>=2.2,<3; sys_platform == 'linux'"]
 local = [
     "faster-whisper>=1.1,<2",
 ]

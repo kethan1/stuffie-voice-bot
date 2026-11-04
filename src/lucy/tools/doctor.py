@@ -15,6 +15,7 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from lucy.adapters.power import CPUFREQ_ROOT
+from lucy.adapters.sound import import_sounddevice
 from lucy.app import load_voice
 from lucy.brains import build_cloud, build_local
 from lucy.config import Config, device, read_api_key, read_system_prompt
@@ -73,8 +74,8 @@ def api_key(config: Config) -> str:
     key = read_api_key(config.api)
     if not key:
         raise LucyError(
-            f"missing: set {config.api.api_key_env} or install /etc/lucy/credentials/"
-            f"{config.api.api_key_credential} (see README)"
+            f"missing: set {config.api.api_key_env} (or put it in .env) or install "
+            f"/etc/lucy/credentials/{config.api.api_key_credential} (see README)"
         )
     return f"present ({len(key)} characters)"
 
@@ -95,8 +96,7 @@ async def voice(config: Config) -> str:
 
 
 def speaker(config: Config) -> str:
-    import sounddevice as sd
-
+    sd = import_sounddevice()
     out = device(config.audio.output_device)
     info = sd.query_devices(out, "output")
     sd.check_output_settings(device=out, samplerate=22_050, channels=1, dtype="int16")
@@ -104,8 +104,7 @@ def speaker(config: Config) -> str:
 
 
 def microphone(config: Config) -> str:
-    import sounddevice as sd
-
+    sd = import_sounddevice()
     mic = device(config.audio.input_device)
     info = sd.query_devices(mic, "input")
     rate = config.audio.input_sample_rate

@@ -79,7 +79,7 @@ def build_cloud(config: Config) -> Cloud:
     api_key = read_api_key(config.api)
     if not api_key:
         log.error(
-            "no API key: install it as the systemd credential %r or set %s; "
+            "no API key: install it as the systemd credential %r or set %s (or put it in .env); "
             "Lucy will ask for a grown-up's help until then",
             config.api.api_key_credential,
             config.api.api_key_env,

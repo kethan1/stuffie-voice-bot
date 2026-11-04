@@ -1,6 +1,7 @@
 """The PortAudio adapters, driven by a simulated audio thread instead of a sound card."""
 
 import asyncio
+import importlib.abc
 import sys
 import threading
 import time
@@ -87,6 +88,23 @@ def sounddevice(monkeypatch: pytest.MonkeyPatch) -> types.SimpleNamespace:
     module.RawInputStream = make(FakeInput)
     monkeypatch.setitem(sys.modules, "sounddevice", module)
     return module
+
+
+class _NoPortAudio(importlib.abc.MetaPathFinder):
+    """Fails ``import sounddevice`` the way it fails on Linux without libportaudio2."""
+
+    def find_spec(self, fullname: str, *_: Any) -> None:
+        if fullname == "sounddevice":
+            raise OSError("PortAudio library not found")
+
+
+def test_missing_portaudio_says_how_to_install_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    from lucy.adapters.sound import SoundDeviceSpeaker
+
+    monkeypatch.delitem(sys.modules, "sounddevice", raising=False)
+    monkeypatch.setattr(sys, "meta_path", [_NoPortAudio(), *sys.meta_path])
+    with pytest.raises(AudioDeviceError, match="apt install libportaudio2"):
+        SoundDeviceSpeaker(sample_rate=8_000)
 
 
 def clip(value: int, frames: int) -> Pcm:
