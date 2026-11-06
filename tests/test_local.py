@@ -149,6 +149,7 @@ VOICE = os.environ.get("LUCY_TEST_VOICE")
 @pytest.mark.skipif(not (STT_MODEL and VOICE), reason="set LUCY_TEST_STT_MODEL and LUCY_TEST_VOICE")
 async def test_real_model_understands_lucys_own_voice() -> None:
     from lucy.adapters.piper_tts import PiperSpeech
+    from lucy.core.speech import render
     from lucy.tools.bench import resample
 
     assert STT_MODEL is not None
@@ -156,7 +157,7 @@ async def test_real_model_understands_lucys_own_voice() -> None:
     tts = PiperSpeech(Path(VOICE), threads=2)
     stt = FasterWhisperTranscriber(Path(STT_MODEL), threads=2)
     try:
-        speech = resample(await tts.synthesize("Why do geese fly south in the winter?"), 16_000)
+        speech = resample(await render(tts, "Why do geese fly south in the winter?"), 16_000)
         text = await stt.transcribe(speech)
     finally:
         tts.close()

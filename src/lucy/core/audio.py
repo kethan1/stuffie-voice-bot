@@ -63,6 +63,15 @@ class Pcm:
         return buffer.getvalue()
 
 
+def amplify(pcm: Pcm, gain: float) -> Pcm:
+    """Scale the volume by ``gain`` (1.0 leaves it unchanged), clipping at full scale."""
+    if gain == 1.0:
+        return pcm
+    samples = pcm.samples().astype(np.float32) * gain
+    clipped = np.clip(samples, -_INT16_FULL_SCALE, _INT16_FULL_SCALE - 1)
+    return Pcm(clipped.astype("<i2").tobytes(), pcm.sample_rate)
+
+
 def level_dbfs(pcm: Pcm) -> float:
     """RMS level relative to full scale; :data:`SILENCE_DBFS` for empty or silent audio."""
     if pcm.frames == 0:

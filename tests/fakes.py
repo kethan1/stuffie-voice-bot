@@ -69,18 +69,34 @@ class FakeChat:
 
 
 class FakeTTS:
+    """Renders each character as one sample, in ``parts`` equal parts per sentence."""
+
     sample_rate = RATE
 
-    def __init__(self, error: Exception | None = None) -> None:
+    def __init__(
+        self,
+        error: Exception | None = None,
+        *,
+        parts: int = 1,
+        error_after: int | None = None,
+        sample: bytes = b"\x01\x00",
+    ) -> None:
         self.texts: list[str] = []
         self.error = error
+        self.error_after = error_after
+        self.parts = parts
+        self.sample = sample
 
-    async def synthesize(self, text: str) -> Pcm:
+    async def stream(self, text: str) -> AsyncGenerator[Pcm, None]:
         self.texts.append(text)
         await asyncio.sleep(0)
-        if self.error:
+        if self.error and self.error_after is None:
             raise self.error
-        return Pcm(b"\x01\x00" * len(text), RATE)
+        for index in range(self.parts):
+            if self.error and index == self.error_after:
+                raise self.error
+            yield Pcm(self.sample * len(text), RATE)
+            await asyncio.sleep(0)
 
 
 class FakeSpeaker:

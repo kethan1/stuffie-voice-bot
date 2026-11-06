@@ -12,7 +12,6 @@ from contextlib import AsyncExitStack
 
 from lucy import __version__
 from lucy.adapters.console import KeyboardButton, LogIndicator
-from lucy.adapters.piper_tts import PiperSpeech
 from lucy.adapters.power import CpuGovernor, NoPowerControl, PowerKnob, PowerManager, WifiPowerSave
 from lucy.adapters.sound import SoundDeviceMicrophone, SoundDeviceSpeaker
 from lucy.brains import Local, build_cloud, build_local
@@ -23,25 +22,27 @@ from lucy.core.errors import ConfigError, LucyError
 from lucy.core.phrases import Phrase, PhraseBook
 from lucy.core.pipeline import TurnPipeline
 from lucy.core.ports import Button, Indicator, PowerControl
-from lucy.core.safety import AllowAll, DistressScreen
+from lucy.core.safety import AllowAll, BlockedWords, DistressScreen
 from lucy.core.tasks import BackgroundTasks
 from lucy.core.types import PowerMode
 from lucy.persona import LUCY
 from lucy.platform.systemd import SystemdNotifier
+from lucy.voices import Voice, build_voice, load_on_device_voice
 
 log = logging.getLogger(__name__)
 
 EXIT_CONFIG = 78  # EX_CONFIG: systemd is told not to restart on this (see lucy.service)
 
 
-def load_voice(config: Config) -> PiperSpeech:
-    return PiperSpeech(
-        config.tts.voice,
-        threads=config.tts.threads,
-        length_scale=config.tts.length_scale,
-        volume=config.tts.volume,
-        speaker_id=config.tts.speaker_id,
-    )
+async def open_voice(config: Config, stack: AsyncExitStack) -> Voice:
+    """Load and warm up the on-device voice, then put the cloud voice (if set up) in front."""
+    on_device = await asyncio.to_thread(load_on_device_voice, config)
+    stack.callback(on_device.close)
+    await asyncio.to_thread(on_device.warm_up)
+    voice = build_voice(config, on_device)
+    if voice.api is not None:
+        stack.push_async_callback(voice.api.aclose)
+    return voice
 
 
 def build_power(config: Config) -> PowerControl:
@@ -101,9 +102,8 @@ async def run(config: Config, *, keyboard: bool = False) -> int:
     async with AsyncExitStack() as stack:
         notifier.status("loading voice")
         system_prompt = read_system_prompt(config, LUCY.system_prompt)
-        tts = await asyncio.to_thread(load_voice, config)
-        stack.callback(tts.close)
-        await asyncio.to_thread(tts.warm_up)
+        voice = await open_voice(config, stack)
+        tts = voice.tts
 
         cloud = build_cloud(config)
         stack.push_async_callback(cloud.aclose)
@@ -127,6 +127,7 @@ async def run(config: Config, *, keyboard: bool = False) -> int:
 
         conversation = Conversation(config.llm.history_exchanges)
         phrases = PhraseBook(LUCY.lines, tts)
+        voice.on_recovery(phrases.forget)  # lines cached in the on-device voice: render again
         pipeline = TurnPipeline(
             brain=cloud.brain(),
             backup=local.brain() if local is not None else None,
@@ -140,6 +141,7 @@ async def run(config: Config, *, keyboard: bool = False) -> int:
             conversation=conversation,
             system_prompt=system_prompt,
             settings=config.turn,
+            reply_screen=BlockedWords() if config.safety.screen else None,
         )
         controller = Controller(
             pipeline=pipeline,
@@ -148,7 +150,7 @@ async def run(config: Config, *, keyboard: bool = False) -> int:
             indicator=indicator,
             power=power,
             conversation=conversation,
-            warmers=[cloud.api],
+            warmers=[cloud.api, *voice.warmers],
             earcons=Earcons.generate(tts.sample_rate),
             settings=config.session,
         )
@@ -161,7 +163,7 @@ async def run(config: Config, *, keyboard: bool = False) -> int:
         button = build_button(config, keyboard)
 
         notifier.ready(f"Lucy {__version__} is awake")
-        log.info("Lucy %s is awake (voice %s)", __version__, config.tts.voice.name)
+        log.info("Lucy %s is awake (voice: %s)", __version__, voice.name)
         serving = asyncio.create_task(controller.run(button), name="controller")
         stopping = asyncio.create_task(stop.wait(), name="stop")
         await asyncio.wait({serving, stopping}, return_when=asyncio.FIRST_COMPLETED)

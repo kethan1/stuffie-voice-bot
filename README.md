@@ -2,17 +2,25 @@
 
 Lucy is a talking plush goose for elementary-school kids, built on a Raspberry
 Pi 4B. Squeeze her wing, ask a question, and let go. She answers out loud in
-one to three short, friendly sentences, usually starting within about a second.
+one or two short, friendly sentences, usually starting within about a second.
 
 ```
  squeeze wing ─► record (16 kHz) ─► Groq Whisper ─► on-device safety screen
-       ─► Groq gpt-oss-20b (streamed) ─► sentence chunks ─► Piper TTS on the Pi ─► speaker
+       ─► Groq gpt-oss-20b (streamed) ─► sentences ─► Speechify voice (streamed) ─► speaker
+                                                      └► Piper on the Pi, if the cloud voice can't
 ```
 
-* **Fast:** everything streams. Lucy starts speaking the first clause while the
-  rest is still being written. The HTTPS connection is warmed up while the
-  child is still talking. Wi-Fi power saving and CPU throttling are switched
-  off only for the moments that matter.
+* **Natural voice:** Lucy speaks with Speechify's `simba-3.2`, one of the most
+  natural-sounding voices available (11th of 103 in a blind listening arena).
+  It is free for up to 500,000 characters a month, about 3,000 replies, with no
+  credit card. Her on-device Piper voice takes over whenever the cloud voice
+  can't speak, so she never goes silent. When she says "Honk!" you hear a goose
+  call, not the word read aloud.
+* **Fast:** everything streams. Lucy starts speaking her first sentence while
+  the rest is still being written, and plays its audio as it arrives. The
+  HTTPS connections are warmed up while the child is still talking. Wi-Fi
+  power saving and CPU throttling are switched off only for the moments that
+  matter.
 * **Frugal:** event-driven with no polling. The mic is open only while the
   wing is squeezed, the amp and speaker sleep when idle, and three power
   profiles (active / standby / dormant) apply on a headless, tuned
@@ -46,12 +54,13 @@ safety model, and failure handling) is in
 1. Flash **Raspberry Pi OS Lite (64-bit)**, enable SSH and Wi-Fi, and wire the parts
    ([docs/HARDWARE.md](docs/HARDWARE.md)).
 2. A grown-up creates a Groq API key at <https://console.groq.com> and turns on
-   Zero Data Retention.
+   Zero Data Retention. For Lucy's natural voice, they also create a free
+   Speechify API key at <https://platform.speechify.ai/api-keys> (no credit card).
 3. Install, then reboot:
 
    ```bash
    git clone <this repository> lucy && cd lucy
-   sudo deploy/install.sh --i2s-amp --tune     # paste the API key when asked
+   sudo deploy/install.sh --i2s-amp --tune     # paste the API keys when asked
    # optional offline brain (~2 GB):  add --local-backup
    sudo reboot
    ```
@@ -63,11 +72,17 @@ safety model, and failure handling) is in
    sudo lucy say "Honk! Hello!"
    ```
 
-### API key
+### API keys
 
-The key is stored in `/etc/lucy/credentials/groq_api_key` (root-only) and
-reaches the service only as a systemd credential. It never goes in the config
-file or the repository. On a laptop, put it in `.env` instead (see below).
+The keys are stored in `/etc/lucy/credentials/groq_api_key` and
+`/etc/lucy/credentials/speechify_api_key` (root-only) and reach the service only
+as systemd credentials. They never go in the config file or the repository. On
+a laptop, put them in `.env` instead (see below).
+
+The Speechify key is optional. Without it, or once the month's free characters
+are used up, Lucy speaks with her on-device voice. `sudo lucy voices` lists the
+cloud voices, with samples to listen to; set `voice_id` under `[tts.cloud]` in
+`/etc/lucy/config.toml` to change hers.
 
 ## Development
 
@@ -94,13 +109,14 @@ leaves the laptop's CPU governor and Wi-Fi alone. Everything else, including
 the Groq models, the safety screen, and the streaming pipeline, is the same code
 and configuration the Pi runs.
 
-Put your Groq key in a file named `.env` (gitignored) in the repository as
-`GROQ_API_KEY=gsk_...`, or export `GROQ_API_KEY`. Lucy reads `.env` from the
-directory you run her in. Then:
+Put your keys in a file named `.env` (gitignored) in the repository as
+`GROQ_API_KEY=gsk_...` and `SPEECHIFY_API_KEY=...` (see `.env.sample`), or export
+them. Lucy reads `.env` from the directory you run her in. Then:
 
 ```bash
-make doctor       # fetches the voice the first time; checks key, mic, speakers, Groq (speak when asked)
+make doctor       # fetches the backup voice the first time; checks keys, both voices, mic, speakers, Groq
 make say          # Lucy says hello through the speakers (TEXT="..." to change it)
+make voices       # the cloud voices she can speak with, with samples
 make run          # talk to her: Enter to start, Enter again to stop; Ctrl-C quits
 make bench        # latency breakdown, measured from this laptop
 ```
@@ -124,11 +140,11 @@ different config. With `dev.toml`, the log shows what Lucy heard on each turn.
 src/lucy/
   core/          pure logic: controller (state machine), pipeline (streaming turn),
                  chunker, text cleaning, safety screen, conversation, phrases, ports
-  adapters/      Groq/OpenAI-compatible HTTP, Piper, PortAudio, libgpiod, power knobs
+  adapters/      Groq/OpenAI-compatible HTTP, Speechify, Piper, PortAudio, libgpiod, power knobs
   platform/      systemd notify/watchdog, journald-aware logging
   tools/         `lucy doctor`, `lucy bench`
   persona.py     Lucy's personality spec, system prompt, and fixed lines
-  app.py         composition root
+  app.py         composition root (brains.py and voices.py assemble the cloud and local parts)
   config.py      strict TOML configuration
 deploy/          installer, systemd unit, ALSA routing, boot tuning
 dev.toml         laptop settings for development (`make run`)

@@ -1,7 +1,9 @@
 """A lean client for OpenAI-compatible REST APIs (GroqCloud by default).
 
 Groq, OpenAI, and a local Ollama server all speak this protocol, so swapping
-providers is a configuration change (``api.base_url`` and model names).
+providers is a configuration change (``api.base_url`` and model names). The
+same client also carries Lucy's cloud voice (Speechify), which is plain JSON
+over HTTPS with a Bearer key too.
 
 Latency choices:
 
@@ -33,7 +35,13 @@ from typing import Any
 import httpx
 
 from lucy import __version__
-from lucy.core.errors import AuthenticationError, RateLimited, ServiceError, ServiceUnreachable
+from lucy.core.errors import (
+    AuthenticationError,
+    ContentRefused,
+    RateLimited,
+    ServiceError,
+    ServiceUnreachable,
+)
 
 log = logging.getLogger(__name__)
 
@@ -49,9 +57,11 @@ class ApiClient:
         connect_timeout_s: float = 3.0,
         keepalive_s: float = 120.0,
         prewarm_after_idle_s: float = 20.0,
+        warm_path: str = "models",
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self._prewarm_after_idle_s = prewarm_after_idle_s
+        self._warm_path = warm_path  # a cheap GET that any valid key may make
         self._last_used = -float("inf")
         self._reachable = True
         self._warming: asyncio.Task[None] | None = None
@@ -98,7 +108,7 @@ class ApiClient:
     async def _warm(self) -> None:
         started = time.monotonic()
         try:
-            async with self._request("GET", "models", timeout_s=5.0) as response:
+            async with self._request("GET", self._warm_path, timeout_s=5.0) as response:
                 await response.aread()
         except Exception as error:  # a failed warm-up is harmless; the real request will report
             log.debug("connection prewarm failed: %s", error)
@@ -135,6 +145,22 @@ class ApiClient:
         """POST and yield each server-sent ``data:`` event as parsed JSON until ``[DONE]``."""
         async with self._request("POST", path, json=payload, timeout_s=timeout_s) as response:
             yield self._events(response)
+
+    @asynccontextmanager
+    async def stream_bytes(
+        self, path: str, payload: Mapping[str, Any], *, timeout_s: float
+    ) -> AsyncIterator[AsyncIterator[bytes]]:
+        """POST JSON and yield the response body as it arrives (``timeout_s`` per read)."""
+        async with self._request("POST", path, json=payload, timeout_s=timeout_s) as response:
+            yield self._bytes(response)
+
+    async def _bytes(self, response: httpx.Response) -> AsyncIterator[bytes]:
+        try:
+            async for data in response.aiter_bytes():
+                self._last_used = time.monotonic()
+                yield data
+        except httpx.HTTPError as error:
+            raise _translate(error) from error
 
     async def _events(self, response: httpx.Response) -> AsyncIterator[JsonObject]:
         try:
@@ -190,11 +216,15 @@ def _translate(error: httpx.HTTPError) -> ServiceError:
 
 def _status_error(response: httpx.Response) -> ServiceError:
     status = response.status_code
-    message = f"HTTP {status}: {_error_message(_safe_json(response.content))}"
+    body = _safe_json(response.content)
+    message = f"HTTP {status}: {_error_message(body)}"
     if status in (401, 403):
         return AuthenticationError(message)
     if status == 429:
         return RateLimited(message, _retry_after(response.headers.get("retry-after")))
+    error = body.get("error")
+    if isinstance(error, Mapping) and error.get("code") == "content_policy_violation":
+        return ContentRefused(message)
     return ServiceError(message)
 
 

@@ -1,6 +1,6 @@
 #!/bin/sh
 # Run Lucy's command line (doctor, say, bench, run --keyboard) exactly as the service runs:
-# same user, groups, API-key credential, and capability. Usage: sudo lucy doctor --listen
+# same user, groups, API-key credentials, and capability. Usage: sudo lucy doctor --listen
 set -eu
 if [ "$(id -u)" -ne 0 ]; then
   exec sudo "$0" "$@"
@@ -9,6 +9,7 @@ exec systemd-run --quiet --pty --wait --collect --working-directory=/opt/lucy \
   --uid=lucy --gid=lucy \
   --property="SupplementaryGroups=audio gpio" \
   --property=LoadCredential=groq_api_key:/etc/lucy/credentials/groq_api_key \
+  --property=LoadCredential=speechify_api_key:/etc/lucy/credentials/speechify_api_key \
   --property=AmbientCapabilities=CAP_NET_ADMIN \
   --setenv=PYTHONUNBUFFERED=1 \
   /opt/lucy/venv/bin/lucy --config /etc/lucy/config.toml "$@"

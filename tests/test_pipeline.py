@@ -1,14 +1,15 @@
 import asyncio
+from collections.abc import AsyncGenerator
 
 import pytest
 
 from lucy.core.audio import Pcm
 from lucy.core.conversation import Conversation
-from lucy.core.errors import RateLimited, ServiceError, ServiceUnreachable
+from lucy.core.errors import ContentRefused, RateLimited, ServiceError, ServiceUnreachable
 from lucy.core.metrics import TurnTimer
 from lucy.core.phrases import Phrase, PhraseBook
 from lucy.core.pipeline import Brain, TurnPipeline, TurnSettings, phrase_for
-from lucy.core.safety import DistressScreen
+from lucy.core.safety import BlockedWords, DistressScreen
 from lucy.core.types import Role, Status
 from lucy.persona import LUCY
 from tests.fakes import FakeChat, FakeIndicator, FakeSpeaker, FakeSTT, FakeTTS, tone, until
@@ -22,6 +23,8 @@ class Rig:
         chat: FakeChat | None = None,
         local: tuple[FakeSTT, FakeChat] | None = None,
         cloud_reachable: bool = True,
+        tts: FakeTTS | None = None,
+        reply_screen: BlockedWords | None = None,
     ) -> None:
         self.stt = stt or FakeSTT()
         self.chat = chat or FakeChat()
@@ -30,7 +33,7 @@ class Rig:
         backup = (
             Brain("local", self.local_stt, self.local_chat, history_exchanges=1) if local else None
         )
-        self.tts = FakeTTS()
+        self.tts = tts or FakeTTS()
         self.speaker = FakeSpeaker()
         self.indicator = FakeIndicator()
         self.conversation = Conversation(4)
@@ -45,6 +48,7 @@ class Rig:
             conversation=self.conversation,
             system_prompt=LUCY.system_prompt,
             settings=TurnSettings(sentence_pause_s=0.0, clause_pause_s=0.0),
+            reply_screen=reply_screen,
         )
         self.timer = TurnTimer()
 
@@ -63,6 +67,55 @@ async def test_streams_reply_sentence_by_sentence() -> None:
     assert Status.SPEAKING in rig.indicator.history
     for stage in ("stt", "first_token", "first_synth", "first_audio"):
         assert rig.timer.get(stage) is not None
+
+
+async def test_streamed_sentences_play_part_by_part() -> None:
+    rig = Rig(tts=FakeTTS(parts=3))
+    await rig.respond()
+    assert len(rig.speaker.played) == 9  # three sentences, three parts each, in order
+    assert [clip.frames for clip in rig.speaker.played[:3]] == [5, 5, 5]  # "Honk!"
+    remembered = rig.conversation.prompt("s", "next")[-2].content
+    assert remembered == "Honk! The sky is blue because of sunlight. Neat?"  # each sentence once
+
+
+async def test_pauses_follow_each_sentence() -> None:
+    rig = Rig()
+    rig.pipeline._settings = TurnSettings(sentence_pause_s=0.01)
+    await rig.respond()
+    assert [any(clip.data) for clip in rig.speaker.played] == [True, False] * 3
+
+
+class RefusingTTS(FakeTTS):
+    """The cloud voice's content screen refuses any sentence mentioning ``word``."""
+
+    def __init__(self, word: str) -> None:
+        super().__init__()
+        self.word = word
+
+    async def stream(self, text: str) -> AsyncGenerator[Pcm, None]:
+        if self.word in text:
+            self.texts.append(text)
+            raise ContentRefused("HTTP 400: refused by the content policy (violence)")
+        async for part in super().stream(text):
+            yield part
+
+
+async def test_a_refused_sentence_ends_the_reply_and_changes_the_subject() -> None:
+    rig = Rig(tts=RefusingTTS("sunlight"))
+    await rig.respond()
+    assert "Neat?" not in rig.tts.texts  # nothing after the refused sentence
+    assert rig.spoken_phrase(Phrase.CHANGE_SUBJECT)
+    assert phrase_for(ContentRefused("refused")) is Phrase.CHANGE_SUBJECT
+
+
+async def test_a_blocked_word_ends_the_reply_before_any_voice_hears_it() -> None:
+    chat = FakeChat(("Sure! ", "It is spelled S H I T. ", "Neat?"))
+    rig = Rig(chat=chat, reply_screen=BlockedWords())
+    await rig.respond()
+    assert rig.tts.texts[0] == "Sure!"
+    assert not any("S H I T" in text or text == "Neat?" for text in rig.tts.texts)
+    assert rig.spoken_phrase(Phrase.CHANGE_SUBJECT)
+    assert rig.conversation.prompt("s", "next")[-2].content == "Sure!"  # only what was said
 
 
 async def test_sends_system_prompt_history_and_question() -> None:

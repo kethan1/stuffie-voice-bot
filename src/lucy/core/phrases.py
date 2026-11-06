@@ -2,8 +2,8 @@
 
 Error and safety replies must work when the network does not, and should not
 cost synthesis time when a child is already waiting, so each line is rendered
-by the local TTS engine on first use (or ahead of time by :meth:`preload`) and
-cached as PCM. Several variants per phrase keep Lucy from sounding robotic.
+by Lucy's voice on first use (or ahead of time by :meth:`preload`) and cached
+as PCM. Several variants per phrase keep Lucy from sounding robotic.
 """
 
 import asyncio
@@ -15,6 +15,7 @@ from functools import partial
 
 from lucy.core.audio import Pcm
 from lucy.core.ports import TextToSpeech
+from lucy.core.speech import render
 
 log = logging.getLogger(__name__)
 
@@ -62,10 +63,16 @@ class PhraseBook:
                 except Exception:
                     log.warning("could not pre-render phrase %r", text, exc_info=True)
 
+    def forget(self) -> None:
+        """Drop every finished render, so each line is rendered again the next time it is used."""
+        for text, future in list(self._cache.items()):
+            if future.done():
+                del self._cache[text]
+
     def _render(self, text: str) -> asyncio.Future[Pcm]:
         future = self._cache.get(text)
         if future is None:
-            future = asyncio.ensure_future(self._tts.synthesize(text))
+            future = asyncio.ensure_future(render(self._tts, text))
             future.add_done_callback(partial(self._discard_failure, text))
             self._cache[text] = future
         return future

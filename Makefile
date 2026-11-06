@@ -1,10 +1,10 @@
-VOICE := en_US-amy-medium
-VOICE_URL := https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/amy/medium
+VOICE := en_US-lessac-medium
+VOICE_URL := https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium
 # The offline brain's speech model, at the same pinned revision deploy/install.sh uses.
 STT_MODEL := models/faster-whisper-tiny.en
 STT_MODEL_URL := https://huggingface.co/Systran/faster-whisper-tiny.en/resolve/0d3d19a32d3338f10357c0889762bd8d64bbdeba
 
-.PHONY: dev check lint typecheck test integration voice stt-model lock clean run doctor say bench
+.PHONY: dev check lint typecheck test integration voice stt-model lock clean run doctor say voices bench
 
 dev:
 	uv sync --extra pi --extra local
@@ -41,7 +41,7 @@ integration: voice stt-model
 		uv run pytest -q tests/test_integration.py tests/test_local.py
 
 # -- on a laptop (dev.toml: laptop mic and speakers, Enter instead of the wing button) -----
-# The API key comes from GROQ_API_KEY or a gitignored .env file.
+# API keys come from GROQ_API_KEY and SPEECHIFY_API_KEY, or a gitignored .env file.
 # `make run CONFIG=my.toml` uses another config.
 CONFIG := dev.toml
 LUCY = uv run lucy --config $(CONFIG)
@@ -54,6 +54,9 @@ doctor: voice
 
 say: voice
 	$(LUCY) say "$(or $(TEXT),Honk! Hello from your laptop.)"
+
+voices:
+	$(LUCY) voices
 
 bench: voice
 	$(LUCY) bench

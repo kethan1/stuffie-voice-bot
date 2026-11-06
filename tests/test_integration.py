@@ -2,7 +2,7 @@
 
 Needs a downloaded voice, so it only runs when ``LUCY_TEST_VOICE`` points at one::
 
-    LUCY_TEST_VOICE=voices/en_US-amy-medium.onnx pytest tests/test_integration.py
+    LUCY_TEST_VOICE=voices/en_US-lessac-medium.onnx pytest tests/test_integration.py
 """
 
 import json
@@ -20,6 +20,7 @@ from lucy.core.metrics import TurnTimer
 from lucy.core.phrases import PhraseBook
 from lucy.core.pipeline import Brain, TurnPipeline, TurnSettings
 from lucy.core.safety import DistressScreen
+from lucy.core.speech import render
 from lucy.persona import LUCY
 from tests.fakes import FakeIndicator, FakeSpeaker, tone
 
@@ -63,9 +64,10 @@ async def test_full_turn_with_real_voice() -> None:
     finally:
         await api.aclose()
         tts.close()
-    assert len(speaker.played) == 3  # "Honk!" | the V sentence | "Isn't that neat?"
+    speech = [clip for clip in speaker.played if any(clip.data)]  # without the pauses
+    assert len(speech) == 3  # "Honk!" | the V sentence | "Isn't that neat?"
     assert all(clip.sample_rate == tts.sample_rate for clip in speaker.played)
-    assert sum(clip.duration for clip in speaker.played) > 2.0
+    assert sum(clip.duration for clip in speech) > 2.0
     first_audio = timer.get("first_audio")
     assert first_audio is not None
     assert first_audio < 2.0
@@ -119,7 +121,7 @@ async def test_offline_turn_uses_the_local_brain() -> None:
         system_prompt=LUCY.system_prompt,
         settings=TurnSettings(),
     )
-    question = resample(await tts.synthesize("Why do geese fly south in the winter?"), 16_000)
+    question = resample(await render(tts, "Why do geese fly south in the winter?"), 16_000)
     try:
         await pipeline.respond(question, TurnTimer())
         assert not cloud_api.reachable()  # remembered: the next turn skips the cloud
@@ -132,4 +134,4 @@ async def test_offline_turn_uses_the_local_brain() -> None:
     assert len(asked) == 2
     assert "geese" in asked[0].lower()
     # Each turn: "thinking with my own brain", then "Honk!" and "They like warmth."
-    assert len(speaker.played) == 6
+    assert len([clip for clip in speaker.played if any(clip.data)]) == 6

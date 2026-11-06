@@ -1,9 +1,10 @@
 """On-device text-to-speech with Piper (VITS models on onnxruntime).
 
-Speech is synthesised on the Pi, not in the cloud. That keeps every reply
-working offline, avoids a second network round trip per sentence, and keeps
-the cost at zero. Groq's hosted TTS is a preview model with a small daily
-request limit.
+Lucy normally speaks with her natural cloud voice
+(:mod:`lucy.adapters.speechify_tts`). Piper is the voice that never fails: it
+needs no network, key, or quota, so it speaks whenever the cloud voice cannot,
+and it is Lucy's only voice when no cloud voice is set up. It is loaded and
+warmed up at start-up so it is ready the moment it is needed.
 
 Tuning for a Raspberry Pi 4 (4 x Cortex-A72):
 
@@ -23,6 +24,7 @@ Tuning for a Raspberry Pi 4 (4 x Cortex-A72):
 import asyncio
 import json
 import logging
+from collections.abc import AsyncGenerator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -79,9 +81,10 @@ class PiperSpeech:
     def sample_rate(self) -> int:
         return int(self._voice.config.sample_rate)
 
-    async def synthesize(self, text: str) -> Pcm:
+    async def stream(self, text: str) -> AsyncGenerator[Pcm, None]:
+        """One part per call: Piper renders a sentence in a fraction of its spoken length."""
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(self._executor, self.render, text)
+        yield await loop.run_in_executor(self._executor, self.render, text)
 
     def render(self, text: str) -> Pcm:
         """Synthesise synchronously (used by the worker thread and by CLI tools)."""

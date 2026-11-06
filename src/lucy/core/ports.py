@@ -33,12 +33,22 @@ class Moderator(Protocol):
         ...
 
 
+class ReplyScreen(Protocol):
+    def allows(self, sentence: str) -> bool:
+        """Whether Lucy may say this sentence of her reply aloud."""
+        ...
+
+
 class TextToSpeech(Protocol):
     @property
     def sample_rate(self) -> int: ...
 
-    async def synthesize(self, text: str) -> Pcm:
-        """Render one short chunk of text (a sentence or clause)."""
+    def stream(self, text: str) -> AsyncGenerator[Pcm, None]:
+        """Render one sentence, yielding audio in order as soon as each part is ready.
+
+        Joined, the parts are the whole sentence. :func:`lucy.core.speech.render`
+        collects them into one clip.
+        """
         ...
 
 

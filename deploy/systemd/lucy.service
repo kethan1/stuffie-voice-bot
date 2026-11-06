@@ -16,8 +16,10 @@ Group=lucy
 SupplementaryGroups=audio gpio
 WorkingDirectory=/opt/lucy
 Environment=PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
-# The API key is handed over as a credential: readable only by this service, never in the environment.
+# API keys are handed over as credentials: readable only by this service, never in the environment.
+# (deploy/install.sh always creates the Speechify file; left empty, Lucy uses her on-device voice.)
 LoadCredential=groq_api_key:/etc/lucy/credentials/groq_api_key
+LoadCredential=speechify_api_key:/etc/lucy/credentials/speechify_api_key
 # "+" runs as root outside the sandbox: let the lucy group switch CPU governors (lucy.adapters.power).
 ExecStartPre=+/bin/sh -c 'for f in /sys/devices/system/cpu/cpufreq/policy*/scaling_governor; do [ -e "$$f" ] && chgrp lucy "$$f" && chmod g+w "$$f"; done; true'
 ExecStart=/opt/lucy/venv/bin/lucy --config /etc/lucy/config.toml run

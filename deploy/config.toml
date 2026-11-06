@@ -4,7 +4,7 @@
 # Unknown keys are rejected, so typos are caught at start-up. Check changes with:
 #   sudo lucy doctor
 #
-# The Groq API key does NOT go in this file. See README.md, "API key".
+# API keys (Groq, Speechify) do NOT go in this file. See README.md, "API keys".
 
 log_level = "info"
 # system_prompt_file = "/etc/lucy/system_prompt.txt"   # replace Lucy's built-in personality
@@ -60,10 +60,24 @@ screen = true                  # on-device distress screen; keep this on for chi
 extra_patterns = []            # more regular expressions that route to "tell a grown-up"
 
 [tts]
-voice = "/opt/lucy/voices/en_US-amy-medium.onnx"
+# Lucy's on-device voice (Piper). It speaks whenever the cloud voice below cannot (no Wi-Fi,
+# no free characters left), and it is her only voice without a Speechify key.
+voice = "/opt/lucy/voices/en_US-lessac-medium.onnx"
 threads = 3                    # leave one core free for audio and the event loop
 length_scale = 1.0             # > 1.0 speaks more slowly
 volume = 0.9
+honks = true                   # "Honk!" is a goose call, not the word read aloud
+honk_volume = 1.0              # 1.0 = about as loud as her voice
+
+[tts.cloud]
+# Lucy's natural voice, streamed from Speechify (free: 500,000 characters a month, about
+# 3,000 replies). Used only when the Speechify key is installed (README.md, "API keys").
+enabled = true
+model = "simba-3.2"
+voice_id = "harper_32"         # see the choices, with samples to listen to: sudo lucy voices
+volume = 1.0                   # match it to the on-device voice's loudness
+timeout_s = 2.0                # no audio this soon: the on-device voice says the sentence
+rest_s = 60.0                  # after a failure, the on-device voice speaks this long
 
 [audio]
 input_device = ""              # "" = ALSA default (configured by deploy/alsa/asound.conf)
@@ -98,7 +112,7 @@ min_speech_s = 0.3
 speech_threshold_dbfs = -50.0  # check your mic with `lucy doctor --listen`
 sentence_pause_s = 0.2
 clause_pause_s = 0.08
-first_clause_min_words = 4
+first_clause_min_words = 0     # 0 = whole sentences (most natural); 4 = start sooner on Piper
 max_chunk_words = 30
 log_transcripts = false        # privacy: keep children's words out of the journal
 

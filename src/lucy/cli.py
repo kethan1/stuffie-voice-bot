@@ -1,9 +1,10 @@
-"""Command-line entry point: ``lucy run | say | bench | doctor``."""
+"""Command-line entry point: ``lucy run | say | voices | bench | doctor``."""
 
 import argparse
 import asyncio
 import logging
 import sys
+from contextlib import aclosing
 from pathlib import Path
 
 from lucy import __version__
@@ -28,6 +29,11 @@ def main(argv: list[str] | None = None) -> int:
 
     say = commands.add_parser("say", help="speak a sentence through the speaker")
     say.add_argument("text")
+    say.add_argument(
+        "--on-device", action="store_true", help="use the on-device voice, not the cloud voice"
+    )
+
+    commands.add_parser("voices", help="list the cloud voices Lucy can speak with")
 
     bench = commands.add_parser("bench", help="measure end-to-end latency without a microphone")
     bench.add_argument("--question", default="Why do geese fly in a V shape?")
@@ -56,7 +62,9 @@ def main(argv: list[str] | None = None) -> int:
 
                 return asyncio.run(run_lucy(config, keyboard=args.keyboard))
             case "say":
-                return asyncio.run(_say(config, args.text))
+                return asyncio.run(_say(config, args.text, on_device=args.on_device))
+            case "voices":
+                return asyncio.run(_voices(config))
             case "bench":
                 from lucy.tools.bench import bench as run_bench
 
@@ -78,23 +86,61 @@ def main(argv: list[str] | None = None) -> int:
     return 2
 
 
-async def _say(config: Config, text: str) -> int:
+async def _say(config: Config, text: str, *, on_device: bool) -> int:
     from lucy.adapters.sound import SoundDeviceSpeaker
-    from lucy.app import load_voice
     from lucy.config import device
+    from lucy.voices import build_voice, load_on_device_voice, with_honks
 
-    tts = await asyncio.to_thread(load_voice, config)
+    voice = build_voice(config, await asyncio.to_thread(load_on_device_voice, config))
+    tts = with_honks(config, voice.on_device) if on_device else voice.tts
     speaker = SoundDeviceSpeaker(
         sample_rate=tts.sample_rate,
         device=device(config.audio.output_device),
         latency_s=config.audio.output_latency_s,
     )
     try:
-        await speaker.enqueue(await tts.synthesize(text))
+        print(f"voice: {config.tts.voice.stem if on_device else voice.name}")
+        played = None
+        async with aclosing(tts.stream(text)) as parts:  # streamed, as Lucy speaks
+            async for part in parts:
+                played = speaker.enqueue(part)
+        if played is not None:
+            await played
         await asyncio.sleep(config.audio.output_latency_s + 0.1)  # let the last block drain
     finally:
         await speaker.close()
-        tts.close()
+        await voice.aclose()
+    return 0
+
+
+async def _voices(config: Config) -> int:
+    from lucy.adapters.speechify_tts import SpeechifySpeech
+    from lucy.voices import connect_cloud_voice
+
+    api = connect_cloud_voice(config)
+    if api is None:
+        log.error("the cloud voice is not set up: it needs a Speechify API key (see README.md)")
+        return 1
+    current = config.tts.cloud.voice_id
+    try:
+        voices = await SpeechifySpeech(api, voice_id=current, model=config.tts.cloud.model).voices()
+    finally:
+        await api.aclose()
+    for entry in voices:
+        mark = "*" if entry.get("id") == current else " "
+        # What a voice sounds like ("style:playful"), not what it is marketed for ("use-case:…").
+        traits = [
+            tag.partition(":")[2]
+            for tag in entry.get("tags") or ()
+            if tag.partition(":")[0] in ("age", "style", "timbre", "pitch", "accent")
+        ]
+        print(
+            f"{mark} {entry.get('id', '?'):<16} {entry.get('gender', ''):<7} "
+            f"{entry.get('locale', ''):<6} {', '.join(traits)}"
+        )
+        if preview := entry.get("preview_audio"):
+            print(f"    listen: {preview}")
+    print(f"\n* = tts.cloud.voice_id ({current}). Set it in the config file to change voice.")
     return 0
 
 

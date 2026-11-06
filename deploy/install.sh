@@ -6,7 +6,7 @@
 #   --i2s-amp              add the MAX98357A I2S amplifier overlay (reboot required)
 #   --playback-card NAME   ALSA card id for the speaker   (default: auto-detect)
 #   --capture-card NAME    ALSA card id for the microphone (default: auto-detect)
-#   --voice NAME           Piper voice, e.g. en_US-amy-medium (default)
+#   --voice NAME           on-device Piper voice, e.g. en_US-lessac-medium (default)
 #   --tune                 power tuning: boot config, unused services off, journal in RAM
 #   --local-backup         an offline brain on the Pi (faster-whisper + Ollama with Gemma 3 1B),
 #                          used when GroqCloud is unreachable; needs ~2 GB of SD card space
@@ -21,12 +21,12 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PREFIX=/opt/lucy
 ETC=/etc/lucy
 SERVICE_USER=lucy
-VOICE=en_US-amy-medium
+VOICE=en_US-lessac-medium
 VOICE_BASE=https://huggingface.co/rhasspy/piper-voices/resolve/main
 # Checksums of the default voice, so a corrupted or tampered download is refused.
 declare -A VOICE_SHA256=(
-  [en_US-amy-medium.onnx]=b3a6e47b57b8c7fbe6a0ce2518161a50f59a9cdd8a50835c02cb02bdd6206c18
-  [en_US-amy-medium.onnx.json]=95a23eb4d42909d38df73bb9ac7f45f597dbfcde2d1bf9526fdeaf5466977d77
+  [en_US-lessac-medium.onnx]=5efe09e69902187827af646e1a6e9d269dee769f9877d17b16b1b46eeaaf019f
+  [en_US-lessac-medium.onnx.json]=efe19c417bed055f2d69908248c6ba650fa135bc868b0e6abb3da181dab690a0
 )
 # A pinned uv release, checksum-verified like the voice. It installs the hash-locked uv.lock.
 UV_VERSION=0.12.8
@@ -204,7 +204,7 @@ UV_CACHE_DIR=/var/cache/lucy/uv "$UV" cache prune --quiet
 
 log "fetching the Piper voice $VOICE"
 IFS=- read -r lang name quality <<<"$VOICE"
-[[ -n ${quality:-} ]] || die "voice must look like en_US-amy-medium"
+[[ -n ${quality:-} ]] || die "voice must look like en_US-lessac-medium"
 for file in "$VOICE.onnx" "$VOICE.onnx.json"; do
   dest="$PREFIX/voices/$file"
   url="$VOICE_BASE/${lang%%_*}/$lang/$name/$quality/$file"
@@ -232,6 +232,18 @@ if [[ ! -s $KEY_FILE ]]; then
   [[ -s $KEY_FILE ]] || warn "no API key yet: put it in $KEY_FILE (root-only, mode 600)"
 fi
 [[ ! -e $KEY_FILE ]] || chmod 0600 "$KEY_FILE"
+# Optional: Lucy's natural cloud voice. The file always exists, because the service loads it as a
+# credential; while it is empty, Lucy speaks with her on-device voice.
+VOICE_KEY_FILE="$ETC/credentials/speechify_api_key"
+if [[ ! -s $VOICE_KEY_FILE ]]; then
+  if [[ -t 0 ]]; then
+    read -r -s -p "Paste the Speechify API key for Lucy's natural voice (hidden; Enter to skip): " key; echo
+    if [[ -n $key ]]; then (umask 077; printf '%s' "$key" >"$VOICE_KEY_FILE"); fi
+  fi
+  [[ -e $VOICE_KEY_FILE ]] || (umask 077; : >"$VOICE_KEY_FILE")
+  [[ -s $VOICE_KEY_FILE ]] || warn "no Speechify key: Lucy uses her on-device voice until it is in $VOICE_KEY_FILE"
+fi
+chmod 0600 "$VOICE_KEY_FILE"
 
 if [[ $LOCAL_BACKUP -eq 1 ]]; then
   log "installing the offline brain: speech model $STT_MODEL"

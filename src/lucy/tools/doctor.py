@@ -1,8 +1,8 @@
 """``lucy doctor``: check everything Lucy needs, and say what to fix.
 
 Run it after installing, after rewiring, or whenever Lucy is quiet. It checks
-the configuration, API key, voice, sound devices, GPIO lines, network/API
-access, and power controls. With ``--listen`` it also records three seconds so
+the configuration, API keys, both voices, sound devices, GPIO lines,
+network/API access, and power controls. With ``--listen`` it also records three seconds so
 microphone levels can be checked against ``turn.speech_threshold_dbfs``.
 """
 
@@ -16,12 +16,14 @@ from pathlib import Path
 
 from lucy.adapters.power import CPUFREQ_ROOT
 from lucy.adapters.sound import import_sounddevice
-from lucy.app import load_voice
+from lucy.adapters.speechify_tts import SpeechifySpeech
 from lucy.brains import build_cloud, build_local
 from lucy.config import Config, device, read_api_key, read_system_prompt
 from lucy.core.audio import Pcm, level_dbfs, trim_silence
 from lucy.core.errors import LucyError
+from lucy.core.speech import render
 from lucy.persona import LUCY
+from lucy.voices import connect_cloud_voice, load_on_device_voice
 
 OK, WARN, FAIL = "✔", "!", "✘"
 
@@ -30,9 +32,11 @@ Probe = Callable[[Config], Awaitable[str] | str]
 
 async def doctor(config: Config, config_path: Path | None, *, listen: bool) -> int:
     print(f"Lucy doctor (config: {config_path or 'built-in defaults'})")
-    probes: list[tuple[str, Probe]] = [
-        ("API key", api_key),
-        ("Piper voice", voice),
+    probes: list[tuple[str, Probe]] = [("API key", api_key)]
+    if config.tts.cloud.enabled:
+        probes.append(("cloud voice key", cloud_voice_key))
+    probes += [
+        ("on-device voice", voice),
         ("speaker", speaker),
         ("microphone", microphone),
     ]
@@ -43,6 +47,8 @@ async def doctor(config: Config, config_path: Path | None, *, listen: bool) -> i
     if config.led.enabled:
         probes.append(("LED GPIO", led_line))
     probes.append(("AI service", service))
+    if config.tts.cloud.enabled:
+        probes.append(("cloud voice", cloud_voice))
     if config.local.enabled:
         probes.append(("local speech model", local_speech))
         probes.append(("local brain (Ollama)", local_brain))
@@ -80,12 +86,23 @@ def api_key(config: Config) -> str:
     return f"present ({len(key)} characters)"
 
 
+def cloud_voice_key(config: Config) -> str:
+    cloud = config.tts.cloud
+    key = read_api_key(cloud)
+    if not key:
+        raise Warning(
+            f"missing, so Lucy uses her on-device voice: set {cloud.api_key_env} (or put it in "
+            f".env) or install /etc/lucy/credentials/{cloud.api_key_credential} (see README)"
+        )
+    return f"present ({len(key)} characters)"
+
+
 async def voice(config: Config) -> str:
-    tts = await asyncio.to_thread(load_voice, config)
+    tts = await asyncio.to_thread(load_on_device_voice, config)
     try:
         await asyncio.to_thread(tts.warm_up)
         started = time.perf_counter()
-        audio = await tts.synthesize("Honk! Did you know that geese can fly very far?")
+        audio = await render(tts, "Honk! Did you know that geese can fly very far?")
         rtf = (time.perf_counter() - started) / audio.duration
     finally:
         tts.close()
@@ -93,6 +110,31 @@ async def voice(config: Config) -> str:
     if rtf > 0.5:
         raise Warning(f"{detail} (slow: try a '-low' voice or more tts.threads)")
     return detail
+
+
+async def cloud_voice(config: Config) -> str:
+    api = connect_cloud_voice(config)
+    if api is None:
+        raise Warning("not set up, so the on-device voice speaks instead")
+    settings = config.tts.cloud
+    speech = SpeechifySpeech(api, voice_id=settings.voice_id, model=settings.model)
+    try:
+        await api.get_json("audio/models")  # open the connection, as Lucy does while you talk
+        started = time.perf_counter()
+        first_ms = None
+        seconds = 0.0
+        async for part in speech.stream("Honk! Did you know that geese can fly very far?"):
+            if first_ms is None:
+                first_ms = (time.perf_counter() - started) * 1000
+            seconds += part.duration
+    finally:
+        await api.aclose()
+    if first_ms is None:
+        raise LucyError(f"{settings.voice_id} returned no audio")
+    detail = f"{settings.voice_id} ({settings.model}): first audio in {first_ms:.0f} ms"
+    if first_ms > settings.timeout_s * 1000 / 2:  # halfway to giving the sentence to Piper
+        raise Warning(f"{detail} (slow: check the Wi-Fi signal)")
+    return f"{detail}, {seconds:.1f}s of speech"
 
 
 def speaker(config: Config) -> str:

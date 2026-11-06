@@ -6,10 +6,12 @@
                                               think()        voice()     speak()
 
 The three stages on the right run concurrently and are joined by queues, so
-Lucy starts talking as soon as the first clause has been synthesised. That
-clause plays while the next one is synthesised, and the next while the LLM is
-still writing. The queue to the speaker is bounded, which keeps memory flat and
-limits wasted work when a child interrupts.
+Lucy starts talking as soon as the first part of the first sentence has been
+synthesised. The cloud voice streams each sentence, so its first audio plays
+while the rest of the sentence is still arriving, the next sentence is
+synthesised while this one plays, and the LLM is still writing. The queue to
+the speaker is bounded, which keeps memory flat and limits wasted work when a
+child interrupts.
 
 Speech recognition and the reply come from a :class:`Brain`: normally Groq in
 the cloud. When the cloud cannot be reached and a backup brain is configured
@@ -33,6 +35,7 @@ from lucy.core.errors import (
     AudioDeviceError,
     AuthenticationError,
     ConfigError,
+    ContentRefused,
     LucyError,
     RateLimited,
     ServiceError,
@@ -40,12 +43,24 @@ from lucy.core.errors import (
 )
 from lucy.core.metrics import TurnTimer
 from lucy.core.phrases import Phrase, PhraseBook
-from lucy.core.ports import ChatModel, Indicator, Moderator, Speaker, SpeechToText, TextToSpeech
+from lucy.core.ports import (
+    ChatModel,
+    Indicator,
+    Moderator,
+    ReplyScreen,
+    Speaker,
+    SpeechToText,
+    TextToSpeech,
+)
 from lucy.core.tasks import detach, run_together
 from lucy.core.textnorm import to_speakable
 from lucy.core.types import Concern, Status
 
 log = logging.getLogger(__name__)
+
+_AHEAD_S = 0.3
+"""Keep at least this much audio queued behind the clip that is playing, so streamed parts
+and sentences join without gaps even when the network hiccups."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,7 +71,10 @@ class TurnSettings:
     """Frames quieter than this count as silence."""
     sentence_pause_s: float = 0.2
     clause_pause_s: float = 0.08
-    first_clause_min_words: int = 4
+    first_clause_min_words: int = 0
+    """0 sends whole sentences only, which is what sounds natural. Above 0, the first chunk may
+    end at a comma once it has this many words: a sooner first word from the on-device voice,
+    at the cost of a seam in the first sentence."""
     max_chunk_words: int = 30
     log_transcripts: bool = False
     """Privacy: children's words are kept out of the logs unless this is enabled."""
@@ -100,11 +118,13 @@ class TurnPipeline:
         conversation: Conversation,
         system_prompt: str,
         settings: TurnSettings,
+        reply_screen: ReplyScreen | None = None,
     ) -> None:
         self._brain = brain
         self._backup = backup
         self._tts = tts
         self._moderator = moderator
+        self._reply_screen = reply_screen
         self._speaker = speaker
         self._indicator = indicator
         self._phrases = phrases
@@ -131,7 +151,11 @@ class TurnPipeline:
                 )
             else:
                 log.exception("turn failed unexpectedly (%s)", timer.report())
-            if not turn.spoken:
+            if isinstance(error, ContentRefused):
+                # Not even part of a refused sentence should be heard: cut it off, move on.
+                self._speaker.stop()
+                await self.say(Phrase.CHANGE_SUBJECT)
+            elif not turn.spoken:
                 await self.say(phrase_for(error), status=Status.ERROR)
         else:
             log.info("turn complete (%s brain): %s", turn.brain.name, timer.report())
@@ -231,10 +255,22 @@ class TurnPipeline:
             log.warning("could not say that Lucy is thinking locally", exc_info=True)
         return True
 
+    def _speakable(self, text: str) -> str:
+        """The words of one chunk of the reply as Lucy will say them ("" if there are none).
+
+        Raises :class:`ContentRefused` if the reply screen stops them, which is handled like
+        the cloud voice refusing a sentence: Lucy stops and changes the subject.
+        """
+        words = to_speakable(text)
+        if words and self._reply_screen is not None and not self._reply_screen.allows(words):
+            raise ContentRefused("Lucy's reply screen stopped a sentence of the reply")
+        return words
+
     async def _stream_reply(self, text: str, turn: _Turn) -> None:
         settings = self._settings
         texts: asyncio.Queue[Chunk | None] = asyncio.Queue()
-        clips: asyncio.Queue[tuple[str, Pcm] | None] = asyncio.Queue(maxsize=1)
+        # (the chunk's words, on its first part only; audio)
+        clips: asyncio.Queue[tuple[str | None, Pcm] | None] = asyncio.Queue(maxsize=1)
 
         async def think() -> None:
             chunker = SentenceChunker(
@@ -252,15 +288,20 @@ class TurnPipeline:
 
         async def voice() -> None:
             while (chunk := await texts.get()) is not None:
-                words = to_speakable(chunk.text)
+                words = self._speakable(chunk.text)
                 if not words:
                     continue
-                audio = await self._tts.synthesize(words)
-                turn.timer.mark("first_synth")
+                label: str | None = words
+                async with aclosing(self._tts.stream(words)) as parts:
+                    async for audio in parts:
+                        turn.timer.mark("first_synth")
+                        await clips.put((label, audio))
+                        label = None
                 pause = (
                     settings.sentence_pause_s if chunk.ends_sentence else settings.clause_pause_s
                 )
-                await clips.put((words, audio + Pcm.silence(pause, audio.sample_rate)))
+                if pause > 0:
+                    await clips.put((None, Pcm.silence(pause, self._tts.sample_rate)))
             await clips.put(None)
 
         async def speak() -> None:
@@ -269,20 +310,24 @@ class TurnPipeline:
                 raise ServiceError("the language model returned nothing speakable")
             self._indicator.show(Status.SPEAKING)
             turn.timer.mark("first_audio")
-            # Keep one clip queued behind the one playing so sentences join without gaps.
-            playing: deque[asyncio.Future[None]] = deque()
+            playing: deque[tuple[asyncio.Future[None], float]] = deque()
+            queued_s = 0.0  # audio queued behind the oldest clip, which is (about to be) playing
             try:
                 while item is not None:
                     words, audio = item
-                    playing.append(self._speaker.enqueue(audio))
-                    turn.spoken.append(words)
-                    if len(playing) > 1:
-                        await playing.popleft()
+                    if playing:
+                        queued_s += audio.duration
+                    playing.append((self._speaker.enqueue(audio), audio.duration))
+                    if words:
+                        turn.spoken.append(words)
+                    while len(playing) > 1 and queued_s >= _AHEAD_S:
+                        await playing.popleft()[0]
+                        queued_s -= playing[0][1]
                     item = await clips.get()
                 while playing:
-                    await playing.popleft()
+                    await playing.popleft()[0]
             finally:
-                for future in playing:
+                for future, _ in playing:
                     future.cancel()
 
         await run_together(think(), voice(), speak())
@@ -297,5 +342,7 @@ def phrase_for(error: BaseException) -> Phrase:
             return Phrase.TIRED
         case AuthenticationError() | AudioDeviceError() | ConfigError():
             return Phrase.NEEDS_HELP
+        case ContentRefused():
+            return Phrase.CHANGE_SUBJECT
         case _:
             return Phrase.TANGLED

@@ -25,17 +25,45 @@ DISTRESS_PATTERNS: dict[str, str] = {
     "self-harm": (
         r"\b(?:kill|hurt|cut|harm)(?:ing)? myself\b"
         r"|\bsuicid\w*|\bend my life\b|\bwant(?:s)? to die\b"
-        r"|\bdon'?t want to (?:be alive|live|wake up)\b|\bi hate myself\b"
+        r"|\bdon'?t want to (?:be alive|live|wake up)\b|\bi hate (?:myself|my life|me)\b"
+        r"|\bwish i (?:was|were) (?:dead|never born)\b|\bwant to disappear\b"
+        r"|\b(?:better|happier) (?:off )?without me\b"
+        r"|\bif i (?:wasn'?t|weren'?t) (?:here|alive|around)\b|\bif i (?:was|were) (?:gone|dead)\b"
+        # a friend at risk
+        r"|\b(?:kill|hurt|cut)(?:ing)? (?:himself|herself|themselves|themself)\b"
     ),
     "being-hurt": (
-        r"\b(?:hits?|hitting|hurts?|hurting|beats?|beating|kicks?|kicking|chok\w+)"
-        r" me\b"
-        r"|\btouch(?:es|ed|ing)? me\b"
-        r"|\bkeep(?:s)? (?:it )?a secret from (?:my )?(?:mom|dad|parents)\b"
+        r"\b(?:hit(?:s|ting)?|hurt(?:s|ing)?|kick(?:s|ed|ing)?|punch(?:es|ed|ing)?"
+        r"|slap(?:s|ped|ping)?|smack(?:s|ed|ing)?|whip(?:s|ped|ping)?|chok\w+) me\b"
+        # "he beats me", not "beat me at checkers" or "Beats me!" (I don't know)
+        r"|\b\w+ beat(?:s|ing)? me\b(?! at\b| in\b)"
+        r"|\btouch(?:es|ed|ing)? (?:me|my (?:body|bottom|butt|chest))\b"
+        r"|\bprivate parts?\b|\bprivates\b"
+        r"|\bscared to go home\b"
+        r"|\b(?:doesn'?t|don'?t|won'?t|never) (?:give|feed) me (?:any )?"
+        r"(?:food|dinner|breakfast|lunch)\b"
+    ),
+    "secret": (  # a grown-up asking a child to hide something is a warning sign of abuse
+        r"\bkeep(?:s)? (?:it )?a secret from (?:my )?(?:mom|dad|mommy|daddy|parents|teacher)\b"
+        r"|\b(?:told|tells|said|says) (?:me )?(?:not to|to not|don'?t) tell"
+        r" (?:anyone|anybody|my\b|your\b)"
+        r"|\bour (?:little )?secret\b(?! \w)"  # "it's our little secret", not "our secret base"
     ),
     "bullying": r"\b(?:bull(?:y|ies|ied|ying)) me\b|\bi'?m (?:being )?bullied\b",
-    "lonely": r"\b(?:nobody|no one) (?:loves|likes|cares about) me\b",
-    "danger": r"\b(?:stranger|someone|somebody) (?:is )?(?:following|took|grabbed) me\b",
+    "lonely": r"\b(?:nobody|no one) (?:loves|likes|wants|cares about) me\b",
+    "danger": (
+        r"\b(?:stranger|someone|somebody) (?:is )?(?:following|took|grabbed) me\b"
+        r"|\b(?:man|guy|lady|woman|person|stranger)\b[^.?!]{0,30}"
+        r"\b(?:asked|told|wanted|tried to get|tried to make) me to (?:get in|come with)\b"
+    ),
+    "online": (  # someone on a game or app asking for pictures, a meeting, or where they live
+        r"^(?=.*\b(?:online|internet|roblox|minecraft|fortnite|discord|tiktok|youtube"
+        r"|snapchat|instagram|game)\b)"
+        r"(?=.*\b(?:wants|asked|asks|asking|told|tells|said|says)\b)"
+        r"(?=.*\b(?:meet (?:me|up)|(?:pictures?|photos?|pics?|selfies?|videos?) of me"
+        r"|send (?:a |some |me |them |him |her )?(?:pictures?|photos?|pics?|selfies?|videos?)"
+        r"|my (?:pictures?|photos?|pics?|address|phone number)|where i live)\b)"
+    ),
 }
 
 
@@ -64,3 +92,46 @@ class AllowAll:
 
     async def assess(self, text: str) -> Assessment:
         return ALLOWED
+
+
+# Words Lucy must never say aloud, in any context: profanity, slurs, sexual words, and drug
+# names. Short on purpose. Words with an innocent meaning ("weed", "kill", "cock" in
+# "cockatoo", "pussy" in the poem's "Pussy-cat") are left to the system prompt.
+BLOCKED_WORDS: tuple[str, ...] = (
+    r"fuck\w*|motherfuck\w*|shit(?:s|ty|ting|head\w*)?|bullshit|bitch\w*|bastards?",
+    r"ass|asshole\w*|arse(?:hole)?s?",
+    r"damn\w*|goddamn\w*|hell|piss\w*|crap(?:s|py)?|cunt\w*|twats?|wank\w*|dickhead\w*",
+    r"whores?|sluts?|slutty|douchebag\w*|bollocks",
+    r"nigg(?:a|er)s?|fag(?:s|got|gots)?|retard(?:s|ed)?|kikes?|trann(?:y|ies)",
+    r"sex(?:y|ier|iest|ual|ually)?|porn\w*|boobs?|boobies|penis(?:es)?|vaginas?|orgasm\w*",
+    r"erotic\w*|horny|nudes",
+    r"marijuana|cannabis|cocaine|heroin|meth|methamphetamine|fentanyl|lsd",
+    r"kill (?:yourself|urself)|kys",
+)
+
+# Three or more single letters in a row ("S H I T", "f-u-c-k", "B.E.C.A.U.S.E"), so a word
+# spelled out letter by letter is checked as the word it spells. Models often write Unicode
+# dashes (gpt-oss spells with U+2011, a non-breaking hyphen), so every dash counts as a gap.
+_GAP = r"[\s.,\-\u2010-\u2015\u2212\u00b7/]+"
+_SPELLED = re.compile(rf"\b[a-z](?:{_GAP}[a-z]\b){{2,}}", re.IGNORECASE)
+_LETTER_GAPS = re.compile(_GAP)
+
+
+class BlockedWords:
+    """Reply screen: stops any sentence of Lucy's reply that contains a blocked word.
+
+    The prompt and the model's safety training keep almost every reply clean, but a model can
+    still be talked into spelling a swear word one letter at a time, or define a grown-up word
+    it was told to leave alone. The cloud voice screens what it speaks, but the on-device voice
+    and the offline brain have no screen of their own. This one runs on the Pi, on every
+    sentence, before any voice sees it.
+    """
+
+    def __init__(self, words: Iterable[str] = BLOCKED_WORDS) -> None:
+        self._blocked = re.compile(r"\b(?:" + "|".join(words) + r")\b", re.IGNORECASE)
+
+    def allows(self, sentence: str) -> bool:
+        if self._blocked.search(sentence):
+            return False
+        spelled = _SPELLED.sub(lambda match: _LETTER_GAPS.sub("", match.group()), sentence)
+        return spelled == sentence or not self._blocked.search(spelled)

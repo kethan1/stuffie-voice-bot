@@ -8,22 +8,31 @@
    enter the Wi-Fi network and country, and enable SSH.
 3. Boot the Pi, then `ssh <user>@lucy.local`.
 
-## 2. Get an API key (a grown-up does this)
+## 2. Get the API keys (a grown-up does this)
 
 Groq requires account holders to be 18 or older.
 
 1. Sign in at <https://console.groq.com> and create an API key.
 2. Turn on **Zero Data Retention**: *Settings → Data Controls*
    (<https://console.groq.com/settings/data-controls>).
-3. Keep the key secret. Never commit it, paste it into config files, or share
-   it in chat.
+3. For Lucy's natural voice, sign up at <https://platform.speechify.ai> (the free
+   plan needs no credit card) and create a key at
+   <https://platform.speechify.ai/api-keys>. This key is optional: without it
+   Lucy speaks with her on-device voice, which sounds more robotic.
+4. Keep the keys secret. Never commit them, paste them into config files, or
+   share them in chat.
+
+The free Speechify plan includes 500,000 characters a month, roughly 3,000 of
+Lucy's replies. When it runs out, Speechify refuses requests instead of
+billing, and Lucy uses her on-device voice until the 1st of the next month.
+Usage is shown at <https://platform.speechify.ai/usage>.
 
 ## 3. Install
 
 ```bash
 sudo apt-get install -y git
 git clone <this repository> lucy && cd lucy
-sudo deploy/install.sh --i2s-amp --tune      # paste the API key when asked
+sudo deploy/install.sh --i2s-amp --tune      # paste the API keys when asked
 sudo reboot
 ```
 
@@ -31,27 +40,30 @@ sudo reboot
 |---|---|
 | `--i2s-amp` | You wired the MAX98357A amplifier |
 | `--playback-card ID`, `--capture-card ID` | Auto-detection picked the wrong sound card (`aplay -l`, `arecord -l`) |
-| `--voice en_US-lessac-medium` | You want a different Piper voice |
+| `--voice en_US-hfc_female-medium` | You want a different on-device (backup) Piper voice |
 | `--tune` | Always, for a finished toy: boot-time power savings, unused services off, journal in RAM |
 | `--local-backup` | You want Lucy to keep answering when GroqCloud is unreachable (no Wi-Fi, school firewall, outage). Installs Ollama with Gemma 3 1B and an on-device speech model: about 2 GB of SD card space and a ~2.5 GB one-time download. Answers offline take several seconds. |
 | `--read-only` | Last step, once everything works: protects the SD card from sudden power loss |
 
-To set or replace the API key later:
+To set or replace an API key later:
 
 ```bash
-sudo install -m 600 /dev/stdin /etc/lucy/credentials/groq_api_key   # paste, Enter, Ctrl-D
+sudo install -m 600 /dev/stdin /etc/lucy/credentials/groq_api_key        # paste, Enter, Ctrl-D
+sudo install -m 600 /dev/stdin /etc/lucy/credentials/speechify_api_key   # Lucy's natural voice
 sudo systemctl restart lucy
 ```
 
 ## 4. Bring-up checklist
 
 The installer adds a `lucy` command that runs exactly as the service does (same
-user, groups, API-key credential, and capability), so what it reports is what
+user, groups, API-key credentials, and capability), so what it reports is what
 the service experiences.
 
 ```bash
 sudo lucy doctor --listen          # every line should be ✔; speak when asked
-sudo lucy say "Honk! Can you hear me?"
+sudo lucy say "Honk! Can you hear me?"              # Lucy's natural (cloud) voice
+sudo lucy say --on-device "Honk! Can you hear me?"  # her backup voice on the Pi (same honk)
+sudo lucy voices                   # other cloud voices, with links to listen to them
 sudo systemctl stop lucy && sudo lucy run --keyboard   # Enter to talk, Enter to stop; Ctrl-C quits
 sudo systemctl start lucy
 sudo lucy bench                    # latency breakdown, measured on this Pi
@@ -59,7 +71,8 @@ sudo lucy bench                    # latency breakdown, measured on this Pi
 
 `lucy bench` prints each stage measured from the button release. If
 `first_audio` is high, compare `stt` and `first_token` (network or Groq) with
-the gap to `first_audio` (Piper on the Pi).
+the gap to `first_audio` (Lucy's voice: Speechify, or Piper on the Pi when the
+cloud voice is unavailable).
 
 ### Offline brain (if installed with `--local-backup`)
 
@@ -101,9 +114,13 @@ All settings are in `/etc/lucy/config.toml` (documented inline).
 
 | To get | Change |
 |---|---|
-| Faster first word | A `-low` voice (16 kHz, cheaper to synthesise); `turn.first_clause_min_words = 3` |
+| A different voice | `sudo lucy voices`, then `tts.cloud.voice_id` |
+| Both voices equally loud | `tts.cloud.volume` (cloud) or `tts.volume` (on-device) |
+| Softer honks, or the word instead of the goose call | `tts.honk_volume = 0.6`; `tts.honks = false` |
+| Longer or shorter answers | A `system_prompt_file` with a different length rule (the built-in prompt asks for at most 25 words) |
+| Faster first word from the on-device voice | `turn.first_clause_min_words = 4` (the first sentence may be split at a comma, which sounds less natural); a `-low` Piper voice |
 | Longer battery life | Shorter `session.awake_s`; `power.standby_governor = "powersave"` |
-| Slower, clearer speech for little ones | `tts.length_scale = 1.15` |
+| Slower, clearer speech for little ones | `tts.length_scale = 1.15` (on-device voice); pick a calmer cloud voice with `lucy voices` |
 | Fewer "I didn't hear that" | Lower `turn.speech_threshold_dbfs` (e.g. `-55`), or raise mic gain in `alsamixer` |
 | Answers that are less creative and more steady | `llm.params.temperature = 0.5` |
 | More context for follow-ups | `llm.history_exchanges = 10` (slightly slower and costlier) |
@@ -121,6 +138,9 @@ sudo deploy/install.sh --read-only && sudo reboot           # only if it was rea
 
 Edited config files are never overwritten. If the template changed, the new
 version is written next to yours as `config.toml.new` so you can compare them.
+A config from before the cloud voice still works (missing settings take their
+defaults), but it sets `first_clause_min_words = 4`. Change that to `0` so Lucy
+speaks in whole sentences, which sounds more natural.
 If your config enables the offline brain, re-running the installer keeps it
 installed and up to date without `--local-backup`.
 
@@ -138,6 +158,8 @@ installed and up to date without `--local-backup`.
 | Button does nothing | Wiring or pin number | `lucy doctor`; `gpioinfo` shows `lucy-button` on line 17 |
 | `CPU governor ... not writable` in doctor | Service never started since boot | Start it once; its `ExecStartPre` grants access |
 | Lucy "thinks on her own" though the Wi-Fi works | Groq is blocked (firewall, DNS) | `curl -sI https://api.groq.com`; the next press re-checks automatically |
+| Lucy sounds robotic | Her cloud voice is unavailable, so the on-device voice speaks: no Speechify key, the month's free characters are used up, or Speechify is blocked | `lucy doctor` ("cloud voice"); `journalctl -u lucy -g "cloud voice"`; usage at <https://platform.speechify.ai/usage> |
+| Lucy stops mid-answer and changes the subject | Speechify's content screen refused a sentence | Working as intended. The journal shows `ContentRefused` |
 | Offline: "Can a grown-up check the Wi-Fi?" | The offline brain is not running | `systemctl status ollama`; `ollama list` should show `gemma3:1b`; `sudo lucy doctor` |
 | Journal: `local brain is not ready` | Ollama started after Lucy, or the model is missing | `sudo ollama pull gemma3:1b && sudo systemctl restart lucy` |
 

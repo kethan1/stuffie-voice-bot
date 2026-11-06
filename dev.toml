@@ -2,10 +2,11 @@
 #
 # Only the settings that differ on a laptop are here. Everything else is the same as on
 # the Pi (deploy/config.toml documents every key). Relative paths are relative to this file.
-# The Groq API key goes in a gitignored .env file (GROQ_API_KEY=...) or the environment.
+# API keys go in a gitignored .env file (GROQ_API_KEY=..., and SPEECHIFY_API_KEY=... for Lucy's
+# natural voice) or the environment.
 
 [tts]
-voice = "voices/en_US-amy-medium.onnx"   # `make voice` downloads it
+voice = "voices/en_US-lessac-medium.onnx"   # `make voice` downloads it
 
 [audio]
 # "" = the laptop's default microphone and speakers. To pick others, list them with

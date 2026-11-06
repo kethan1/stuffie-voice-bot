@@ -1,11 +1,14 @@
 """Split a streaming LLM reply into speakable chunks.
 
-Time-to-first-sound is dominated by how soon the first chunk can be handed to
-the speech synthesizer, so the chunker is deliberately eager at the start:
+Each sentence is handed to the speech synthesizer as soon as it is complete:
 
-* the first chunk may end at a clause boundary (",", ";", ":", a dash) once it
-  holds enough words to sound natural on its own;
-* every later chunk ends at a sentence boundary, so prosody stays natural;
+* chunks end at sentence boundaries, because a voice gives a whole sentence
+  its natural intonation, and a sentence synthesised in pieces sounds stitched
+  together;
+* optionally (``first_clause_min_words``), the first chunk may end at a clause
+  boundary (",", ";", ":", a dash) once it holds that many words. A slow
+  on-device voice then starts sooner. A streaming cloud voice does not need
+  this, since its first audio arrives within a fraction of a second anyway;
 * an unusually long run without punctuation is force-split so one sentence can
   never hold the speaker hostage.
 
@@ -30,7 +33,7 @@ class Chunk:
 
 
 class SentenceChunker:
-    def __init__(self, *, first_clause_min_words: int = 4, max_words: int = 30) -> None:
+    def __init__(self, *, first_clause_min_words: int = 0, max_words: int = 30) -> None:
         self._first_clause_min_words = first_clause_min_words
         self._max_words = max_words
         self._buffer = ""
@@ -53,7 +56,7 @@ class SentenceChunker:
     def _next_chunk(self) -> Chunk | None:
         cut = self._sentence_cut()
         ends_sentence = cut is not None
-        if cut is None and self._emitted == 0:
+        if cut is None and self._emitted == 0 and self._first_clause_min_words > 0:
             cut = self._clause_cut(self._first_clause_min_words)
         if cut is None and _word_count(self._buffer) > self._max_words:
             cut = self._clause_cut(1) or _word_cut(self._buffer, self._max_words)

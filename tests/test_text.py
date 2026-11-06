@@ -33,13 +33,20 @@ class TestSentenceChunker:
             "Pi is about 3.14 and Dr. Seuss wrote books."
         ]
 
+    def test_whole_sentences_by_default(self) -> None:
+        chunks = chunk_stream(["Well, that is a great question, and the answer is yes. "])
+        assert texts(chunks) == ["Well, that is a great question, and the answer is yes."]
+        assert chunks[0].ends_sentence is True
+
     def test_first_chunk_may_end_at_a_clause(self) -> None:
-        chunks = chunk_stream(["Well, that is a great question, and the answer is yes."])
+        text = "Well, that is a great question, and the answer is yes."
+        chunks = chunk_stream([text], first_clause_min_words=4)
         assert texts(chunks) == ["Well, that is a great question,", "and the answer is yes."]
         assert chunks[0].ends_sentence is False
 
     def test_later_chunks_wait_for_the_sentence(self) -> None:
-        chunks = chunk_stream(["Yes. The moon, which is far away, is made of rock. "])
+        text = "Yes. The moon, which is far away, is made of rock. "
+        chunks = chunk_stream([text], first_clause_min_words=4)
         assert texts(chunks) == ["Yes.", "The moon, which is far away, is made of rock."]
 
     def test_long_runs_are_force_split(self) -> None:

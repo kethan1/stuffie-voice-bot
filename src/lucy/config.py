@@ -5,10 +5,11 @@
   start-up instead of being silently ignored.
 * Relative paths are relative to the config file, so a config such as the
   repository's ``dev.toml`` works from any working directory.
-* The API key never lives in the TOML file. It is read from the systemd
-  credential ``groq_api_key`` (``LoadCredential=``; only the service can read
-  it) or, for development, from ``GROQ_API_KEY`` in the environment or in a
-  ``.env`` file in the working directory.
+* API keys never live in the TOML file. Each is read from a systemd
+  credential (``groq_api_key``, ``speechify_api_key``; ``LoadCredential=``, so
+  only the service can read them) or, for development, from ``GROQ_API_KEY``
+  and ``SPEECHIFY_API_KEY`` in the environment or in a ``.env`` file in the
+  working directory.
 """
 
 import dataclasses
@@ -19,7 +20,7 @@ import typing
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, Protocol, TypeVar
 
 from lucy.core.controller import SessionSettings
 from lucy.core.errors import ConfigError
@@ -93,13 +94,40 @@ class SafetySettings:
 
 
 @dataclass(frozen=True, slots=True)
+class CloudVoiceSettings:
+    """Lucy's natural voice, streamed from Speechify. The on-device voice stands in for it."""
+
+    enabled: bool = True
+    """Without an API key Lucy uses her on-device voice, so this only needs turning off to
+    keep a configured key unused."""
+    base_url: str = "https://api.speechify.ai/v1"
+    api_key_credential: str = "speechify_api_key"
+    api_key_env: str = "SPEECHIFY_API_KEY"
+    model: str = "simba-3.2"
+    voice_id: str = "harper_32"
+    """See the choices with `lucy voices`."""
+    volume: float = 1.0
+    timeout_s: float = 2.0
+    """The first audio must arrive this soon (and no later part may stall this long), or the
+    on-device voice says the sentence instead."""
+    rest_s: float = 60.0
+    """After a failure, use the on-device voice this long before trying the cloud voice again."""
+
+
+@dataclass(frozen=True, slots=True)
 class TtsSettings:
-    voice: Path = Path("/opt/lucy/voices/en_US-amy-medium.onnx")
+    voice: Path = Path("/opt/lucy/voices/en_US-lessac-medium.onnx")
+    """The on-device Piper voice: always ready, and the only voice without a cloud voice."""
     threads: int = 3
     length_scale: float = 1.0
     """Above 1.0 speaks more slowly, which can help the youngest children."""
     volume: float = 0.9
     speaker_id: int | None = None
+    honks: bool = True
+    """Make a goose call for each interjected "Honk!" instead of saying the word."""
+    honk_volume: float = 1.0
+    """1.0 is about as loud as Lucy's voice."""
+    cloud: CloudVoiceSettings = field(default_factory=CloudVoiceSettings)
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,8 +208,18 @@ def default_config_path(environ: Mapping[str, str] = os.environ) -> Path | None:
     return DEFAULT_CONFIG_PATH if DEFAULT_CONFIG_PATH.is_file() else None
 
 
+class KeySource(Protocol):
+    """Settings that name where an API key comes from (:class:`ApiSettings` and the like)."""
+
+    @property
+    def api_key_credential(self) -> str: ...
+
+    @property
+    def api_key_env(self) -> str: ...
+
+
 def read_api_key(
-    settings: ApiSettings,
+    settings: KeySource,
     environ: Mapping[str, str] = os.environ,
     env_file: Path = Path(".env"),
 ) -> str:
@@ -246,8 +284,19 @@ def _validate(config: Config) -> None:
         problems.append("button.backend must be 'gpio' or 'keyboard'")
     if config.tts.threads < 1:
         problems.append("tts.threads must be at least 1")
-    if not 0.0 <= config.tts.volume <= 2.0:
-        problems.append("tts.volume must be between 0 and 2")
+    cloud = config.tts.cloud
+    volumes = {
+        "tts.volume": config.tts.volume,
+        "tts.honk_volume": config.tts.honk_volume,
+        "tts.cloud.volume": cloud.volume,
+    }
+    problems += [
+        f"{name} must be between 0 and 2" for name, value in volumes.items() if not 0 <= value <= 2
+    ]
+    if cloud.timeout_s <= 0 or cloud.rest_s < 0:
+        problems.append("tts.cloud.timeout_s must be positive and tts.cloud.rest_s >= 0")
+    if config.turn.first_clause_min_words < 0:
+        problems.append("turn.first_clause_min_words must be 0 (whole sentences) or more")
     if config.audio.input_sample_rate not in (8_000, 16_000, 22_050, 24_000, 44_100, 48_000):
         problems.append("audio.input_sample_rate must be a standard rate (16000 recommended)")
     if config.local.enabled and config.audio.input_sample_rate != 16_000:

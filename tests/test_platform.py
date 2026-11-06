@@ -33,7 +33,7 @@ class TestConfig:
         assert not config.led.enabled
         assert not config.power.manage_cpu_governor
         assert not config.power.manage_wifi
-        assert config.tts.voice == REPO / "voices" / "en_US-amy-medium.onnx"  # `make voice`
+        assert config.tts.voice == REPO / "voices" / "en_US-lessac-medium.onnx"  # `make voice`
         assert config.local.stt_model == REPO / "models" / "faster-whisper-tiny.en"
 
     def test_relative_paths_are_relative_to_the_config_file(self, tmp_path: Path) -> None:
