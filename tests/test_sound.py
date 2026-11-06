@@ -31,6 +31,7 @@ class FakeStream:
         self.blocksize = blocksize
         self.output = bytearray()
         self.feed = [bytes([i % 256, 0]) * blocksize for i in range(1000)]
+        self.timing: Any = None  # PortAudio's time info, as the callback is handed it
         self._running = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -59,7 +60,7 @@ class FakeStream:
 class FakeOutput(FakeStream):
     def tick(self) -> None:
         buffer = bytearray(self.blocksize * 2)
-        self.callback(buffer, self.blocksize, None, _Status())
+        self.callback(buffer, self.blocksize, self.timing, _Status())
         self.output += buffer
 
 
@@ -72,13 +73,14 @@ class FakeInput(FakeStream):
 @pytest.fixture
 def sounddevice(monkeypatch: pytest.MonkeyPatch) -> types.SimpleNamespace:
     streams: list[FakeStream] = []
-    module = types.SimpleNamespace(fail=False, streams=streams)
+    module = types.SimpleNamespace(fail=False, streams=streams, timing=None)
 
     def make(kind: type[FakeStream]) -> Callable[..., FakeStream]:
         def factory(**kwargs: Any) -> FakeStream:
             if module.fail:
                 raise OSError("no such device")
             stream = kind(**kwargs)
+            stream.timing = module.timing
             streams.append(stream)
             return stream
 
@@ -148,6 +150,96 @@ async def test_cancelled_clip_is_skipped(sounddevice: types.SimpleNamespace) -> 
     await asyncio.wait_for(speaker.enqueue(clip(5, 10)), 2.0)
     await speaker.close()
     assert b"\x04" not in sounddevice.streams[0].output
+
+
+class Listener:
+    def __init__(self) -> None:
+        self.played: list[tuple[Pcm, float]] = []
+        self.stops = 0
+
+    def playing(self, audio: Pcm, at: float) -> None:
+        self.played.append((audio, at))
+
+    def stopped(self) -> None:
+        self.stops += 1
+
+
+async def test_speaker_says_when_each_clip_will_be_heard(
+    sounddevice: types.SimpleNamespace,
+) -> None:
+    from lucy.adapters.sound import SoundDeviceSpeaker
+
+    listener = Listener()
+    speaker = SoundDeviceSpeaker(
+        sample_rate=8_000, blocksize=BLOCK, latency_s=0.2, listener=listener
+    )
+    first, second = clip(1, 10), clip(2, 10)
+    before = time.monotonic()
+    done = asyncio.gather(speaker.enqueue(first), speaker.enqueue(second))
+    await asyncio.wait_for(done, 2.0)
+    await until(lambda: len(listener.played) == 2)
+    await speaker.close()
+    (heard_first, at_first), (heard_second, at_second) = listener.played
+    assert heard_first is first  # the clips themselves, cues and all
+    assert heard_second is second
+    # No DAC time from this host API, so the output latency stands in for it.
+    assert at_first >= before + 0.2
+    # Both start in the same buffer: exactly the first clip's length apart.
+    assert at_second - at_first == pytest.approx(10 / 8_000)
+
+
+async def test_speaker_uses_the_dac_time_when_portaudio_has_it(
+    sounddevice: types.SimpleNamespace,
+) -> None:
+    from lucy.adapters.sound import SoundDeviceSpeaker
+
+    sounddevice.timing = types.SimpleNamespace(currentTime=100.0, outputBufferDacTime=100.03)
+    listener = Listener()
+    speaker = SoundDeviceSpeaker(
+        sample_rate=8_000, blocksize=BLOCK, latency_s=0.5, listener=listener
+    )
+    before = time.monotonic()
+    await asyncio.wait_for(speaker.enqueue(clip(1, 10)), 2.0)
+    await until(lambda: len(listener.played) == 1)
+    await speaker.close()
+    assert listener.played[0][1] - before == pytest.approx(0.03, abs=0.02)
+
+
+async def test_stop_tells_the_listener(sounddevice: types.SimpleNamespace) -> None:
+    from lucy.adapters.sound import SoundDeviceSpeaker
+
+    listener = Listener()
+    speaker = SoundDeviceSpeaker(sample_rate=8_000, blocksize=BLOCK, listener=listener)
+    speaker.enqueue(clip(3, 8_000 * 60))
+    await until(lambda: len(listener.played) == 1)
+    speaker.stop()
+    assert listener.stops == 1
+    await speaker.close()
+
+
+async def test_a_report_overtaken_by_stop_is_dropped(sounddevice: types.SimpleNamespace) -> None:
+    from lucy.adapters.sound import SoundDeviceSpeaker
+
+    listener = Listener()
+    speaker = SoundDeviceSpeaker(sample_rate=8_000, blocksize=BLOCK, listener=listener)
+    stale = speaker._generation
+    speaker.stop()  # barge-in, after the audio thread posted the report but before it ran
+    speaker._report(stale, clip(1, 10), 0.0)
+    assert listener.played == []
+
+
+async def test_withdrawing_a_clip_part_way_tells_the_listener(
+    sounddevice: types.SimpleNamespace,
+) -> None:
+    from lucy.adapters.sound import SoundDeviceSpeaker
+
+    listener = Listener()
+    speaker = SoundDeviceSpeaker(sample_rate=8_000, blocksize=BLOCK, listener=listener)
+    playing = speaker.enqueue(clip(4, 8_000 * 60))
+    await until(lambda: len(listener.played) == 1)
+    playing.cancel()
+    await until(lambda: listener.stops == 1)
+    await speaker.close()
 
 
 async def test_rejects_mismatched_sample_rate(sounddevice: types.SimpleNamespace) -> None:

@@ -9,7 +9,7 @@ import numpy as np
 from lucy.core.audio import Pcm
 from lucy.core.metrics import TurnTimer
 from lucy.core.phrases import Phrase
-from lucy.core.types import ButtonEvent, Message, PowerMode, Status
+from lucy.core.types import ButtonEvent, Message, Motor, PowerMode, Status
 
 RATE = 1_000  # tiny sample rate keeps fake audio cheap
 
@@ -95,7 +95,7 @@ class FakeTTS:
         for index in range(self.parts):
             if self.error and index == self.error_after:
                 raise self.error
-            yield Pcm(self.sample * len(text), RATE)
+            yield Pcm(self.sample * len(text), self.sample_rate)
             await asyncio.sleep(0)
 
 
@@ -182,6 +182,30 @@ class FakePower:
 
     async def restore(self) -> None:
         self.restored = True
+
+
+class FakeMotors:
+    """Records every motor command with the event-loop time it was given."""
+
+    def __init__(self) -> None:
+        self.moves: list[tuple[float, Motor, float]] = []
+        self.awake = False
+        self.sleeps = 0
+
+    def drive(self, motor: Motor, power: float) -> None:
+        self.moves.append((asyncio.get_running_loop().time(), motor, power))
+        self.awake = self.awake or bool(power)
+
+    def sleep(self) -> None:
+        self.awake = False
+        self.sleeps += 1
+
+    def of(self, motor: Motor) -> list[tuple[float, float]]:
+        """(time, power) of each command ``motor`` was given."""
+        return [(at, power) for at, which, power in self.moves if which is motor]
+
+    def powers(self, motor: Motor) -> list[float]:
+        return [power for _, power in self.of(motor)]
 
 
 class FakeWarmer:

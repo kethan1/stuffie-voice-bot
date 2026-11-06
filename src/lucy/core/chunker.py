@@ -13,7 +13,10 @@ Each sentence is handed to the speech synthesizer as soon as it is complete:
   never hold the speaker hostage.
 
 Boundaries are only confirmed once the *next* character has arrived (or the
-stream ends), so "3.14" and "Dr. Seuss" are not split.
+stream ends), so "3.14" and "Dr. Seuss" are not split. After a single letter,
+they wait for the next word too: a run of single letters ("J. K. Rowling", or a
+word spelled out as "S. H. I. T.") stays in one chunk, so the reply screen sees
+the word it spells.
 """
 
 import re
@@ -21,6 +24,8 @@ from dataclasses import dataclass
 
 _SENTENCE_END = re.compile(r"""[.!?…]+["')\]]*(?=\s)|\n\s*\n""")
 _CLAUSE_END = re.compile(r"""(?:[,;:]|\s[-\u2013\u2014])(?=\s)""")
+# A single letter just before a sentence end: "in a V." or the "S" of "S. H. I. T."
+_SINGLE_LETTER = re.compile(r"(?:^|[^\w'])[A-Za-z]$")
 _ABBREVIATIONS = frozenset(
     {"mr", "mrs", "ms", "dr", "st", "jr", "sr", "vs", "etc", "e.g", "i.e", "mt", "no"}
 )
@@ -70,8 +75,15 @@ class SentenceChunker:
 
     def _sentence_cut(self) -> int | None:
         for match in _SENTENCE_END.finditer(self._buffer):
-            if not _is_abbreviation(self._buffer, match.start()):
-                return match.end()
+            if _is_abbreviation(self._buffer, match.start()):
+                continue
+            if _SINGLE_LETTER.search(self._buffer, 0, match.start()):
+                following = self._buffer[match.end() :].lstrip()
+                if len(following) < 2:
+                    return None  # not yet known whether another single letter follows
+                if following[0].isalpha() and not following[1].isalpha():
+                    continue  # "S. H. ...": the run of letters goes on
+            return match.end()
         return None
 
     def _clause_cut(self, min_words: int) -> int | None:
@@ -85,7 +97,8 @@ def _is_abbreviation(text: str, dot: int) -> bool:
     if text[dot] != ".":
         return False
     word = text[:dot].rsplit(maxsplit=1)[-1] if text[:dot].strip() else ""
-    # Single letters are not treated as initials: "geese fly in a V." must end a sentence.
+    # Single letters are not abbreviations: "geese fly in a V. Then..." ends a sentence (see
+    # _sentence_cut for a run of them).
     return word.lower().lstrip("(\"'") in _ABBREVIATIONS
 
 

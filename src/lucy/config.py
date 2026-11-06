@@ -24,6 +24,7 @@ from typing import Any, Protocol, TypeVar
 
 from lucy.core.controller import SessionSettings
 from lucy.core.errors import ConfigError
+from lucy.core.motion import MotionSettings
 from lucy.core.pipeline import TurnSettings
 
 DEFAULT_CONFIG_PATH = Path("/etc/lucy/config.toml")
@@ -88,7 +89,7 @@ class LocalSettings:
 @dataclass(frozen=True, slots=True)
 class SafetySettings:
     screen: bool = True
-    """On-device distress screen (see lucy.core.safety). Strongly recommended."""
+    """On-device screens of what a child says and what Lucy replies (see lucy.core.safety)."""
     extra_patterns: tuple[str, ...] = ()
     """Additional case-insensitive regular expressions that route to a trusted grown-up."""
 
@@ -159,6 +160,30 @@ class LedSettings:
 
 
 @dataclass(frozen=True, slots=True)
+class MotorSettings:
+    """Lucy's beak and body motors on a DRV8833 driver (docs/HARDWARE.md)."""
+
+    enabled: bool = False
+    pwm_chip: Path = Path("/sys/class/pwm/pwmchip0")
+    """Hardware PWM from ``dtoverlay=pwm-2chan,pin=12,func=4,pin2=13,func2=4``."""
+    pwm_frequency_hz: int = 20_000
+    """Above hearing, so the motors do not whine."""
+    gpio_chip: str = "/dev/gpiochip0"
+    beak_pwm_channel: int = 0
+    """PWM channel 0 is GPIO12 (pin 32), wired to AIN1."""
+    beak_direction_line: int = 22
+    """GPIO22 (pin 15), wired to AIN2."""
+    body_pwm_channel: int = 1
+    """PWM channel 1 is GPIO13 (pin 33), wired to BIN1."""
+    body_direction_line: int = 23
+    """GPIO23 (pin 16), wired to BIN2."""
+    sleep_line: int = 24
+    """GPIO24 (pin 18), wired to nSLEEP so the driver sleeps while Lucy is still; -1 if not
+    wired."""
+    motion: MotionSettings = field(default_factory=MotionSettings)
+
+
+@dataclass(frozen=True, slots=True)
 class PowerSettings:
     manage_cpu_governor: bool = True
     active_governor: str = "performance"
@@ -182,6 +207,7 @@ class Config:
     audio: AudioSettings = field(default_factory=AudioSettings)
     button: ButtonSettings = field(default_factory=ButtonSettings)
     led: LedSettings = field(default_factory=LedSettings)
+    motors: MotorSettings = field(default_factory=MotorSettings)
     power: PowerSettings = field(default_factory=PowerSettings)
     turn: TurnSettings = field(default_factory=TurnSettings)
     session: SessionSettings = field(default_factory=SessionSettings)
@@ -307,8 +333,53 @@ def _validate(config: Config) -> None:
         problems.append("session.tap_max_s must be shorter than session.max_record_s")
     if config.session.awake_s <= 0 or config.session.forget_after_s <= 0:
         problems.append("session.awake_s and session.forget_after_s must be positive")
+    if config.motors.enabled:
+        problems += _motor_problems(config)
     if problems:
         raise ConfigError("invalid configuration: " + "; ".join(problems))
+
+
+def _motor_problems(config: Config) -> list[str]:
+    motors, motion = config.motors, config.motors.motion
+    problems = []
+    if motors.beak_pwm_channel == motors.body_pwm_channel:
+        problems.append("motors.beak_pwm_channel and motors.body_pwm_channel must differ")
+    if not 1_000 <= motors.pwm_frequency_hz <= 50_000:
+        problems.append("motors.pwm_frequency_hz must be between 1000 and 50000 (20000 is silent)")
+    lines = {
+        "motors.beak_direction_line": motors.beak_direction_line,
+        "motors.body_direction_line": motors.body_direction_line,
+    }
+    if motors.sleep_line != -1:
+        lines["motors.sleep_line"] = motors.sleep_line
+    taken = {}
+    if config.button.chip == motors.gpio_chip and config.button.backend == "gpio":
+        taken[config.button.line] = "button.line"
+    if config.led.chip == motors.gpio_chip and config.led.enabled:
+        taken[config.led.line] = "led.line"
+    for name, line in lines.items():
+        if line < 0:
+            problems.append(f"{name} must be a GPIO line number")
+        elif line in taken:
+            problems.append(f"{name} {line} is already used by {taken[line]}")
+        taken[line] = name
+    powers = {
+        "beak_min_power": motion.beak_min_power,
+        "beak_max_power": motion.beak_max_power,
+        "body_power": motion.body_power,
+    }
+    problems += [
+        f"motors.motion.{name} must be between 0 and 1"
+        for name, value in powers.items()
+        if not 0 <= value <= 1
+    ]
+    if motion.beak_min_power > motion.beak_max_power:
+        problems.append("motors.motion.beak_min_power must not be above beak_max_power")
+    if not 0 <= motion.lead_s <= 0.3:
+        problems.append("motors.motion.lead_s must be between 0 and 0.3")
+    if motion.max_hold_s <= 0 or motion.bob_every_s < 0:
+        problems.append("motors.motion.max_hold_s must be positive and bob_every_s >= 0")
+    return problems
 
 
 # -- strict TOML -> dataclass conversion ---------------------------------------------------

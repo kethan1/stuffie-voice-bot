@@ -14,19 +14,25 @@ Playback runs from a PortAudio callback fed by a queue of clips. Consecutive
 clips are spliced sample-accurately (no gaps between sentences), an empty
 queue plays silence instead of underrunning, and ``stop()`` takes effect
 within one audio block (about 46 ms) for barge-in.
+
+The speaker can report to a :class:`~lucy.core.ports.PlaybackListener` (Lucy's
+motors) when each clip will actually be heard. The callback knows when the
+buffer it fills reaches the DAC (PortAudio's ``outputBufferDacTime``), so the
+report is accurate to a sample, however much audio is queued ahead of it.
 """
 
 import asyncio
-import contextlib
 import logging
 import threading
 from collections import deque
 from dataclasses import dataclass
 from functools import partial
+from time import monotonic
 from typing import Any
 
 from lucy.core.audio import SAMPLE_WIDTH, Pcm
 from lucy.core.errors import AudioDeviceError
+from lucy.core.ports import PlaybackListener
 
 log = logging.getLogger(__name__)
 
@@ -108,6 +114,7 @@ class SoundDeviceMicrophone:
 
 @dataclass(eq=False, slots=True)
 class _Clip:
+    audio: Pcm
     data: memoryview
     future: asyncio.Future[None]
     offset: int = 0
@@ -121,15 +128,19 @@ class SoundDeviceSpeaker:
         device: Device = None,
         latency_s: float = 0.08,
         blocksize: int = 1024,
+        listener: PlaybackListener | None = None,
     ) -> None:
         self._sd = import_sounddevice()
         self._sample_rate = sample_rate
         self._device = device
         self._latency_s = latency_s
+        self._delay_s = latency_s  # until the stream reports its real output latency
         self._blocksize = blocksize
+        self._listener = listener
         self._silence = bytes(blocksize * SAMPLE_WIDTH)
         self._lock = threading.Lock()
         self._queue: deque[_Clip] = deque()
+        self._generation = 0  # bumped by stop(): reports from before it are stale
         self._stream: Any = None
         self._opening: asyncio.Task[None] | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -139,7 +150,7 @@ class SoundDeviceSpeaker:
             raise ValueError(f"speaker runs at {self._sample_rate} Hz, got {audio.sample_rate} Hz")
         self._loop = asyncio.get_running_loop()
         future: asyncio.Future[None] = self._loop.create_future()
-        clip = _Clip(memoryview(audio.data), future)
+        clip = _Clip(audio, memoryview(audio.data), future)
         with self._lock:
             self._queue.append(clip)
         future.add_done_callback(partial(self._withdraw, clip))
@@ -150,8 +161,11 @@ class SoundDeviceSpeaker:
         with self._lock:
             clips = list(self._queue)
             self._queue.clear()
+            self._generation += 1
         for clip in clips:
             clip.future.cancel()
+        if self._listener is not None:
+            self._listener.stopped()
         return bool(clips)
 
     async def open(self) -> None:
@@ -198,22 +212,36 @@ class SoundDeviceSpeaker:
             latency=self._latency_s,
             callback=self._fill,
         )
+        self._delay_s = float(getattr(stream, "latency", None) or self._latency_s)
         stream.start()
         return stream
 
     def _withdraw(self, clip: _Clip, future: asyncio.Future[None]) -> None:
-        if future.cancelled():
-            with self._lock, contextlib.suppress(ValueError):
+        if not future.cancelled():
+            return
+        with self._lock:
+            try:
                 self._queue.remove(clip)
+            except ValueError:
+                return
+            cut_short = clip.offset > 0
+            if cut_short:
+                self._generation += 1
+        if cut_short and self._listener is not None:
+            self._listener.stopped()  # the rest of a clip that had started will not be heard
 
-    def _fill(self, outdata: Any, frames: int, time: Any, status: Any) -> None:
+    def _fill(self, outdata: Any, frames: int, timing: Any, status: Any) -> None:
         """PortAudio callback (audio thread): copy queued clips, pad with silence."""
         need = len(outdata)
         filled = 0
         finished: list[asyncio.Future[None]] = []
+        started: list[tuple[Pcm, int]] = []  # clips starting in this buffer, at which byte
         with self._lock:
+            generation = self._generation
             while filled < need and self._queue:
                 clip = self._queue[0]
+                if clip.offset == 0 and self._listener is not None:
+                    started.append((clip.audio, filled))
                 take = min(need - filled, len(clip.data) - clip.offset)
                 outdata[filled : filled + take] = clip.data[clip.offset : clip.offset + take]
                 clip.offset += take
@@ -223,9 +251,28 @@ class SoundDeviceSpeaker:
                     finished.append(clip.future)
         if filled < need:
             outdata[filled:need] = self._silence[: need - filled]
-        if finished and self._loop is not None:
-            for future in finished:
-                self._loop.call_soon_threadsafe(_resolve, future)
+        if self._loop is None:
+            return
+        for future in finished:
+            self._loop.call_soon_threadsafe(_resolve, future)
+        if started:
+            heard_at = monotonic() + self._output_delay(timing)
+            for audio, offset in started:
+                at = heard_at + offset / SAMPLE_WIDTH / self._sample_rate
+                self._loop.call_soon_threadsafe(self._report, generation, audio, at)
+
+    def _output_delay(self, timing: Any) -> float:
+        """Seconds until the first sample of the buffer being filled is heard."""
+        dac = getattr(timing, "outputBufferDacTime", 0.0) or 0.0
+        now = getattr(timing, "currentTime", 0.0) or 0.0
+        if dac > 0 and now > 0 and 0 <= dac - now < 1.0:
+            return float(dac - now)
+        return self._delay_s  # some host APIs leave the times at zero
+
+    def _report(self, generation: int, audio: Pcm, at: float) -> None:
+        """Event loop: tell the listener a clip is playing, unless stop() came since."""
+        if generation == self._generation and self._listener is not None:
+            self._listener.playing(audio, at)
 
 
 def _resolve(future: asyncio.Future[None]) -> None:

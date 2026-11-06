@@ -17,7 +17,8 @@ shipped. Each one is about a third of a second:
 Punctuation sets the mood: "Honk!" is bright, "Honk?" rises like a question,
 and "Honk." or "Honk," is calmer. Each mood has a few slightly different
 calls, picked at random, so a honk never sounds like the same clip on repeat.
-Calls are normalised to the loudness of Lucy's voice.
+Calls are normalised to the loudness of Lucy's voice, and each one is cued as a
+honk (:class:`~lucy.core.audio.Cue`) so her body flaps in time with it.
 """
 
 import math
@@ -31,7 +32,7 @@ from enum import StrEnum
 import numpy as np
 import numpy.typing as npt
 
-from lucy.core.audio import Pcm
+from lucy.core.audio import CueKind, Pcm
 from lucy.core.ports import TextToSpeech
 
 Samples = npt.NDArray[np.float64]
@@ -230,7 +231,8 @@ class GooseCalls:
     def _level(self, samples: Samples, volume: float) -> Pcm:
         rms = math.sqrt(float(np.mean(samples * samples)))
         scaled = samples * (_TARGET_RMS * volume / rms)
-        return Pcm.from_float(np.clip(scaled, -0.95, 0.95), self.sample_rate)
+        call = Pcm.from_float(np.clip(scaled, -0.95, 0.95), self.sample_rate)
+        return call.cued(CueKind.HONK)
 
 
 class HonkingVoice:

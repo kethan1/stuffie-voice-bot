@@ -33,6 +33,13 @@ class TestSentenceChunker:
             "Pi is about 3.14 and Dr. Seuss wrote books."
         ]
 
+    def test_a_run_of_single_letters_stays_in_one_chunk(self) -> None:
+        # A word spelled one letter per "sentence" must reach the reply screen whole.
+        text = "It is spelled S. H. I. T. Neat! Geese fly in a V. Wow."
+        expected = ["It is spelled S. H. I. T.", "Neat!", "Geese fly in a V.", "Wow."]
+        assert texts(chunk_stream([text])) == expected
+        assert texts(chunk_stream(list(text))) == expected
+
     def test_whole_sentences_by_default(self) -> None:
         chunks = chunk_stream(["Well, that is a great question, and the answer is yes. "])
         assert texts(chunks) == ["Well, that is a great question, and the answer is yes."]

@@ -12,7 +12,7 @@ from collections.abc import AsyncGenerator, AsyncIterator, Sequence
 from typing import Protocol
 
 from lucy.core.audio import Pcm
-from lucy.core.types import Assessment, ButtonEvent, Message, PowerMode, Status
+from lucy.core.types import Assessment, ButtonEvent, Message, Motor, PowerMode, Status
 
 
 class SpeechToText(Protocol):
@@ -34,8 +34,8 @@ class Moderator(Protocol):
 
 
 class ReplyScreen(Protocol):
-    def allows(self, sentence: str) -> bool:
-        """Whether Lucy may say this sentence of her reply aloud."""
+    def screen(self, sentence: str) -> Assessment:
+        """Whether Lucy may say this sentence of her reply aloud, and if not, why not."""
         ...
 
 
@@ -81,6 +81,31 @@ class Speaker(Protocol):
 
     async def close(self) -> None:
         """Release the output device so the amplifier and sound card can idle."""
+        ...
+
+
+class PlaybackListener(Protocol):
+    """Told what the speaker plays, and when it is heard (see :mod:`lucy.core.motion`)."""
+
+    def playing(self, audio: Pcm, at: float) -> None:
+        """``audio`` has started to play: its first sample is heard at loop time ``at``."""
+        ...
+
+    def stopped(self) -> None:
+        """Playback was cut short: nothing already reported will be heard any more."""
+        ...
+
+
+class Motors(Protocol):
+    def drive(self, motor: Motor, power: float) -> None:
+        """Run ``motor`` at ``power``, from -1 to 1: the sign picks the way, 0 lets it coast.
+
+        Wakes the motor driver if it is asleep.
+        """
+        ...
+
+    def sleep(self) -> None:
+        """Let every motor coast and put the driver to sleep, drawing next to nothing."""
         ...
 
 

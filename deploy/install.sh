@@ -4,6 +4,8 @@
 #   sudo deploy/install.sh [options]
 #
 #   --i2s-amp              add the MAX98357A I2S amplifier overlay (reboot required)
+#   --motors               Lucy's beak and body motors on a DRV8833: the hardware PWM overlay
+#                          (reboot required), PWM access for the gpio group, [motors] enabled
 #   --playback-card NAME   ALSA card id for the speaker   (default: auto-detect)
 #   --capture-card NAME    ALSA card id for the microphone (default: auto-detect)
 #   --voice NAME           on-device Piper voice, e.g. en_US-lessac-medium (default)
@@ -48,7 +50,7 @@ declare -A STT_MODEL_SHA256=(
   [tokenizer.json]=929c5252409436dce1b38a75d1abbcb5e132d170d8e324e4e04ed915fa2d22df
   [vocabulary.txt]=ff77588746d3a2595d32ab5b69ffd7b95ce2441ac57533cb66fc3eb575a115cf
 )
-I2S_AMP=0 TUNE=0 READ_ONLY=0 START=1 LOCAL_BACKUP=0 PLAYBACK_CARD="" CAPTURE_CARD=""
+I2S_AMP=0 MOTORS=0 TUNE=0 READ_ONLY=0 START=1 LOCAL_BACKUP=0 PLAYBACK_CARD="" CAPTURE_CARD=""
 
 log() { printf '\033[1;33m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;31m!!\033[0m %s\n' "$*" >&2; }
@@ -57,6 +59,7 @@ die() { warn "$*"; exit 1; }
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --i2s-amp) I2S_AMP=1 ;;
+    --motors) MOTORS=1 ;;
     --playback-card) PLAYBACK_CARD="${2:?}"; shift ;;
     --capture-card) CAPTURE_CARD="${2:?}"; shift ;;
     --voice) VOICE="${2:?}"; shift ;;
@@ -64,7 +67,7 @@ while [[ $# -gt 0 ]]; do
     --local-backup) LOCAL_BACKUP=1 ;;
     --read-only) READ_ONLY=1 ;;
     --no-start) START=0 ;;
-    -h|--help) sed -n '2,18p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
     *) die "unknown option: $1 (see --help)" ;;
   esac
   shift
@@ -131,13 +134,24 @@ install_ollama() {
   rm -rf "$tmp"
 }
 
-# True if an installed config already turns the local brain on (so upgrades keep it).
-local_backup_configured() {
+# True if the installed config turns on the [$1] section (so upgrades keep it on).
+section_enabled() {
   [[ -f $ETC/config.toml ]] && python3 -c '
 import sys, tomllib
 with open(sys.argv[1], "rb") as f:
-    sys.exit(0 if tomllib.load(f).get("local", {}).get("enabled") is True else 1)
-' "$ETC/config.toml" 2>/dev/null
+    sys.exit(0 if tomllib.load(f).get(sys.argv[2], {}).get("enabled") is True else 1)
+' "$ETC/config.toml" "$1" 2>/dev/null
+}
+
+# Turn on the [$1] section of the installed config.
+enable_section() {
+  local name=$1
+  if grep -q "^\[$name\]" "$ETC/config.toml"; then
+    sed -i "/^\[$name\]/,/^\[/ s/^enabled = false/enabled = true/" "$ETC/config.toml"
+  else
+    printf '\n[%s]\nenabled = true\n' "$name" >>"$ETC/config.toml"
+  fi
+  section_enabled "$name" || warn "could not enable [$name] in $ETC/config.toml; set enabled = true there"
 }
 
 # The id of an ALSA card with a PCM of the given kind (p = playback, c = capture).
@@ -154,9 +168,13 @@ detect_card() {
   echo "$fallback"
 }
 
-if [[ $LOCAL_BACKUP -eq 0 ]] && local_backup_configured; then
+if [[ $LOCAL_BACKUP -eq 0 ]] && section_enabled local; then
   LOCAL_BACKUP=1
   log "keeping the offline brain that $ETC/config.toml enables"
+fi
+if [[ $MOTORS -eq 0 ]] && section_enabled motors; then
+  MOTORS=1
+  log "keeping the motors that $ETC/config.toml enables"
 fi
 EXTRAS=(--extra pi)
 [[ $LOCAL_BACKUP -eq 0 ]] || EXTRAS+=(--extra local)
@@ -261,13 +279,7 @@ if [[ $LOCAL_BACKUP -eq 1 ]]; then
   systemctl restart ollama.service
   for _ in $(seq 30); do ollama list &>/dev/null && break; sleep 1; done
   ollama pull "$LOCAL_LLM"
-
-  if grep -q '^\[local\]' "$ETC/config.toml"; then
-    sed -i '/^\[local\]/,/^\[/ s/^enabled = false/enabled = true/' "$ETC/config.toml"
-  else
-    printf '\n[local]\nenabled = true\n' >>"$ETC/config.toml"
-  fi
-  local_backup_configured || warn "could not enable [local] in $ETC/config.toml; set enabled = true there"
+  enable_section local
 fi
 
 log "configuring audio"
@@ -286,6 +298,23 @@ if [[ -n $PLAYBACK_CARD && -n $CAPTURE_CARD ]]; then
   log "speaker card: $PLAYBACK_CARD, microphone card: $CAPTURE_CARD (change with --playback-card/--capture-card)"
 else
   warn "could not find a speaker and a microphone (see 'aplay -l' and 'arecord -l'); re-run once they are plugged in"
+fi
+
+if [[ $MOTORS -eq 1 ]]; then
+  log "setting up the beak and body motors"
+  # Hardware PWM channel 0 on GPIO12 (the beak) and channel 1 on GPIO13 (the body).
+  set_block "$BOOT_CONFIG" lucy-motors "$(printf '%s\n' '# >>> lucy-motors >>>' '[all]' \
+    'dtoverlay=pwm-2chan,pin=12,func=4,pin2=13,func2=4' '# <<< lucy-motors <<<')"
+  # Raspberry Pi OS already lets the gpio group use PWM; add the same rule anywhere it does not.
+  if ! grep -rqs 'SUBSYSTEM=="pwm' /usr/lib/udev/rules.d /etc/udev/rules.d; then
+    cat >/etc/udev/rules.d/60-lucy-pwm.rules <<'RULE'
+# Let the gpio group export and drive hardware PWM channels (Lucy's motors). Exporting a
+# channel sends a "change" event for its chip, so new channels are covered too.
+SUBSYSTEM=="pwm", KERNEL=="pwmchip*", RUN+="/bin/sh -c 'chgrp -R gpio /sys%p && chmod -R g+rwX /sys%p'"
+RULE
+    udevadm control --reload
+  fi
+  enable_section motors
 fi
 
 if [[ $TUNE -eq 1 ]]; then
@@ -319,8 +348,11 @@ fi
 
 log "done. Next steps:"
 echo "   sudo lucy doctor --listen     # check everything (runs exactly as the service does)"
-echo "   sudo lucy say 'Honk!'          # test the speaker"
+echo "   sudo lucy say 'Honk!'          # test the speaker (and, with motors, the beak)"
+if [[ $MOTORS -eq 1 ]]; then
+  echo "   sudo systemctl stop lucy && sudo lucy motors; sudo systemctl start lucy   # check the motors"
+fi
 echo "   journalctl -u lucy -f"
-if [[ $I2S_AMP -eq 1 || $TUNE -eq 1 || $READ_ONLY -eq 1 ]]; then
+if [[ $I2S_AMP -eq 1 || $MOTORS -eq 1 || $TUNE -eq 1 || $READ_ONLY -eq 1 ]]; then
   warn "reboot to apply boot-time changes: sudo reboot"
 fi

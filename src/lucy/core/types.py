@@ -38,6 +38,15 @@ class Status(Enum):
     ERROR = "error"
 
 
+class Motor(StrEnum):
+    """Lucy's motors (docs/HARDWARE.md)."""
+
+    BEAK = "beak"
+    """Pushes the beak open against a spring; the spring closes it when the motor lets go."""
+    BODY = "body"
+    """Wiggles or flaps Lucy's body, one way or both."""
+
+
 class PowerMode(Enum):
     """System power profile.
 
@@ -56,6 +65,10 @@ class Concern(Enum):
 
     NONE = "none"
     OFF_LIMITS = "off_limits"  # a topic Lucy steers away from
+    UNKIND = "unkind"  # being mean about someone, or asking Lucy to be
+    TRICK = "trick"  # trying to talk Lucy out of her rules
+    PRIVATE = "private"  # personal details (address, phone number), kept off the network
+    UNSAFE = "unsafe"  # something that could hurt someone: a dare, a weapon, a poison
     NEEDS_GROWN_UP = "needs_grown_up"  # the child may be hurt, unsafe, or in distress
 
 

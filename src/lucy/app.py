@@ -22,9 +22,10 @@ from lucy.core.errors import ConfigError, LucyError
 from lucy.core.phrases import Phrase, PhraseBook
 from lucy.core.pipeline import TurnPipeline
 from lucy.core.ports import Button, Indicator, PowerControl
-from lucy.core.safety import AllowAll, BlockedWords, DistressScreen
+from lucy.core.safety import AllowAll, ReplyFilter, SafetyScreen
 from lucy.core.tasks import BackgroundTasks
-from lucy.core.types import PowerMode
+from lucy.core.types import PowerMode, Status
+from lucy.motors import start_motion
 from lucy.persona import LUCY
 from lucy.platform.systemd import SystemdNotifier
 from lucy.voices import Voice, build_voice, load_on_device_voice
@@ -75,6 +76,17 @@ def build_button(config: Config, keyboard: bool) -> Button:
     return GpioButton(b.chip, b.line, active_low=b.active_low, debounce_ms=b.debounce_ms)
 
 
+class Indicators:
+    """Shows each status on several indicators at once (the LED, and Lucy's motors)."""
+
+    def __init__(self, *indicators: Indicator) -> None:
+        self._indicators = indicators
+
+    def show(self, status: Status) -> None:
+        for indicator in self._indicators:
+            indicator.show(status)
+
+
 def build_indicator(config: Config, stack: AsyncExitStack) -> Indicator:
     if not config.led.enabled:
         return LogIndicator()
@@ -101,7 +113,8 @@ async def run(config: Config, *, keyboard: bool = False) -> int:
 
     async with AsyncExitStack() as stack:
         notifier.status("loading voice")
-        system_prompt = read_system_prompt(config, LUCY.system_prompt)
+        puppeteer = await start_motion(config, stack)  # her prompt says whether she can move
+        system_prompt = read_system_prompt(config, LUCY.prompt(moving=puppeteer is not None))
         voice = await open_voice(config, stack)
         tts = voice.tts
 
@@ -115,6 +128,7 @@ async def run(config: Config, *, keyboard: bool = False) -> int:
             device=device(config.audio.output_device),
             latency_s=config.audio.output_latency_s,
             blocksize=config.audio.output_blocksize,
+            listener=puppeteer,
         )
         mic = SoundDeviceMicrophone(
             sample_rate=config.audio.input_sample_rate,
@@ -122,6 +136,8 @@ async def run(config: Config, *, keyboard: bool = False) -> int:
             max_seconds=config.session.max_record_s + 1.0,
         )
         indicator = build_indicator(config, stack)
+        if puppeteer is not None:
+            indicator = Indicators(indicator, puppeteer)
         power = build_power(config)
         stack.push_async_callback(power.restore)
 
@@ -132,7 +148,7 @@ async def run(config: Config, *, keyboard: bool = False) -> int:
             brain=cloud.brain(),
             backup=local.brain() if local is not None else None,
             tts=tts,
-            moderator=DistressScreen(extra=config.safety.extra_patterns)
+            moderator=SafetyScreen(extra=config.safety.extra_patterns)
             if config.safety.screen
             else AllowAll(),
             speaker=speaker,
@@ -141,7 +157,7 @@ async def run(config: Config, *, keyboard: bool = False) -> int:
             conversation=conversation,
             system_prompt=system_prompt,
             settings=config.turn,
-            reply_screen=BlockedWords() if config.safety.screen else None,
+            reply_screen=ReplyFilter() if config.safety.screen else None,
         )
         controller = Controller(
             pipeline=pipeline,
@@ -163,7 +179,12 @@ async def run(config: Config, *, keyboard: bool = False) -> int:
         button = build_button(config, keyboard)
 
         notifier.ready(f"Lucy {__version__} is awake")
-        log.info("Lucy %s is awake (voice: %s)", __version__, voice.name)
+        log.info(
+            "Lucy %s is awake (voice: %s; %s)",
+            __version__,
+            voice.name,
+            "moving" if puppeteer is not None else "keeping still",
+        )
         serving = asyncio.create_task(controller.run(button), name="controller")
         stopping = asyncio.create_task(stop.wait(), name="stop")
         await asyncio.wait({serving, stopping}, return_when=asyncio.FIRST_COMPLETED)

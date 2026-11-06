@@ -26,7 +26,7 @@ import time
 from collections.abc import AsyncGenerator, Callable
 from contextlib import aclosing
 
-from lucy.core.audio import Pcm
+from lucy.core.audio import Pcm, join
 from lucy.core.errors import ContentRefused, RateLimited, ServiceError, ServiceUnreachable
 from lucy.core.ports import TextToSpeech
 
@@ -34,10 +34,9 @@ log = logging.getLogger(__name__)
 
 
 async def render(tts: TextToSpeech, text: str) -> Pcm:
-    """Synthesise ``text`` into one clip."""
+    """Synthesise ``text`` into one clip (keeping the parts' cues, such as honks)."""
     async with aclosing(tts.stream(text)) as parts:
-        audio = b"".join([part.data async for part in parts])
-    return Pcm(audio, tts.sample_rate)
+        return join([part async for part in parts], tts.sample_rate)
 
 
 def _always() -> bool:

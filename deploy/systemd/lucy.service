@@ -23,6 +23,10 @@ LoadCredential=speechify_api_key:/etc/lucy/credentials/speechify_api_key
 # "+" runs as root outside the sandbox: let the lucy group switch CPU governors (lucy.adapters.power).
 ExecStartPre=+/bin/sh -c 'for f in /sys/devices/system/cpu/cpufreq/policy*/scaling_governor; do [ -e "$$f" ] && chgrp lucy "$$f" && chmod g+w "$$f"; done; true'
 ExecStart=/opt/lucy/venv/bin/lucy --config /etc/lucy/config.toml run
+# A hardware PWM channel keeps running after the process that set it dies, so stop the beak
+# and body motors whenever Lucy stops, however she stopped (a crash, the watchdog, a kill).
+# Does nothing when [motors] is off. "-": this cleanup never fails the unit.
+ExecStopPost=-/opt/lucy/venv/bin/lucy --config /etc/lucy/config.toml motors --off
 
 # Self-healing: restart on crash or a wedged event loop, but not on a configuration error (exit 78).
 Restart=always
@@ -43,8 +47,8 @@ MemoryMax=1500M
 AmbientCapabilities=CAP_NET_ADMIN
 CapabilityBoundingSet=CAP_NET_ADMIN
 
-# Sandbox. /sys stays writable (ProtectKernelTunables=no) for the CPU governor files only
-# the lucy group may write; everything else on disk is read-only.
+# Sandbox. /sys stays writable (ProtectKernelTunables=no) for the CPU governor files the
+# lucy group may write and the motors' PWM channels (gpio group); the rest is read-only.
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes

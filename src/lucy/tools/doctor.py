@@ -1,9 +1,10 @@
 """``lucy doctor``: check everything Lucy needs, and say what to fix.
 
 Run it after installing, after rewiring, or whenever Lucy is quiet. It checks
-the configuration, API keys, both voices, sound devices, GPIO lines,
-network/API access, and power controls. With ``--listen`` it also records three seconds so
-microphone levels can be checked against ``turn.speech_threshold_dbfs``.
+the configuration, API keys, both voices, sound devices, GPIO lines, the
+motors' PWM channels, network/API access, and power controls. With
+``--listen`` it also records three seconds so microphone levels can be checked
+against ``turn.speech_threshold_dbfs``.
 """
 
 import asyncio
@@ -46,6 +47,8 @@ async def doctor(config: Config, config_path: Path | None, *, listen: bool) -> i
         probes.append(("button GPIO", button_line))
     if config.led.enabled:
         probes.append(("LED GPIO", led_line))
+    if config.motors.enabled:
+        probes.append(("motors", motors))
     probes.append(("AI service", service))
     if config.tts.cloud.enabled:
         probes.append(("cloud voice", cloud_voice))
@@ -192,10 +195,40 @@ def _gpio_line(chip: str, line: int, label: str) -> str:
         raise LucyError(f"no permission on {chip} (add the user to the 'gpio' group)")
     with gpiod.Chip(chip) as handle:
         info = handle.get_line_info(line)
-    if info.used and info.consumer not in ("lucy-button", "lucy-led"):
+    if info.used and not info.consumer.startswith("lucy-"):
         raise LucyError(f"line {line} is in use by {info.consumer!r}")
     held = f" (held by the running service as {info.consumer})" if info.used else ""
     return f"{label} on {chip} line {line}{held}"
+
+
+def motors(config: Config) -> str:
+    """The PWM channels and GPIO lines are there and free. Nothing moves (`lucy motors` does)."""
+    settings = config.motors
+    chip = settings.pwm_chip
+    if not (chip / "npwm").exists():
+        raise LucyError(
+            f"{chip} is missing: add the PWM overlay (sudo deploy/install.sh --motors) and reboot"
+        )
+    channels = int((chip / "npwm").read_text())
+    for name, channel in (("beak", settings.beak_pwm_channel), ("body", settings.body_pwm_channel)):
+        if channel >= channels:
+            raise LucyError(
+                f"{chip} has {channels} channel(s), so there is no {name} channel {channel}"
+            )
+    lines = [
+        (settings.beak_direction_line, "beak direction"),
+        (settings.body_direction_line, "body direction"),
+    ]
+    if settings.sleep_line != -1:
+        lines.append((settings.sleep_line, "driver sleep"))
+    for line, label in lines:
+        _gpio_line(settings.gpio_chip, line, label)
+    sleep = "not wired" if settings.sleep_line == -1 else f"GPIO{settings.sleep_line}"
+    return (
+        f"beak on PWM {settings.beak_pwm_channel} + GPIO{settings.beak_direction_line}, "
+        f"body on PWM {settings.body_pwm_channel} + GPIO{settings.body_direction_line}, "
+        f"sleep {sleep} (`lucy motors` moves them)"
+    )
 
 
 async def service(config: Config) -> str:

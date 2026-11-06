@@ -76,9 +76,11 @@ class GpioButton:
 
 
 class GpioOutput:
-    """A single output line (e.g. an LED behind a resistor)."""
+    """A single output line (an LED behind a resistor, a motor driver input), starting off."""
 
-    def __init__(self, chip: str, line: int, *, active_low: bool = False) -> None:
+    def __init__(
+        self, chip: str, line: int, *, active_low: bool = False, consumer: str = "lucy-led"
+    ) -> None:
         import gpiod
         from gpiod.line import Direction, Value
 
@@ -87,7 +89,7 @@ class GpioOutput:
         try:
             self._request: Any = gpiod.request_lines(
                 chip,
-                consumer="lucy-led",
+                consumer=consumer,
                 config={
                     line: gpiod.LineSettings(
                         direction=Direction.OUTPUT,
@@ -97,7 +99,9 @@ class GpioOutput:
                 },
             )
         except OSError as error:
-            raise ConfigError(f"cannot claim LED GPIO {line} on {chip}: {error}") from error
+            raise ConfigError(
+                f"cannot claim GPIO {line} on {chip} ({consumer}): {error}"
+            ) from error
 
     def set(self, on: bool) -> None:
         self._request.set_value(self._line, self._active if on else self._inactive)

@@ -19,7 +19,7 @@ from lucy.core.conversation import Conversation
 from lucy.core.metrics import TurnTimer
 from lucy.core.phrases import PhraseBook
 from lucy.core.pipeline import Brain, TurnPipeline, TurnSettings
-from lucy.core.safety import DistressScreen
+from lucy.core.safety import SafetyScreen
 from lucy.core.speech import render
 from lucy.persona import LUCY
 from tests.fakes import FakeIndicator, FakeSpeaker, tone
@@ -50,7 +50,7 @@ async def test_full_turn_with_real_voice() -> None:
             StreamingChat(api, ChatModelSpec("openai/gpt-oss-20b")),
         ),
         tts=tts,
-        moderator=DistressScreen(),
+        moderator=SafetyScreen(),
         speaker=speaker,
         indicator=FakeIndicator(),
         phrases=PhraseBook(LUCY.lines, tts),
@@ -113,7 +113,7 @@ async def test_offline_turn_uses_the_local_brain() -> None:
         ),
         backup=Brain("local", local_stt, StreamingChat(local_api, ChatModelSpec("gemma3:1b"))),
         tts=tts,
-        moderator=DistressScreen(),
+        moderator=SafetyScreen(),
         speaker=speaker,
         indicator=FakeIndicator(),
         phrases=PhraseBook(LUCY.lines, tts),

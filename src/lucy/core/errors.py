@@ -5,6 +5,8 @@ into these types so the core can decide what Lucy should *say* without knowing
 which library broke.
 """
 
+from lucy.core.types import Concern
+
 
 class LucyError(Exception):
     """Base class for every error Lucy knows how to explain."""
@@ -39,4 +41,12 @@ class RateLimited(ServiceError):
 
 
 class ContentRefused(ServiceError):
-    """The service's own content screen refused the text. Retrying it unchanged cannot help."""
+    """A content screen refused the text. Retrying it unchanged cannot help.
+
+    ``concern`` says why, so Lucy can answer to match: a service's own screen does not say,
+    and is treated as an off-limits topic.
+    """
+
+    def __init__(self, message: str, concern: Concern = Concern.OFF_LIMITS) -> None:
+        super().__init__(message)
+        self.concern = concern

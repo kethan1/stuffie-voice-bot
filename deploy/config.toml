@@ -56,7 +56,7 @@ max_tokens = 100
 temperature = 0.7
 
 [safety]
-screen = true                  # on-device distress screen; keep this on for children
+screen = true                  # on-device screens of what kids say and what Lucy says; keep on
 extra_patterns = []            # more regular expressions that route to "tell a grown-up"
 
 [tts]
@@ -99,6 +99,29 @@ chip = "/dev/gpiochip0"
 line = 27                      # BCM 27 = physical pin 13, through a 330 ohm resistor
 active_low = false
 
+[motors]
+# Lucy's beak and body motors on a DRV8833 driver (docs/HARDWARE.md, "Motors"). Switched on,
+# with the PWM overlay they need, by: sudo deploy/install.sh --motors. Check the wiring with:
+#   sudo systemctl stop lucy && sudo lucy motors
+enabled = false
+pwm_chip = "/sys/class/pwm/pwmchip0"   # dtoverlay=pwm-2chan,pin=12,func=4,pin2=13,func2=4
+pwm_frequency_hz = 20000       # above hearing, so the motors don't whine
+gpio_chip = "/dev/gpiochip0"
+beak_pwm_channel = 0           # GPIO12 (pin 32) -> AIN1
+beak_direction_line = 22       # GPIO22 (pin 15) -> AIN2
+body_pwm_channel = 1           # GPIO13 (pin 33) -> BIN1
+body_direction_line = 23       # GPIO23 (pin 16) -> BIN2
+sleep_line = 24                # GPIO24 (pin 18) -> nSLEEP; -1 if your board ties it high
+
+[motors.motion]
+lead_s = 0.05                  # move this much before the sound (motors take a moment)
+beak_min_power = 0.35          # just enough to move the beak against its spring
+beak_max_power = 0.8           # wide open, without slamming it
+body_power = 0.6
+body_two_way = true            # false if the body motor may only run forward
+bob_every_s = 2.5              # bob at the start of a phrase at most this often; 0 = never
+max_hold_s = 2.0               # no motor runs longer than this without a rest (no overheating)
+
 [power]
 manage_cpu_governor = true
 active_governor = "performance"
@@ -114,7 +137,7 @@ sentence_pause_s = 0.2
 clause_pause_s = 0.08
 first_clause_min_words = 0     # 0 = whole sentences (most natural); 4 = start sooner on Piper
 max_chunk_words = 30
-log_transcripts = false        # privacy: keep children's words out of the journal
+log_transcripts = false        # privacy: keep children's words (and replies) out of the journal
 
 [session]
 tap_max_s = 0.3                # a shorter press is a tap: stops Lucy, or explains how to talk

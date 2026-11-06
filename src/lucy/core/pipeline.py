@@ -19,6 +19,11 @@ the cloud. When the cloud cannot be reached and a backup brain is configured
 already known to be down, or the moment a request fails to connect. Lucy says
 she is "thinking with her own goose brain" so the slower local answer is
 expected rather than a mystery.
+
+When a safety screen answers instead of the model, the conversation remembers
+the exchange as :data:`SCREENED` and the fixed line Lucy said, never the child's
+words. A follow-up such as "yes!" (to "Want a weird animal fact instead?") or
+"but I'm scared to tell" then reaches a model that knows what Lucy just said.
 """
 
 import asyncio
@@ -62,6 +67,9 @@ _AHEAD_S = 0.3
 """Keep at least this much audio queued behind the clip that is playing, so streamed parts
 and sentences join without gaps even when the network hiccups."""
 
+SCREENED = "(Lucy's safety screen stopped this part of the conversation.)"
+"""What the conversation remembers a child saying when a safety screen answered for Lucy."""
+
 
 @dataclass(frozen=True, slots=True)
 class TurnSettings:
@@ -77,7 +85,8 @@ class TurnSettings:
     at the cost of a seam in the first sentence."""
     max_chunk_words: int = 30
     log_transcripts: bool = False
-    """Privacy: children's words are kept out of the logs unless this is enabled."""
+    """Privacy: what a child said and what the model replied (which can echo it) are kept out
+    of the logs unless this is enabled."""
 
 
 def _always() -> bool:
@@ -101,7 +110,16 @@ class Brain:
 class _Turn:
     timer: TurnTimer
     brain: Brain
+    heard: str = ""
+    """What the child said, once the input screen has let it through to the model."""
+    reply: list[str] = field(default_factory=list)
+    """The model's reply as it streamed in."""
     spoken: list[str] = field(default_factory=list)
+
+    def received(self, delta: str) -> None:
+        """The next piece of the model's reply arrived."""
+        self.timer.mark("first_token")
+        self.reply.append(delta)
 
 
 class TurnPipeline:
@@ -139,6 +157,7 @@ class TurnPipeline:
             await self._respond(recording, turn)
         except asyncio.CancelledError:
             log.info("turn interrupted (%s brain): %s", turn.brain.name, timer.report())
+            self._remember(turn)  # what was said before the interruption, so "why?" works
             raise
         except Exception as error:
             if isinstance(error, LucyError):
@@ -154,22 +173,49 @@ class TurnPipeline:
             if isinstance(error, ContentRefused):
                 # Not even part of a refused sentence should be heard: cut it off, move on.
                 self._speaker.stop()
-                await self.say(Phrase.CHANGE_SUBJECT)
-            elif not turn.spoken:
+                self._log_reply(turn)
+                await self._redirect(phrase_for(error))
+                return
+            if not turn.spoken:
                 await self.say(phrase_for(error), status=Status.ERROR)
+            self._remember(turn)
         else:
             log.info("turn complete (%s brain): %s", turn.brain.name, timer.report())
+            self._remember(turn)
 
     async def say(self, phrase: Phrase, *, status: Status = Status.SPEAKING) -> None:
         """Speak one of Lucy's fixed lines. Never raises except for cancellation."""
+        await self._say(phrase, status)
+
+    async def _say(self, phrase: Phrase, status: Status = Status.SPEAKING) -> str | None:
+        """Speak one of Lucy's fixed lines, and return it (None if it could not be said)."""
         try:
-            audio = await self._phrases.render(phrase)
+            text, audio = await self._phrases.line(phrase)
             self._indicator.show(status)
             await self._speaker.enqueue(audio)
         except Exception:
             # Nothing left to say it with: the LED is the only way left to signal trouble.
             log.exception("could not speak phrase %s", phrase)
             self._indicator.show(Status.ERROR)
+            return None
+        return text
+
+    async def _redirect(self, phrase: Phrase) -> None:
+        """Say a safety line in place of an answer, and remember it, but not what led to it."""
+        said = await self._say(phrase)
+        if said:
+            self._conversation.record(SCREENED, said)
+
+    def _remember(self, turn: _Turn) -> None:
+        """Remember what was actually said, even if interrupted, so "why?" still works."""
+        self._conversation.record(turn.heard, " ".join(turn.spoken))
+        self._log_reply(turn)
+
+    def _log_reply(self, turn: _Turn) -> None:
+        if self._settings.log_transcripts and turn.reply:
+            # The model's own words, as far as they got, including any the reply screen
+            # stopped: not always what Lucy said out loud.
+            log.info("%s brain replied: %r", turn.brain.name, "".join(turn.reply))
 
     async def _respond(self, recording: Pcm, turn: _Turn) -> None:
         settings = self._settings
@@ -193,18 +239,11 @@ class TurnPipeline:
         assessment = await self._moderator.assess(text)
         if not assessment.allowed:
             log.info("screened: %s (%s)", assessment.concern.value, ", ".join(assessment.reasons))
-            await self.say(
-                Phrase.TELL_A_GROWN_UP
-                if assessment.concern is Concern.NEEDS_GROWN_UP
-                else Phrase.CHANGE_SUBJECT
-            )
+            await self._redirect(screened_phrase(assessment.concern))
             return
 
-        try:
-            await self._stream_reply(text, turn)
-        finally:
-            # Remember what was actually said, even when interrupted, so "why?" still works.
-            self._conversation.record(text, " ".join(turn.spoken))
+        turn.heard = text
+        await self._stream_reply(text, turn)
 
     async def _transcribe(self, speech: Pcm, turn: _Turn) -> str:
         try:
@@ -259,11 +298,19 @@ class TurnPipeline:
         """The words of one chunk of the reply as Lucy will say them ("" if there are none).
 
         Raises :class:`ContentRefused` if the reply screen stops them, which is handled like
-        the cloud voice refusing a sentence: Lucy stops and changes the subject.
+        the cloud voice refusing a sentence: Lucy stops and says one of her fixed lines.
         """
         words = to_speakable(text)
-        if words and self._reply_screen is not None and not self._reply_screen.allows(words):
-            raise ContentRefused("Lucy's reply screen stopped a sentence of the reply")
+        if words and self._reply_screen is not None:
+            # The chunk as the model wrote it: cleaning it for speech would hide "f***" or "sh!t".
+            assessment = self._reply_screen.screen(text)
+            if not assessment.allowed:
+                log.info(
+                    "reply screened: %s (%s)",
+                    assessment.concern.value,
+                    ", ".join(assessment.reasons),
+                )
+                raise ContentRefused("Lucy's reply screen stopped a sentence", assessment.concern)
         return words
 
     async def _stream_reply(self, text: str, turn: _Turn) -> None:
@@ -279,7 +326,7 @@ class TurnPipeline:
             )
             async with aclosing(self._reply(text, turn)) as deltas:
                 async for delta in deltas:
-                    turn.timer.mark("first_token")
+                    turn.received(delta)
                     for chunk in chunker.feed(delta):
                         texts.put_nowait(chunk)
             for chunk in chunker.flush():
@@ -343,6 +390,20 @@ def phrase_for(error: BaseException) -> Phrase:
         case AuthenticationError() | AudioDeviceError() | ConfigError():
             return Phrase.NEEDS_HELP
         case ContentRefused():
-            return Phrase.CHANGE_SUBJECT
+            return screened_phrase(error.concern)
         case _:
             return Phrase.TANGLED
+
+
+_SCREENED: dict[Concern, Phrase] = {
+    Concern.NEEDS_GROWN_UP: Phrase.TELL_A_GROWN_UP,
+    Concern.UNSAFE: Phrase.NOT_SAFE,
+    Concern.PRIVATE: Phrase.KEEP_PRIVATE,
+    Concern.UNKIND: Phrase.BE_KIND,
+    Concern.TRICK: Phrase.NICE_TRY,
+}
+
+
+def screened_phrase(concern: Concern) -> Phrase:
+    """What Lucy says instead of answering, for a message or reply a safety screen stopped."""
+    return _SCREENED.get(concern, Phrase.CHANGE_SUBJECT)

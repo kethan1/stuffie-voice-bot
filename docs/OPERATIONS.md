@@ -32,13 +32,14 @@ Usage is shown at <https://platform.speechify.ai/usage>.
 ```bash
 sudo apt-get install -y git
 git clone <this repository> lucy && cd lucy
-sudo deploy/install.sh --i2s-amp --tune      # paste the API keys when asked
+sudo deploy/install.sh --i2s-amp --motors --tune   # paste the API keys when asked
 sudo reboot
 ```
 
 | Option | Use it when |
 |---|---|
 | `--i2s-amp` | You wired the MAX98357A amplifier |
+| `--motors` | You wired the beak and body motors to a DRV8833 (HARDWARE.md, "Motors"). Adds the hardware PWM overlay, lets the `gpio` group use PWM, and turns on `[motors]` |
 | `--playback-card ID`, `--capture-card ID` | Auto-detection picked the wrong sound card (`aplay -l`, `arecord -l`) |
 | `--voice en_US-hfc_female-medium` | You want a different on-device (backup) Piper voice |
 | `--tune` | Always, for a finished toy: boot-time power savings, unused services off, journal in RAM |
@@ -68,6 +69,19 @@ sudo systemctl stop lucy && sudo lucy run --keyboard   # Enter to talk, Enter to
 sudo systemctl start lucy
 sudo lucy bench                    # latency breakdown, measured on this Pi
 ```
+
+With motors (`--motors`), check them before closing the plush. Each motor
+moves on its own first, then `lucy say` shows the beak following her voice and
+the body flapping on the honk:
+
+```bash
+sudo systemctl stop lucy
+sudo lucy motors                   # beak: wide x3, a little x3; body: forward, then back
+sudo lucy say "Honk! Did you know geese fly in a V to save energy?"
+sudo systemctl start lucy
+```
+
+Then tune `[motors.motion]` in `/etc/lucy/config.toml` (section 6).
 
 `lucy bench` prints each stage measured from the button release. If
 `first_audio` is high, compare `stt` and `first_token` (network or Groq) with
@@ -106,7 +120,9 @@ The journal shows `cloud brain unreachable; using the local brain` and
 Every turn logs one line such as
 `turn complete (cloud brain): stt=0.41s first_token=0.68s first_synth=0.93s first_audio=0.93s total=7.12s`.
 Offline turns say `(local brain)` and include `fallback=…`.
-Children's words are **not** logged unless `turn.log_transcripts = true`.
+Children's words and the model's replies are **not** logged unless
+`turn.log_transcripts = true`, which adds `child said: …` and `cloud brain replied: …`
+(or `local brain replied: …`) lines to each turn.
 
 ## 6. Tuning
 
@@ -117,7 +133,7 @@ All settings are in `/etc/lucy/config.toml` (documented inline).
 | A different voice | `sudo lucy voices`, then `tts.cloud.voice_id` |
 | Both voices equally loud | `tts.cloud.volume` (cloud) or `tts.volume` (on-device) |
 | Softer honks, or the word instead of the goose call | `tts.honk_volume = 0.6`; `tts.honks = false` |
-| Longer or shorter answers | A `system_prompt_file` with a different length rule (the built-in prompt asks for at most 25 words) |
+| Longer or shorter answers | A `system_prompt_file` with a different length rule (the built-in prompt asks for at most 40 words) |
 | Faster first word from the on-device voice | `turn.first_clause_min_words = 4` (the first sentence may be split at a comma, which sounds less natural); a `-low` Piper voice |
 | Longer battery life | Shorter `session.awake_s`; `power.standby_governor = "powersave"` |
 | Slower, clearer speech for little ones | `tts.length_scale = 1.15` (on-device voice); pick a calmer cloud voice with `lucy voices` |
@@ -126,6 +142,10 @@ All settings are in `/etc/lucy/config.toml` (documented inline).
 | More context for follow-ups | `llm.history_exchanges = 10` (slightly slower and costlier) |
 | Faster offline answers | `sudo ollama pull gemma3:270m`, then `local.model = "gemma3:270m"` (quicker but simpler answers); `local.params.max_tokens = 60` |
 | More accurate offline hearing | A `base.en` faster-whisper model in `local.stt_model` (about twice as slow as `tiny.en`) |
+| A beak that opens wider, or snaps less | `motors.motion.beak_max_power` (up or down). If small syllables don't move it, raise `beak_min_power` until `lucy motors` just moves it |
+| A beak that runs ahead of, or behind, her voice | `motors.motion.lead_s`: larger moves sooner (try 0.03–0.1) |
+| A calmer or livelier body | `motors.motion.body_power`; `bob_every_s` (0 = flap on honks only) |
+| A body motor that may only run forward | `motors.motion.body_two_way = false` |
 
 ## 7. Updating
 
@@ -162,6 +182,12 @@ installed and up to date without `--local-backup`.
 | Lucy stops mid-answer and changes the subject | Speechify's content screen refused a sentence | Working as intended. The journal shows `ContentRefused` |
 | Offline: "Can a grown-up check the Wi-Fi?" | The offline brain is not running | `systemctl status ollama`; `ollama list` should show `gemma3:1b`; `sudo lucy doctor` |
 | Journal: `local brain is not ready` | Ollama started after Lucy, or the model is missing | `sudo ollama pull gemma3:1b && sudo systemctl restart lucy` |
+| Journal: `Lucy will keep still: her motors are not working` | No PWM overlay (needs a reboot after `--motors`), a line in use, or no permission | `sudo lucy doctor` ("motors") says which; `ls /sys/class/pwm` should show `pwmchip0` |
+| `lucy motors`: "cannot claim GPIO … Device or resource busy" | The service holds the lines | `sudo systemctl stop lucy` first |
+| A motor turns the wrong way | Its two wires are swapped | Swap them at the driver's AOUT/BOUT terminals |
+| The beak barely moves, or only on loud words | Not enough power to beat its spring | Raise `motors.motion.beak_min_power`, or use a weaker spring |
+| Motors do nothing, but `lucy motors` gives no error | Motor battery off or flat, no shared ground, or SLP not reaching the Pi | Check the battery switch, the GND link between Pi and driver, and `motors.sleep_line` |
+| A motor stops for a moment in a long sentence | The `max_hold_s` safety rest | Working as intended: no motor runs more than 2 s without a pause |
 
 ## 9. Uninstall
 
@@ -174,6 +200,7 @@ sudo rm -rf /usr/local/bin/ollama /usr/local/lib/ollama /etc/systemd/system/olla
   /var/lib/private/ollama /var/lib/ollama
 sudo userdel lucy
 sudo mv /etc/asound.conf.lucy-backup /etc/asound.conf 2>/dev/null || sudo rm -f /etc/asound.conf
-sudo cp /boot/firmware/config.txt.lucy-backup /boot/firmware/config.txt   # if --tune/--i2s-amp was used
+sudo rm -f /etc/udev/rules.d/60-lucy-pwm.rules   # if --motors added it
+sudo cp /boot/firmware/config.txt.lucy-backup /boot/firmware/config.txt   # if --tune/--i2s-amp/--motors was used
 sudo systemctl daemon-reload && sudo reboot
 ```

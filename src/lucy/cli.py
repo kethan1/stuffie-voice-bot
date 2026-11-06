@@ -1,10 +1,10 @@
-"""Command-line entry point: ``lucy run | say | voices | bench | doctor``."""
+"""Command-line entry point: ``lucy run | say | voices | motors | bench | doctor``."""
 
 import argparse
 import asyncio
 import logging
 import sys
-from contextlib import aclosing
+from contextlib import AsyncExitStack, aclosing
 from pathlib import Path
 
 from lucy import __version__
@@ -34,6 +34,11 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     commands.add_parser("voices", help="list the cloud voices Lucy can speak with")
+
+    motors = commands.add_parser("motors", help="move the beak and body to check the wiring")
+    motors.add_argument(
+        "--off", action="store_true", help="only stop both motors (run after the service stops)"
+    )
 
     bench = commands.add_parser("bench", help="measure end-to-end latency without a microphone")
     bench.add_argument("--question", default="Why do geese fly in a V shape?")
@@ -65,6 +70,8 @@ def main(argv: list[str] | None = None) -> int:
                 return asyncio.run(_say(config, args.text, on_device=args.on_device))
             case "voices":
                 return asyncio.run(_voices(config))
+            case "motors":
+                return asyncio.run(_motors(config, off=args.off))
             case "bench":
                 from lucy.tools.bench import bench as run_bench
 
@@ -89,16 +96,21 @@ def main(argv: list[str] | None = None) -> int:
 async def _say(config: Config, text: str, *, on_device: bool) -> int:
     from lucy.adapters.sound import SoundDeviceSpeaker
     from lucy.config import device
+    from lucy.motors import start_motion
     from lucy.voices import build_voice, load_on_device_voice, with_honks
 
-    voice = build_voice(config, await asyncio.to_thread(load_on_device_voice, config))
-    tts = with_honks(config, voice.on_device) if on_device else voice.tts
-    speaker = SoundDeviceSpeaker(
-        sample_rate=tts.sample_rate,
-        device=device(config.audio.output_device),
-        latency_s=config.audio.output_latency_s,
-    )
-    try:
+    async with AsyncExitStack() as stack:
+        puppeteer = await start_motion(config, stack)  # her beak and body move as she speaks
+        voice = build_voice(config, await asyncio.to_thread(load_on_device_voice, config))
+        stack.push_async_callback(voice.aclose)
+        tts = with_honks(config, voice.on_device) if on_device else voice.tts
+        speaker = SoundDeviceSpeaker(
+            sample_rate=tts.sample_rate,
+            device=device(config.audio.output_device),
+            latency_s=config.audio.output_latency_s,
+            listener=puppeteer,
+        )
+        stack.push_async_callback(speaker.close)
         print(f"voice: {config.tts.voice.stem if on_device else voice.name}")
         played = None
         async with aclosing(tts.stream(text)) as parts:  # streamed, as Lucy speaks
@@ -106,10 +118,25 @@ async def _say(config: Config, text: str, *, on_device: bool) -> int:
                 played = speaker.enqueue(part)
         if played is not None:
             await played
-        await asyncio.sleep(config.audio.output_latency_s + 0.1)  # let the last block drain
+        await asyncio.sleep(config.audio.output_latency_s + 0.2)  # let the last block drain
+    return 0
+
+
+async def _motors(config: Config, *, off: bool) -> int:
+    from lucy.motors import exercise, open_motors
+
+    if not config.motors.enabled:
+        print("Lucy has no motors in this config ([motors] enabled = false)")
+        return 0
+    try:
+        driver = await asyncio.to_thread(open_motors, config)  # both motors still, driver asleep
+    except OSError as error:
+        raise ConfigError(f"cannot open the motors: {error}") from error
+    try:
+        if not off:
+            await exercise(driver, config)
     finally:
-        await speaker.close()
-        await voice.aclose()
+        driver.close()
     return 0
 
 

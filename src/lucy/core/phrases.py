@@ -30,7 +30,11 @@ class Phrase(StrEnum):
     TANGLED = "tangled"
     NEEDS_HELP = "needs_help"
     CHANGE_SUBJECT = "change_subject"
+    BE_KIND = "be_kind"
+    NICE_TRY = "nice_try"
     TELL_A_GROWN_UP = "tell_a_grown_up"
+    NOT_SAFE = "not_safe"
+    KEEP_PRIVATE = "keep_private"
 
 
 class PhraseBook:
@@ -50,9 +54,13 @@ class PhraseBook:
         self._cache: dict[str, asyncio.Future[Pcm]] = {}
 
     async def render(self, phrase: Phrase) -> Pcm:
+        return (await self.line(phrase))[1]
+
+    async def line(self, phrase: Phrase) -> tuple[str, Pcm]:
+        """One of the phrase's lines, picked at random, and its audio."""
         text = self._rng.choice(self._lines[phrase])
         # Shielded: if the turn is interrupted, the render still finishes and is cached.
-        return await asyncio.shield(self._render(text))
+        return text, await asyncio.shield(self._render(text))
 
     async def preload(self) -> None:
         """Render every line, one at a time so a real turn is never stuck behind a batch."""

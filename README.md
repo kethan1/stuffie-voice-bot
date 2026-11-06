@@ -1,8 +1,8 @@
 # Lucy the Goose 🪿
 
-Lucy is a talking plush goose for elementary-school kids, built on a Raspberry
+Lucy is a talking plush goose for 4th and 5th graders, built on a Raspberry
 Pi 4B. Squeeze her wing, ask a question, and let go. She answers out loud in
-one or two short, friendly sentences, usually starting within about a second.
+one to three short, witty sentences, usually starting within about a second.
 
 ```
  squeeze wing ─► record (16 kHz) ─► Groq Whisper ─► on-device safety screen
@@ -16,6 +16,11 @@ one or two short, friendly sentences, usually starting within about a second.
   credit card. Her on-device Piper voice takes over whenever the cloud voice
   can't speak, so she never goes silent. When she says "Honk!" you hear a goose
   call, not the word read aloud.
+* **Alive:** her beak opens and shuts in time with every syllable, and her body
+  flaps whenever she honks and bobs as she starts each phrase. Two small motors
+  on a DRV8833 driver follow the sound itself, as it reaches the speaker. She
+  keeps still while she listens, and if the motors aren't wired she simply
+  talks without them.
 * **Fast:** everything streams. Lucy starts speaking her first sentence while
   the rest is still being written, and plays its audio as it arrives. The
   HTTPS connections are warmed up while the child is still talking. Wi-Fi
@@ -27,8 +32,12 @@ one or two short, friendly sentences, usually starting within about a second.
   Raspberry Pi OS Lite.
 * **Kind and safe:** an on-device screen catches signs that a child is hurt or
   upset and answers with a fixed, caring script that points to a trusted
-  grown-up. A careful system prompt covers everything else. No recordings are
-  kept and no transcripts are logged.
+  grown-up. Dangerous dares, private details, grown-up topics, swear words
+  (however they're disguised), meanness, and attempts to trick her each get a
+  fixed reply in her own voice, and none of those words leave the Pi. A second
+  screen checks every sentence Lucy is about to say. A careful system prompt
+  covers everything else. No recordings are kept and no transcripts are
+  logged.
 * **Robust:** Lucy explains problems out loud ("Can a grown-up check the
   Wi-Fi?"). She falls back to a second model when rate-limited, is restarted
   by the systemd watchdog if wedged, and supports a read-only root filesystem
@@ -60,7 +69,8 @@ safety model, and failure handling) is in
 
    ```bash
    git clone <this repository> lucy && cd lucy
-   sudo deploy/install.sh --i2s-amp --tune     # paste the API keys when asked
+   sudo deploy/install.sh --i2s-amp --motors --tune   # paste the API keys when asked
+   # no motors wired yet: leave out --motors
    # optional offline brain (~2 GB):  add --local-backup
    sudo reboot
    ```
@@ -69,7 +79,7 @@ safety model, and failure handling) is in
 
    ```bash
    sudo lucy doctor --listen
-   sudo lucy say "Honk! Hello!"
+   sudo lucy say "Honk! Hello!"     # with motors: watch her beak and flap
    ```
 
 ### API keys
@@ -123,7 +133,7 @@ make bench        # latency breakdown, measured from this laptop
 
 These are shorthand for `uv run lucy --config dev.toml <command>`,
 which also takes any other option (`lucy --help`). Use `CONFIG=my.toml` to try a
-different config. With `dev.toml`, the log shows what Lucy heard on each turn.
+different config. With `dev.toml`, the log shows what Lucy heard and what the model replied on each turn.
 
 * **Other sound devices:** `uv run python -m sounddevice` lists them. Put a name
   in `audio.input_device` / `audio.output_device` in `dev.toml`.
@@ -139,12 +149,13 @@ different config. With `dev.toml`, the log shows what Lucy heard on each turn.
 ```
 src/lucy/
   core/          pure logic: controller (state machine), pipeline (streaming turn),
-                 chunker, text cleaning, safety screen, conversation, phrases, ports
-  adapters/      Groq/OpenAI-compatible HTTP, Speechify, Piper, PortAudio, libgpiod, power knobs
+                 chunker, text cleaning, safety screen, conversation, phrases, motion, ports
+  adapters/      Groq/OpenAI-compatible HTTP, Speechify, Piper, PortAudio, libgpiod,
+                 motors (DRV8833 on hardware PWM), power knobs
   platform/      systemd notify/watchdog, journald-aware logging
   tools/         `lucy doctor`, `lucy bench`
   persona.py     Lucy's personality spec, system prompt, and fixed lines
-  app.py         composition root (brains.py and voices.py assemble the cloud and local parts)
+  app.py         composition root (brains.py, voices.py, and motors.py assemble the parts)
   config.py      strict TOML configuration
 deploy/          installer, systemd unit, ALSA routing, boot tuning
 dev.toml         laptop settings for development (`make run`)

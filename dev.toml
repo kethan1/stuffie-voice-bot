@@ -25,7 +25,7 @@ manage_cpu_governor = false    # leave the laptop's own power management alone
 manage_wifi = false
 
 [turn]
-log_transcripts = true         # show what Lucy heard (your own voice, in your own terminal)
+log_transcripts = true         # show what Lucy heard and what the model replied (in your own terminal)
 
 [local]
 # The offline brain, as on the Pi. To try it: `make stt-model`, install Ollama
