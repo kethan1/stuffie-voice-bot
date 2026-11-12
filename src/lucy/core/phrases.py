@@ -35,6 +35,7 @@ class Phrase(StrEnum):
     TELL_A_GROWN_UP = "tell_a_grown_up"
     NOT_SAFE = "not_safe"
     KEEP_PRIVATE = "keep_private"
+    SETUP = "setup"
 
 
 class PhraseBook:

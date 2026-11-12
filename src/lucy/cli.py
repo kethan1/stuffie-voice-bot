@@ -1,4 +1,4 @@
-"""Command-line entry point: ``lucy run | say | voices | motors | bench | doctor``."""
+"""Command-line entry point: ``lucy run | say | voices | motors | bench | doctor | setup``."""
 
 import argparse
 import asyncio
@@ -15,7 +15,7 @@ from lucy.platform.logs import configure_logging
 log = logging.getLogger("lucy")
 
 
-def main(argv: list[str] | None = None) -> int:
+def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="lucy", description="Lucy the Goose voice companion")
     parser.add_argument("--version", action="version", version=f"lucy {__version__}")
     parser.add_argument(
@@ -50,7 +50,28 @@ def main(argv: list[str] | None = None) -> int:
     doctor = commands.add_parser("doctor", help="check hardware, voice, network, and permissions")
     doctor.add_argument("--listen", action="store_true", help="also record 3 s to check mic level")
 
-    args = parser.parse_args(argv)
+    setup = commands.add_parser(
+        "setup", help="setup mode: Lucy's own Wi-Fi and settings page (what lucy-setup runs)"
+    )
+    setup.add_argument(
+        "--if-offline",
+        action="store_true",
+        help="start setup mode only if no network connects soon (at boot)",
+    )
+    setup.add_argument(
+        "--demo",
+        action="store_true",
+        help="try the settings page on this computer with pretend Wi-Fi (http://127.0.0.1:8080)",
+    )
+    card = commands.add_parser(
+        "setup-card", help="print the card for Lucy's setup Wi-Fi, making it first if needed"
+    )
+    card.add_argument("--output", type=Path, help="also save a printable copy (HTML) here")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
     config_path = args.config or default_config_path()
     try:
         config = load_config(config_path)
@@ -82,6 +103,12 @@ def main(argv: list[str] | None = None) -> int:
                 from lucy.tools.doctor import doctor as run_doctor
 
                 return asyncio.run(run_doctor(config, config_path, listen=args.listen))
+            case "setup":
+                return asyncio.run(_setup(config, config_path, args.if_offline, args.demo))
+            case "setup-card":
+                from lucy.setup.mode import print_card
+
+                return print_card(config, args.output)
     except ConfigError as error:
         log.error("%s", error)
         return 78
@@ -122,6 +149,17 @@ async def _say(config: Config, text: str, *, on_device: bool) -> int:
     return 0
 
 
+async def _setup(config: Config, config_path: Path | None, if_offline: bool, demo: bool) -> int:
+    from lucy.setup.mode import run_setup, start_if_offline
+    from lucy.setup.network import NetworkManager
+
+    if if_offline:
+        return await start_if_offline(config, NetworkManager(config.setup.interface))
+    if config_path is None:
+        raise ConfigError("setup mode needs a config file to save to (--config)")
+    return await run_setup(config, config_path, demo=demo)
+
+
 async def _motors(config: Config, *, off: bool) -> int:
     from lucy.motors import exercise, open_motors
 
@@ -134,7 +172,7 @@ async def _motors(config: Config, *, off: bool) -> int:
         raise ConfigError(f"cannot open the motors: {error}") from error
     try:
         if not off:
-            await exercise(driver, config)
+            await exercise(driver, config.motors.motion)
     finally:
         driver.close()
     return 0

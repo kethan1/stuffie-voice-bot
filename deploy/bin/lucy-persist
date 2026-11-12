@@ -1,0 +1,20 @@
+#!/bin/sh
+# Keep setup mode's changes across a power-off when the root filesystem is read-only
+# (deploy/install.sh --read-only, which uses raspi-config's overlay). Then everything written
+# goes to RAM, so this copies Lucy's settings and the saved Wi-Fi networks through to the SD
+# card, the way overlayroot-chroot does. Run as root by lucy-setup.service when setup ends.
+# On a normal, writable root it does nothing: the files are already on the card.
+set -eu
+
+LOWER=/media/root-ro   # where the overlay keeps the SD card's own (read-only) root
+mountpoint -q "$LOWER" || exit 0
+
+mount -o remount,rw "$LOWER"
+trap 'sync; mount -o remount,ro "$LOWER"' EXIT
+for dir in /etc/lucy /etc/NetworkManager/system-connections; do
+  if [ -d "$dir" ]; then
+    mkdir -p "$LOWER$dir"
+    rsync -a --delete "$dir/" "$LOWER$dir/"
+  fi
+done
+echo "lucy-persist: saved Lucy's settings and Wi-Fi networks to the SD card"

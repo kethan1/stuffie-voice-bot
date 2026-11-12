@@ -194,6 +194,26 @@ class PowerSettings:
 
 
 @dataclass(frozen=True, slots=True)
+class SetupSettings:
+    """Setup mode: Lucy's own Wi-Fi and a settings page for a grown-up's phone (lucy.setup)."""
+
+    enabled: bool = True
+    hold_to_start_s: float = 3.0
+    """Holding her wing while she wakes up, this long after she is ready, starts setup mode.
+    0 turns the gesture off."""
+    when_offline: bool = True
+    """Start setup mode by herself when no network has connected ``offline_wait_s`` after boot."""
+    offline_wait_s: float = 90.0
+    idle_timeout_s: float = 600.0
+    """Leave setup mode after this long with nothing happening on the page."""
+    interface: str = "wlan0"
+    hotspot_file: Path = Path("/etc/lucy/setup-hotspot.toml")
+    """Her setup Wi-Fi's name and password (root-only), made by ``lucy setup-card``."""
+    credentials_dir: Path = Path("/etc/lucy/credentials")
+    """Where the settings page stores API keys (the files lucy.service loads as credentials)."""
+
+
+@dataclass(frozen=True, slots=True)
 class Config:
     log_level: str = "info"
     system_prompt_file: Path | None = None
@@ -211,6 +231,7 @@ class Config:
     power: PowerSettings = field(default_factory=PowerSettings)
     turn: TurnSettings = field(default_factory=TurnSettings)
     session: SessionSettings = field(default_factory=SessionSettings)
+    setup: SetupSettings = field(default_factory=SetupSettings)
 
 
 def load_config(path: Path | None) -> Config:
@@ -218,9 +239,19 @@ def load_config(path: Path | None) -> Config:
     if path is None:
         return Config()
     try:
-        data = tomllib.loads(path.read_text(encoding="utf-8"))
+        text = path.read_text(encoding="utf-8")
     except FileNotFoundError as error:
         raise ConfigError(f"config file not found: {path}") from error
+    return parse_config(text, path)
+
+
+def parse_config(text: str, path: Path) -> Config:
+    """Check ``text`` as the contents of the config file at ``path``, without reading it.
+
+    Relative paths in it are relative to ``path``'s directory, as in :func:`load_config`.
+    """
+    try:
+        data = tomllib.loads(text)
     except tomllib.TOMLDecodeError as error:
         raise ConfigError(f"{path} is not valid TOML: {error}") from error
     config = _build(Config, data, "", path.parent)
@@ -335,8 +366,18 @@ def _validate(config: Config) -> None:
         problems.append("session.awake_s and session.forget_after_s must be positive")
     if config.motors.enabled:
         problems += _motor_problems(config)
+    problems += _setup_problems(config.setup)
     if problems:
         raise ConfigError("invalid configuration: " + "; ".join(problems))
+
+
+def _setup_problems(setup: SetupSettings) -> list[str]:
+    problems = []
+    if setup.hold_to_start_s < 0 or setup.offline_wait_s <= 0:
+        problems.append("setup.hold_to_start_s must be >= 0 and setup.offline_wait_s positive")
+    if setup.idle_timeout_s < 60:
+        problems.append("setup.idle_timeout_s must be at least 60 (seconds)")
+    return problems
 
 
 def _motor_problems(config: Config) -> list[str]:

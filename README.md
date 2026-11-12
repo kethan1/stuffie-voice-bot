@@ -42,6 +42,12 @@ one to three short, witty sentences, usually starting within about a second.
   Wi-Fi?"). She falls back to a second model when rate-limited, is restarted
   by the systemd watchdog if wedged, and supports a read-only root filesystem
   for power yanks.
+* **Set up from a phone:** no SSH, keyboard, or monitor after the first install.
+  Hold her wing while she wakes up (or take her somewhere with no Wi-Fi she
+  knows) and she turns on her own Wi-Fi. Scanning the card sewn inside her
+  zipper opens her settings page on a phone, where a grown-up picks a network,
+  changes her settings and API keys, and tries her voice and motors. She says
+  out loud whether a network worked, and puts everything back if it did not.
 * **Works offline (optional):** with `--local-backup`, Lucy keeps answering
   when GroqCloud is unreachable. She uses faster-whisper and Gemma 3 1B
   (Ollama) on the Pi itself, says she is "thinking with her own goose brain",
@@ -75,6 +81,11 @@ safety model, and failure handling) is in
    sudo reboot
    ```
 
+   The installer ends by printing **Lucy's setup card**: a QR code for her
+   setup Wi-Fi. Print it from her settings page and keep it inside her zipper.
+   From then on, Wi-Fi and settings changes need only a phone
+   ([Setup mode](docs/OPERATIONS.md#5-setup-mode-a-phone-instead-of-ssh)).
+
 4. Check everything, then talk to her:
 
    ```bash
@@ -86,7 +97,7 @@ safety model, and failure handling) is in
 
 The keys are stored in `/etc/lucy/credentials/groq_api_key` and
 `/etc/lucy/credentials/speechify_api_key` (root-only) and reach the service only
-as systemd credentials. They never go in the config file or the repository. On
+as systemd credentials. They can also be pasted into her settings page in setup mode. They never go in the config file or the repository. On
 a laptop, put them in `.env` instead (see below).
 
 The Speechify key is optional. Without it, or once the month's free characters
@@ -129,6 +140,7 @@ make say          # Lucy says hello through the speakers (TEXT="..." to change i
 make voices       # the cloud voices she can speak with, with samples
 make run          # talk to her: Enter to start, Enter again to stop; Ctrl-C quits
 make bench        # latency breakdown, measured from this laptop
+make setup        # setup mode's settings page with pretend Wi-Fi: http://127.0.0.1:8080
 ```
 
 These are shorthand for `uv run lucy --config dev.toml <command>`,
@@ -154,10 +166,11 @@ src/lucy/
                  motors (DRV8833 on hardware PWM), power knobs
   platform/      systemd notify/watchdog, journald-aware logging
   tools/         `lucy doctor`, `lucy bench`
+  setup/         setup mode: her own Wi-Fi hotspot, the settings page, NetworkManager
   persona.py     Lucy's personality spec, system prompt, and fixed lines
   app.py         composition root (brains.py, voices.py, and motors.py assemble the parts)
   config.py      strict TOML configuration
-deploy/          installer, systemd unit, ALSA routing, boot tuning
+deploy/          installer, systemd units, ALSA routing, boot tuning, setup mode's DNS
 dev.toml         laptop settings for development (`make run`)
 uv.lock          hash-locked dependencies for every platform, including the Pi
 tests/           fast tests with fakes for every port (no hardware, no network)

@@ -4,7 +4,7 @@ VOICE_URL := https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/l
 STT_MODEL := models/faster-whisper-tiny.en
 STT_MODEL_URL := https://huggingface.co/Systran/faster-whisper-tiny.en/resolve/0d3d19a32d3338f10357c0889762bd8d64bbdeba
 
-.PHONY: dev check lint typecheck test integration voice stt-model lock clean run doctor say voices bench
+.PHONY: dev check lint typecheck test integration voice stt-model lock clean run doctor say voices bench setup
 
 dev:
 	uv sync --extra pi --extra local
@@ -60,6 +60,13 @@ voices:
 
 bench: voice
 	$(LUCY) bench
+
+# Setup mode's settings page with pretend Wi-Fi, at http://127.0.0.1:8080 (Lucy speaks through
+# the laptop). It saves to setup-dev.toml, a copy of dev.toml, and API keys to
+# .lucy-setup-demo/; both are gitignored. A password of "wrong-password" pretends to fail.
+setup: voice
+	[ -e setup-dev.toml ] || cp dev.toml setup-dev.toml
+	uv run lucy --config setup-dev.toml setup --demo
 
 # Re-resolve every dependency to its newest release that is at least two weeks old
 # (exclude-newer in pyproject.toml). uv.lock is universal: it also pins the Pi's aarch64 wheels.

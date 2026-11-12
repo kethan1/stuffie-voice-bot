@@ -1,0 +1,11 @@
+[Unit]
+Description=Start Lucy's setup mode when she asks for it (her wing held while she wakes up)
+Documentation=file:///opt/lucy/src/docs/OPERATIONS.md
+
+[Path]
+# Lucy (lucy.service, RuntimeDirectory=lucy) writes this file. It goes away when she stops.
+PathExists=/run/lucy/setup-request
+Unit=lucy-setup.service
+
+[Install]
+WantedBy=multi-user.target

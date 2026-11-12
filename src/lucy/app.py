@@ -7,8 +7,12 @@ port. Everything below it receives its collaborators through its constructor.
 import asyncio
 import contextlib
 import logging
+import os
 import signal
+from collections.abc import Mapping
 from contextlib import AsyncExitStack
+from pathlib import Path
+from typing import Protocol, runtime_checkable
 
 from lucy import __version__
 from lucy.adapters.console import KeyboardButton, LogIndicator
@@ -185,6 +189,8 @@ async def run(config: Config, *, keyboard: bool = False) -> int:
             voice.name,
             "moving" if puppeteer is not None else "keeping still",
         )
+        if await _hand_over_to_setup(config, button, pipeline, stop, notifier):
+            return 0
         serving = asyncio.create_task(controller.run(button), name="controller")
         stopping = asyncio.create_task(stop.wait(), name="stop")
         await asyncio.wait({serving, stopping}, return_when=asyncio.FIRST_COMPLETED)
@@ -199,6 +205,64 @@ async def run(config: Config, *, keyboard: bool = False) -> int:
         notifier.stopping()
         log.info("Lucy is going to sleep")
     return exit_code
+
+
+@runtime_checkable
+class HoldableButton(Protocol):
+    """A button that can tell whether it is being held right now (the wing button on GPIO)."""
+
+    async def held(self, seconds: float) -> bool: ...
+
+
+SETUP_REQUEST = "setup-request"
+"""Written into Lucy's runtime directory (/run/lucy) to ask for setup mode: lucy-setup.path
+starts lucy-setup.service, which stops Lucy while it runs and wakes her afterwards."""
+SETUP_HANDOVER_S = 30.0
+
+
+def request_setup(environ: Mapping[str, str] = os.environ) -> bool:
+    """Ask systemd for setup mode. False if Lucy is not running as lucy.service."""
+    runtime = environ.get("RUNTIME_DIRECTORY")  # set by RuntimeDirectory= in lucy.service
+    if not runtime:
+        log.warning("setup mode can only start when Lucy runs as lucy.service")
+        return False
+    try:
+        (Path(runtime.split(":")[0]) / SETUP_REQUEST).touch()
+    except OSError as error:
+        log.warning("could not ask for setup mode: %s", error)
+        return False
+    return True
+
+
+async def _hand_over_to_setup(
+    config: Config,
+    button: Button,
+    pipeline: TurnPipeline,
+    stop: asyncio.Event,
+    notifier: SystemdNotifier,
+) -> bool:
+    """If her wing is held while she wakes up, hand over to setup mode. True once stopped."""
+    hold_s = config.setup.hold_to_start_s
+    if not config.setup.enabled or hold_s <= 0 or not isinstance(button, HoldableButton):
+        return False
+    try:
+        if not await button.held(hold_s):
+            return False
+    except ConfigError as error:  # the button line is busy: Lucy reports it when she listens
+        log.warning("could not check the wing for the setup gesture: %s", error)
+        return False
+    log.info("wing held while waking up: asking for setup mode")
+    with contextlib.suppress(LucyError):
+        await pipeline.say(Phrase.SETUP)
+    if request_setup():
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(stop.wait(), SETUP_HANDOVER_S)  # systemd stops Lucy
+    if stop.is_set():
+        notifier.stopping()
+        log.info("Lucy is resting while setup mode runs")
+        return True
+    log.warning("setup mode did not start; carrying on as usual")
+    return False
 
 
 async def _warm_up(

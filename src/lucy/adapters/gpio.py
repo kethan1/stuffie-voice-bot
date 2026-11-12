@@ -30,7 +30,7 @@ class GpioButton:
         self._active_low = active_low
         self._debounce = timedelta(milliseconds=debounce_ms)
 
-    async def events(self) -> AsyncIterator[ButtonEvent]:
+    def _request(self) -> Any:
         import gpiod
         from gpiod.line import Bias, Direction, Edge
 
@@ -43,7 +43,7 @@ class GpioButton:
             debounce_period=self._debounce,
         )
         try:
-            request = gpiod.request_lines(
+            return gpiod.request_lines(
                 self._chip, consumer="lucy-button", config={self._line: settings}
             )
         except OSError as error:
@@ -51,6 +51,41 @@ class GpioButton:
                 f"cannot claim button GPIO {self._line} on {self._chip}: {error}"
             ) from error
 
+    async def held(self, seconds: float) -> bool:
+        """True if the button is pressed now and stays pressed for ``seconds`` more.
+
+        The wake-up gesture for setup mode: a grown-up holds Lucy's wing while she starts.
+        """
+        import gpiod
+
+        request = self._request()
+        loop = asyncio.get_running_loop()
+        released = asyncio.Event()
+
+        def on_readable() -> None:
+            for event in request.read_edge_events():
+                if event.event_type is event.Type.FALLING_EDGE:
+                    released.set()
+
+        try:
+            if request.get_value(self._line) != gpiod.line.Value.ACTIVE:
+                return False
+            loop.add_reader(request.fd, on_readable)
+            try:
+                async with asyncio.timeout(seconds):
+                    await released.wait()
+            except TimeoutError:
+                return True
+            finally:
+                loop.remove_reader(request.fd)
+            return False
+        finally:
+            request.release()
+
+    async def events(self) -> AsyncIterator[ButtonEvent]:
+        import gpiod
+
+        request = self._request()
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue[ButtonEvent] = asyncio.Queue()
         # Logical value (active_low already applied): True means pressed.

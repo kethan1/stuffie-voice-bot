@@ -46,6 +46,9 @@ sudo reboot
 | `--local-backup` | You want Lucy to keep answering when GroqCloud is unreachable (no Wi-Fi, school firewall, outage). Installs Ollama with Gemma 3 1B and an on-device speech model: about 2 GB of SD card space and a ~2.5 GB one-time download. Answers offline take several seconds. |
 | `--read-only` | Last step, once everything works: protects the SD card from sudden power loss |
 
+Wherever NetworkManager runs (Raspberry Pi OS Bookworm and later), the installer
+also sets up setup mode (section 5), and ends by printing Lucy's setup card.
+
 To set or replace an API key later:
 
 ```bash
@@ -81,7 +84,8 @@ sudo lucy say "Honk! Did you know geese fly in a V to save energy?"
 sudo systemctl start lucy
 ```
 
-Then tune `[motors.motion]` in `/etc/lucy/config.toml` (section 6).
+Then tune `[motors.motion]` in `/etc/lucy/config.toml` (section 7), or from a phone in
+setup mode (section 5), which can try the numbers before saving them.
 
 `lucy bench` prints each stage measured from the button release. If
 `first_audio` is high, compare `stt` and `first_token` (network or Groq) with
@@ -108,13 +112,94 @@ sudo systemctl restart lucy
 The journal shows `cloud brain unreachable; using the local brain` and
 `turn complete (local brain): …`.
 
-## 5. Day-to-day
+## 5. Setup mode: a phone instead of SSH
+
+Once Lucy is installed, a grown-up can change her Wi-Fi and her settings from a
+phone. Nobody needs SSH, a keyboard, or a monitor.
+
+**Lucy's setup card.** The installer ends by printing a QR code for her own
+setup Wi-Fi, with its name (`Lucy-Setup-` and four digits) and password. Print
+the card from her settings page ("Her setup card"), or run
+`sudo lucy setup-card` to see it again. Keep it inside her zipper, where only
+grown-ups go: whoever has it can change her settings.
+
+**Starting setup mode**, any of:
+
+* Hold her wing while she wakes up: plug her in and keep squeezing until she
+  says "Setup time!"
+* Take her somewhere with no Wi-Fi she knows. About 90 seconds after she
+  wakes up, she starts setup mode by herself.
+* Over SSH: `sudo lucy setup`.
+
+**Using it:**
+
+1. Lucy says that her setup Wi-Fi is on, and its name.
+2. Scan the card's QR code with the phone's camera to join it (or join
+   `Lucy-Setup-…` by hand with the password on the card).
+3. Her settings page opens by itself, as on hotel Wi-Fi. If it doesn't, open
+   <http://10.42.0.1> in the browser. Keep the page open while you work; if
+   the phone asks, choose to stay connected or use the network without internet.
+4. On the page:
+   * **Wi-Fi:** pick a network, then type its password (and a username, for
+     school networks that ask for one). When you tap **Join**, the phone loses
+     Lucy's Wi-Fi. Listen to her. If it worked, she says so, and setup is
+     over. If not, she says why (a wrong password, a network she can't find
+     from there, a network with no way to the internet), forgets it, and
+     turns her setup Wi-Fi back on within a minute: join it again to retry.
+     The networks she already knew are never touched by a failed attempt.
+   * **Lucy** and **Motors:** her voice and loudness, honks, how long she
+     stays quick to answer, the questions-per-hour limit, and the beak and
+     body powers. **Hear her** and **Test motors** try the numbers on the
+     page before you save them.
+   * **API keys:** paste a new Groq or Speechify key. The page never shows a
+     saved key, only its last four characters.
+   * **Advanced:** the whole `config.toml`, with its notes. Lucy refuses
+     anything she couldn't start with, and **Undo** puts back the file as it
+     was before the last change.
+5. Tap **Finish setup**, hold her wing for two seconds, or just leave her: after
+   10 minutes with nothing happening she finishes by herself. She wakes up
+   with her new settings.
+
+| What changes | Where it is kept |
+|---|---|
+| Wi-Fi networks | NetworkManager: `/etc/NetworkManager/system-connections/` |
+| Settings | `/etc/lucy/config.toml` (the version before the last change: `config.toml.previous`) |
+| API keys | `/etc/lucy/credentials/` |
+
+With a read-only root (`--read-only`), these changes would otherwise be lost at
+power-off, so setup mode copies them to the SD card when it ends
+(`/usr/local/sbin/lucy-persist`).
+
+**School networks.** Lucy can log in to networks that ask for a username and
+password (WPA2-Enterprise with PEAP, the usual kind); she does not check the
+network's certificate. If the school only lets in approved devices, the page
+shows her Wi-Fi (MAC) address to give to its IT team: she always uses the Pi's
+own address, never a random one. A network that needs a sign-in web page (many
+guest networks) cannot work: she joins it but cannot reach the internet, and
+says so.
+
+**Settings** (`[setup]` in `/etc/lucy/config.toml`):
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `enabled` | `true` | Setup mode at all |
+| `hold_to_start_s` | `3.0` | How long the wing must stay held once she is awake; `0` turns the gesture off |
+| `when_offline` | `true` | Start by herself when no network connects after boot. Turn it off if she runs offline on purpose (`--local-backup` with no Wi-Fi) |
+| `offline_wait_s` | `90.0` | How long after boot she waits for a network |
+| `idle_timeout_s` | `600.0` | How long setup mode waits with nothing happening |
+
+On a laptop, `make setup` serves the same page at <http://127.0.0.1:8080> with
+pretend Wi-Fi: it saves to `setup-dev.toml`, a copy of `dev.toml`, and a
+password of `wrong-password` pretends to fail.
+
+## 6. Day-to-day
 
 | Task | Command |
 |---|---|
 | Live logs | `journalctl -u lucy -f` (and `journalctl -u ollama -f` for the offline brain) |
 | Status | `systemctl status lucy` |
 | Restart after a config change | `sudo systemctl restart lucy` |
+| Setup mode | `sudo lucy setup`; its log: `journalctl -u lucy-setup -f` |
 | Temperature / throttling | `vcgencmd measure_temp; vcgencmd get_throttled` |
 
 Every turn logs one line such as
@@ -124,7 +209,7 @@ Children's words and the model's replies are **not** logged unless
 `turn.log_transcripts = true`, which adds `child said: …` and `cloud brain replied: …`
 (or `local brain replied: …`) lines to each turn.
 
-## 6. Tuning
+## 7. Tuning
 
 All settings are in `/etc/lucy/config.toml` (documented inline).
 
@@ -147,7 +232,7 @@ All settings are in `/etc/lucy/config.toml` (documented inline).
 | A calmer or livelier body | `motors.motion.body_power`; `bob_every_s` (0 = flap on honks only) |
 | A body motor that may only run forward | `motors.motion.body_two_way = false` |
 
-## 7. Updating
+## 8. Updating
 
 ```bash
 sudo raspi-config nonint disable_overlayfs && sudo reboot   # only if --read-only was used
@@ -164,7 +249,7 @@ speaks in whole sentences, which sounds more natural.
 If your config enables the offline brain, re-running the installer keeps it
 installed and up to date without `--local-backup`.
 
-## 8. Troubleshooting
+## 9. Troubleshooting
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
@@ -188,13 +273,22 @@ installed and up to date without `--local-backup`.
 | The beak barely moves, or only on loud words | Not enough power to beat its spring | Raise `motors.motion.beak_min_power`, or use a weaker spring |
 | Motors do nothing, but `lucy motors` gives no error | Motor battery off or flat, no shared ground, or SLP not reaching the Pi | Check the battery switch, the GND link between Pi and driver, and `motors.sleep_line` |
 | A motor stops for a moment in a long sentence | The `max_hold_s` safety rest | Working as intended: no motor runs more than 2 s without a pause |
+| "Setup time!", then "I couldn't turn on my setup Wi-Fi" | NetworkManager could not start the hotspot. Most often the Wi-Fi country is not set | `journalctl -u lucy-setup -e`; set the country with `sudo raspi-config nonint do_wifi_country GB` (your country's code) |
+| The phone joined her setup Wi-Fi, but no page opened | The phone skipped its sign-in check | Open <http://10.42.0.1> in the browser |
+| Holding her wing at wake-up does nothing | Setup mode is not installed (no NetworkManager), or `setup.hold_to_start_s = 0` | `systemctl status lucy-setup.path`; re-run the installer |
+| She starts setup mode at every boot | No Wi-Fi she knows is in range | Add one in setup mode, or set `setup.when_offline = false` |
+| Changes from setup mode are gone after unplugging her | With `--read-only`, copying them to the SD card failed | `journalctl -u lucy-setup -g lucy-persist` |
 
-## 9. Uninstall
+## 10. Uninstall
 
 ```bash
 sudo systemctl disable --now lucy ollama
+sudo systemctl disable --now lucy-setup.path lucy-setup-offline.service
+sudo nmcli connection delete "Lucy setup hotspot"
 sudo rm -rf /opt/lucy /etc/lucy /var/cache/lucy /usr/local/bin/lucy /etc/systemd/system/lucy.service \
-  /etc/systemd/journald.conf.d/lucy.conf
+  /etc/systemd/journald.conf.d/lucy.conf /etc/systemd/system/lucy-setup.service \
+  /etc/systemd/system/lucy-setup.path /etc/systemd/system/lucy-setup-offline.service \
+  /etc/NetworkManager/dnsmasq-shared.d/lucy-setup.conf /usr/local/sbin/lucy-persist
 # Only if --local-backup was used: Ollama, its libraries, and its models
 sudo rm -rf /usr/local/bin/ollama /usr/local/lib/ollama /etc/systemd/system/ollama.service \
   /var/lib/private/ollama /var/lib/ollama

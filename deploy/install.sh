@@ -15,6 +15,9 @@
 #   --read-only            make the root filesystem read-only (overlayfs); do this last
 #   --no-start             install everything but do not (re)start the service
 #
+# Setup mode (her own Wi-Fi and a settings page for a grown-up's phone) is always installed
+# when NetworkManager runs, and the card for it is printed at the end.
+#
 # Safe to re-run: every step checks what is already there. Existing config files are
 # never overwritten; an updated template is written next to them as *.new instead.
 set -euo pipefail
@@ -67,7 +70,7 @@ while [[ $# -gt 0 ]]; do
     --local-backup) LOCAL_BACKUP=1 ;;
     --read-only) READ_ONLY=1 ;;
     --no-start) START=0 ;;
-    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,23p' "$0"; exit 0 ;;
     *) die "unknown option: $1 (see --help)" ;;
   esac
   shift
@@ -183,7 +186,7 @@ log "installing system packages"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq --no-install-recommends \
-  python3 libportaudio2 alsa-utils iw ca-certificates curl rsync zstd >/dev/null
+  python3 libportaudio2 alsa-utils iw ca-certificates curl rsync zstd dnsmasq-base >/dev/null
 
 log "creating the '$SERVICE_USER' service account"
 getent group gpio >/dev/null || groupadd --system gpio
@@ -329,10 +332,30 @@ if [[ $TUNE -eq 1 ]]; then
   systemctl restart systemd-journald
 fi
 
+# Setup mode: NetworkManager runs the hotspot and answers its DNS (pointing every name at the
+# settings page); lucy-persist keeps its changes when the root filesystem is read-only.
+SETUP=0
+if systemctl is-active --quiet NetworkManager.service; then
+  log "installing setup mode (Lucy's own Wi-Fi and settings page)"
+  install -D -m 0644 "$REPO_DIR/deploy/networkmanager/lucy-setup.conf" \
+    /etc/NetworkManager/dnsmasq-shared.d/lucy-setup.conf
+  install -m 0755 "$REPO_DIR/deploy/bin/lucy-persist" /usr/local/sbin/lucy-persist
+  for unit in lucy-setup.service lucy-setup.path lucy-setup-offline.service; do
+    install -m 0644 "$REPO_DIR/deploy/systemd/$unit" "/etc/systemd/system/$unit"
+  done
+  SETUP=1
+else
+  warn "NetworkManager is not running, so setup mode is not installed (it needs Raspberry Pi OS Bookworm or later)"
+fi
+
 log "installing the systemd service"
 install -m 0644 "$REPO_DIR/deploy/systemd/lucy.service" /etc/systemd/system/lucy.service
 systemctl daemon-reload
 systemctl enable lucy.service >/dev/null
+if [[ $SETUP -eq 1 ]]; then
+  systemctl enable lucy-setup.path lucy-setup-offline.service >/dev/null
+  systemctl start lucy-setup.path
+fi
 if [[ $START -eq 1 ]]; then
   systemctl restart lucy.service || warn "lucy did not start; see: journalctl -u lucy -e"
 fi
@@ -344,6 +367,13 @@ if [[ $READ_ONLY -eq 1 ]]; then
   raspi-config nonint enable_bootro || true
   warn "from the next boot, changes to the SD card are discarded at power-off."
   warn "to update later: sudo raspi-config nonint disable_overlayfs && sudo reboot"
+fi
+
+if [[ $SETUP -eq 1 ]]; then
+  log "Lucy's setup card: scan it to reach her settings page in setup mode (keep it secret)"
+  "$PREFIX/venv/bin/lucy" --config "$ETC/config.toml" setup-card --output "$ETC/setup-card.html" ||
+    warn "could not make the setup card; try: sudo lucy setup-card"
+  echo "   Print it from her settings page (\"Her setup card\") and keep it inside her zipper."
 fi
 
 log "done. Next steps:"

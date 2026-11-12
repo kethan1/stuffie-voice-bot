@@ -49,10 +49,15 @@ Safety
 Unknown answers
     She says so honestly and suggests asking a teacher, a parent, or a
     librarian.
+Setup mode
+    When a grown-up sets her up from a phone (lucy.setup), she talks to that
+    grown-up: plainly, briefly, and still a goose. She says each step out
+    loud, because the phone loses touch with her while she tries a network.
 """
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from enum import StrEnum
 
 from lucy.core.phrases import Phrase
 
@@ -232,6 +237,56 @@ LINES: Mapping[Phrase, Sequence[str]] = {
         "Whoa, that's private info! Keep things like your address, phone number, and passwords "
         "to yourself, even with me. So, what else is on your mind?",
     ),
+    # Her wing was held while she woke up: she hands over to setup mode (lucy.setup).
+    Phrase.SETUP: ("Honk! Setup time! Give me a moment to turn on my setup Wi-Fi.",),
+}
+
+
+class SetupLine(StrEnum):
+    """What Lucy says in setup mode, to the grown-up setting her up (lucy.setup)."""
+
+    READY = "ready"
+    HELLO = "hello"
+    TRYING = "trying"
+    JOINED = "joined"
+    JOINED_OFFLINE = "joined_offline"
+    WRONG_PASSWORD = "wrong_password"
+    NOT_FOUND = "not_found"
+    NO_ADDRESS = "no_address"
+    JOIN_FAILED = "join_failed"
+    FINISHED = "finished"
+    IDLE = "idle"
+    CANCELLED = "cancelled"
+    NO_HOTSPOT = "no_hotspot"
+
+
+_TRY_AGAIN = "My setup Wi-Fi is back on, so you can try again."
+
+# {hotspot} is her setup Wi-Fi's name and {network} the one she is joining, both made speakable
+# (and screened) by lucy.setup.mode. Setup mode has no internet, so her on-device voice says these.
+SETUP_LINES: Mapping[SetupLine, str] = {
+    SetupLine.READY: (
+        "My setup Wi-Fi is on! A grown-up can scan the card inside my zipper with a phone, or "
+        "join the Wi-Fi called {hotspot}."
+    ),
+    SetupLine.HELLO: "Honk! I see your phone. Let's get me set up.",
+    SetupLine.TRYING: "Okay, I'm trying {network} now. Your phone will lose my Wi-Fi for a bit.",
+    SetupLine.JOINED: "Honk! I'm on {network}, and I can reach my thinking cloud. Setup is done!",
+    SetupLine.JOINED_OFFLINE: (
+        "I joined {network}, but I can't reach the internet through it. It might need a sign-in "
+        "page, or the school might need to let me in. " + _TRY_AGAIN
+    ),
+    SetupLine.WRONG_PASSWORD: f"Hmm, {{network}} didn't accept that password. {_TRY_AGAIN}",
+    SetupLine.NOT_FOUND: f"I can't find {{network}} from here. {_TRY_AGAIN}",
+    SetupLine.NO_ADDRESS: f"{{network}} let me in, but didn't give me an address. {_TRY_AGAIN}",
+    SetupLine.JOIN_FAILED: f"I couldn't join {{network}}. {_TRY_AGAIN}",
+    SetupLine.FINISHED: "All done! Give me a moment to wake back up.",
+    SetupLine.IDLE: "Nobody's setting me up, so I'll go back to being a goose.",
+    SetupLine.CANCELLED: "Okay, no setup for now.",
+    SetupLine.NO_HOTSPOT: (
+        "Uh oh, I couldn't turn on my setup Wi-Fi. A grown-up may need to check how my Wi-Fi is "
+        "set up."
+    ),
 }
 
 
@@ -243,6 +298,7 @@ class Persona:
     moving_system_prompt: str
     """For a Lucy whose motors work, so she can say she wiggles."""
     lines: Mapping[Phrase, Sequence[str]]
+    setup_lines: Mapping[SetupLine, str]
 
     def prompt(self, *, moving: bool) -> str:
         return self.moving_system_prompt if moving else self.system_prompt
@@ -253,4 +309,5 @@ LUCY = Persona(
     system_prompt=SYSTEM_PROMPT,
     moving_system_prompt=MOVING_SYSTEM_PROMPT,
     lines=LINES,
+    setup_lines=SETUP_LINES,
 )

@@ -1,10 +1,17 @@
 #!/bin/sh
 # Run Lucy's command line (doctor, say, bench, run --keyboard) exactly as the service runs:
 # same user, groups, API-key credentials, and capability. Usage: sudo lucy doctor --listen
+# (sudo lucy setup starts setup mode; sudo lucy setup-card prints her setup card.)
 set -eu
 if [ "$(id -u)" -ne 0 ]; then
   exec sudo "$0" "$@"
 fi
+case "${1:-}" in
+  # Setup mode runs as its own service (lucy-setup.service), as if her wing were held.
+  setup) exec systemctl start --no-block lucy-setup.service ;;
+  # The card holds her setup Wi-Fi's password, which only root may read.
+  setup-card) shift; exec /opt/lucy/venv/bin/lucy --config /etc/lucy/config.toml setup-card "$@" ;;
+esac
 exec systemd-run --quiet --pty --wait --collect --working-directory=/opt/lucy \
   --uid=lucy --gid=lucy \
   --property="SupplementaryGroups=audio gpio" \

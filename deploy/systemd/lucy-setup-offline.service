@@ -1,0 +1,28 @@
+[Unit]
+Description=Start Lucy's setup mode if no network connects soon after boot
+Documentation=file:///opt/lucy/src/docs/OPERATIONS.md
+After=NetworkManager.service lucy.service
+Wants=NetworkManager.service
+
+[Service]
+# Waits for a network (setup.offline_wait_s); if none connects, starts lucy-setup.service.
+# Does nothing when [setup] enabled or when_offline is false. "exec": boot does not wait for it.
+# It keeps root's capabilities (starting a unit needs them) but sees a read-only system, no
+# devices, and no network sockets: it only talks to NetworkManager and systemd over D-Bus.
+Type=exec
+Environment=PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/lucy/venv/bin/lucy --config /etc/lucy/config.toml setup --if-offline
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

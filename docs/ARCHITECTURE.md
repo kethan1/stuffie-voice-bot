@@ -135,6 +135,7 @@ interfaces, and a single composition root wires them together.
    lucy.motors      assembles her motors and the Puppeteer (or none: she keeps still)
    lucy.platform    systemd notify/watchdog, journald-aware logging
    lucy.tools       `lucy doctor`, `lucy bench`
+   lucy.setup       setup mode: her own hotspot, the settings page, NetworkManager (§5.8)
    lucy.persona     Lucy's system prompt and fixed lines
 ```
 
@@ -391,6 +392,83 @@ boots. If the motors cannot be opened (no overlay, a line in use), Lucy logs
 it and keeps talking without moving, with the prompt for a Lucy who cannot
 move: she only says she can wiggle when she really can.
 
+### 5.8 Setup mode: a phone instead of SSH (`lucy.setup`)
+
+A toy that needs SSH whenever it moves to a new Wi-Fi network is not usable by a
+teacher. In setup mode, Lucy becomes a Wi-Fi hotspot with a settings page, and
+a grown-up configures her from a phone.
+
+```
+ wing held at wake-up ─► lucy writes /run/lucy/setup-request ─► lucy-setup.path ─┐
+ no network 90 s after boot ─► lucy-setup-offline.service ───────────────────────┤
+ sudo lucy setup ────────────────────────────────────────────────────────────────┤
+                                                                                 ▼
+  lucy-setup.service (Conflicts=lucy.service: Lucy rests; her speaker, motors, and wing are free)
+   scan ─► hotspot "Lucy-Setup-4821" (NetworkManager, 10.42.0.1) ─► "My setup Wi-Fi is on!"
+   phone scans the card's QR code ─► joins ─► asks for any web page ─► DNS answers 10.42.0.1
+     ─► the page redirects every other host to http://10.42.0.1/ ─► the phone opens it itself
+   Join ─► "Trying School Wi-Fi" ─► network up? ─ yes, and online ─► "I'm on …!" ─► end
+                                           └─ no ─► delete it, hotspot back, say why
+  ExecStopPost: lucy-persist (read-only root) ─► systemctl start lucy
+```
+
+**Why a hotspot, not a page on the school network.** The page must work
+before Lucy is on any network, and school networks often block devices from
+reaching each other, so `lucy.local` would not reliably load. Bluetooth was
+ruled out because Safari on iPhones has no Web Bluetooth, and `--tune` turns
+Bluetooth off to save power. The hotspot needs nothing on the phone but its
+camera and browser.
+
+**The phone opens the page by itself.** NetworkManager's shared mode runs
+dnsmasq for the hotspot, and `deploy/networkmanager/lucy-setup.conf` makes it
+answer every name with Lucy's address. A phone checks for a sign-in page by
+fetching a known URL (`captive.apple.com`, `connectivitycheck.gstatic.com`).
+It reaches Lucy instead, gets a redirect to her page, and shows it in its
+sign-in window, as hotel Wi-Fi does.
+
+**The page** (`pages.py`) is plain server-rendered HTML forms with no
+JavaScript and nothing from the internet. A phone's sign-in window is a
+limited browser, and the hotspot has no internet. "Hear her" and "Test
+motors" post the same form to another address and get `204 No Content`, which
+leaves the page as it is. The server (`http.py`) is under 200 lines on the
+asyncio event loop: one request per connection, size and time limits, and
+no new dependency.
+
+**Joining is all or nothing** (`network.py`). A network is written as a
+NetworkManager keyfile with autoconnect off, loaded with `nmcli connection
+load`, and brought up. Passwords never go on a command line, where other
+processes could read them. Only if it comes up is autoconnect turned on and
+any older profile for the same network deleted. Otherwise the new profile is
+deleted, so the networks that already worked are never touched. nmcli's
+English error message (it runs with `LC_ALL=C`) tells Lucy what to say:
+wrong password, not found, or no address. After joining, she connects to the
+Groq host to check that the network really reaches the internet; a sign-in
+page or an unapproved device shows up there. The Pi's radio scans poorly
+while it is a hotspot, so she scans first and keeps the list.
+
+**Settings are checked before they are saved** (`settings.py`). The page
+shows a chosen set of settings, each tied to its `config.toml` key. A test
+checks every one against `Config`, so the page cannot drift. Saving edits
+the file with tomlkit, keeping its comments, and runs the result through
+`parse_config`, the same check Lucy starts with. A change she would refuse
+is explained on the page and never written. The file before the last change
+is kept for Undo. Writes are atomic (temporary file, fsync, rename), so a
+power cut leaves the old file or the new one. The safety settings are only
+in the Advanced view of the whole file.
+
+**What she says** is in `persona.py` (`SETUP_LINES`). She speaks with Piper,
+because setup mode has no internet. A network's name is spoken only if it
+passes the same reply screen as her answers (`ReplyFilter`); otherwise she
+says "that network".
+
+**Leaving.** Setup mode ends on "Finish setup", a successful join, holding the
+wing for two seconds, or `idle_timeout_s` with no requests. However it ends,
+including a crash, the unit's `ExecStopPost` starts Lucy again. With a
+read-only root, it first runs `lucy-persist`. That script remounts the SD
+card's lower layer read-write, rsyncs `/etc/lucy` and
+`/etc/NetworkManager/system-connections` to it, and remounts it read-only,
+so the changes survive a power-off.
+
 ---
 
 ## 6. Latency engineering
@@ -623,6 +701,9 @@ grown-up.
 | Missing API key | Lucy still starts, explains out loud that she needs a grown-up, and `lucy doctor` says exactly what to do. Without a Speechify key she simply speaks with her backup voice. |
 | Motors missing or broken (no PWM overlay, a line in use) | Lucy keeps still and keeps talking, with the prompt for a Lucy who cannot move. `lucy doctor` names the problem. The DRV8833 itself limits current and shuts down if it overheats. |
 | Lucy crashes or is killed mid-sentence | `ExecStopPost` runs `lucy motors --off`, so no motor is left running on a stale PWM duty cycle. |
+| A new Wi-Fi network fails in setup mode | Its profile is deleted, the networks that worked before are untouched, Lucy says why, and her hotspot comes back (§5.8). |
+| Setup mode crashes, times out, or is stopped | `ExecStopPost` starts Lucy again (after copying the changes to the SD card on a read-only root). |
+| A setting Lucy would refuse is entered in setup mode | It is checked with the same parser she starts with and never saved. The previous file is kept for Undo. |
 
 ---
 
@@ -643,6 +724,16 @@ grown-up.
   `speechify_api_key` (root, mode 600) and reach the service only through
   `LoadCredential=`. They are not in the config file, the environment, the
   logs, or the repository.
+* **Setup mode** (`lucy-setup.service`) runs as root, because it changes
+  NetworkManager's connections and `/etc/lucy`. It has no capabilities except
+  binding port 80, and sees a read-only system except those two directories.
+  It serves its page only on Lucy's own WPA2 hotspot, whose password (unique to
+  each goose, root-only in `/etc/lucy/setup-hotspot.toml`) is on the card
+  inside her zipper. A child holding her wing at wake-up only gets the hotspot,
+  not the card. Forms carry a per-run token. The page sends a Content
+  Security Policy with no scripts, never shows a saved key or Wi-Fi password,
+  and runs every text it shows through HTML escaping. Wi-Fi passwords go to
+  NetworkManager in root-only keyfiles, never on a command line.
 * **Supply chain:** dependencies are pinned with SHA-256 hashes in `uv.lock`,
   resolved with a two-week release-age cutoff, and installed with
   `uv sync --locked --no-build`: prebuilt wheels only, and a lock that is out of
@@ -669,6 +760,7 @@ grown-up.
 | Safety screens (what must be caught, and what must get through) | `tests/test_safety.py`. New disguises are also checked against an English word list. |
 | Audio adapters (gapless splicing, stop, cancel, open failure, mic capping, when each clip is heard) | A simulated `sounddevice` whose thread calls the real callbacks |
 | Config, power knobs, systemd notify | Temp files, a fake sysfs tree, a real Unix datagram socket |
+| Setup mode (keyfiles and nmcli parsing, join with rollback, the settings store and its comments, the card, every page action over real HTTP, joining, failing, idle and wing exits, the wake-up gesture) | `tests/test_setup.py`: a fake nmcli, the demo network, and a body that records what Lucy says |
 | Offline brain (fallback at each stage, remembered outages, recovery, history limit, never mixing brains) | Fakes in `tests/test_pipeline.py`; a simulated faster-whisper in `tests/test_local.py` |
 | Real voice end to end | `tests/test_integration.py` (runs when `LUCY_TEST_VOICE` is set) |
 | Real offline turn: Piper speaks a question, faster-whisper hears it, a mocked Ollama answers | `tests/test_integration.py`, `tests/test_local.py` (with `LUCY_TEST_STT_MODEL`) |

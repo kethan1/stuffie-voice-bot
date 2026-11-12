@@ -145,6 +145,9 @@ mechanics are up to the builder:
 * **Motors** in foam, away from the microphone. They never move while Lucy
   listens, but mounting them softly keeps them quiet while she talks.
 * **Button** in a wing, padded so a gentle squeeze presses it.
+* **Setup card:** print Lucy's setup card (docs/OPERATIONS.md, "Setup mode")
+  and keep it in a pocket inside the access seam. It is how a grown-up reaches
+  her settings from a phone, so it belongs where children don't go.
 * **Child safety:** no exposed wires, pins, or small parts. Secure the battery,
   route cables so they can't be pulled, and close the access seam with a zip
   or hook-and-loop that a grown-up opens. Supervise use.

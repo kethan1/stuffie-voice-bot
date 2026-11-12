@@ -13,3 +13,6 @@ voices/
 .env
 !.env.sample
 models/
+# make setup (setup mode with pretend Wi-Fi)
+setup-dev.toml
+.lucy-setup-demo/

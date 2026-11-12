@@ -147,3 +147,16 @@ forget_after_s = 300.0         # then forget the conversation entirely
 max_turns_per_hour = 120       # protects the API quota from a stuck or hammered button
 greet_on_start = true
 earcons = true
+
+[setup]
+# Setup mode: Lucy turns on her own Wi-Fi and a grown-up's phone opens her settings page (Wi-Fi
+# networks, these settings, API keys), so nobody needs SSH or a monitor. docs/OPERATIONS.md,
+# "Setup mode". Her setup Wi-Fi's name and password are on the card from: sudo lucy setup-card
+enabled = true
+hold_to_start_s = 3.0          # hold her wing while she wakes up, this long once she's ready; 0 = off
+when_offline = true            # start setup mode by herself when no network connects after boot
+offline_wait_s = 90.0          # ... within this long
+idle_timeout_s = 600.0         # leave setup mode after this long with nothing happening on the page
+interface = "wlan0"
+hotspot_file = "/etc/lucy/setup-hotspot.toml"   # root-only: her setup Wi-Fi's name and password
+credentials_dir = "/etc/lucy/credentials"       # where the page saves API keys (see lucy.service)

@@ -15,6 +15,9 @@ User=lucy
 Group=lucy
 SupplementaryGroups=audio gpio
 WorkingDirectory=/opt/lucy
+# /run/lucy: holding her wing while she wakes up writes setup-request here, and lucy-setup.path
+# starts setup mode (which stops Lucy, and this directory goes with her).
+RuntimeDirectory=lucy
 Environment=PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
 # API keys are handed over as credentials: readable only by this service, never in the environment.
 # (deploy/install.sh always creates the Speechify file; left empty, Lucy uses her on-device voice.)
