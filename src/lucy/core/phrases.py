@@ -36,6 +36,11 @@ class Phrase(StrEnum):
     NOT_SAFE = "not_safe"
     KEEP_PRIVATE = "keep_private"
     SETUP = "setup"
+    NO_SETUP = "no_setup"
+    LOUDER = "louder"
+    QUIETER = "quieter"
+    LOUDEST = "loudest"
+    QUIETEST = "quietest"
 
 
 class PhraseBook:

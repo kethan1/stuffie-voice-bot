@@ -26,6 +26,7 @@ from lucy.core.controller import SessionSettings
 from lucy.core.errors import ConfigError
 from lucy.core.motion import MotionSettings
 from lucy.core.pipeline import TurnSettings
+from lucy.core.volume import VolumeSettings
 
 DEFAULT_CONFIG_PATH = Path("/etc/lucy/config.toml")
 
@@ -124,6 +125,9 @@ class TtsSettings:
     """Above 1.0 speaks more slowly, which can help the youngest children."""
     volume: float = 0.9
     speaker_id: int | None = None
+    goose_voice: float = 0.7
+    """How much like a goose her speech sounds, from 0 (her plain voice) to 1: a higher,
+    smaller, honky voice with a rasp (lucy.core.goose_voice)."""
     honks: bool = True
     """Make a goose call for each interjected "Honk!" instead of saying the word."""
     honk_volume: float = 1.0
@@ -161,7 +165,7 @@ class LedSettings:
 
 @dataclass(frozen=True, slots=True)
 class MotorSettings:
-    """Lucy's beak and body motors on a DRV8833 driver (docs/HARDWARE.md)."""
+    """Lucy's beak and body motors on an L293D driver (docs/HARDWARE.md)."""
 
     enabled: bool = False
     pwm_chip: Path = Path("/sys/class/pwm/pwmchip0")
@@ -170,17 +174,27 @@ class MotorSettings:
     """Above hearing, so the motors do not whine."""
     gpio_chip: str = "/dev/gpiochip0"
     beak_pwm_channel: int = 0
-    """PWM channel 0 is GPIO12 (pin 32), wired to AIN1."""
-    beak_direction_line: int = 22
-    """GPIO22 (pin 15), wired to AIN2."""
+    """PWM channel 0 is GPIO12 (pin 32), wired to 1,2EN."""
+    beak_forward_line: int = 22
+    """GPIO22 (pin 15), wired to 1A: high runs the beak motor forward (opening the beak)."""
+    beak_backward_line: int = 23
+    """GPIO23 (pin 16), wired to 2A: high runs the beak motor backward."""
     body_pwm_channel: int = 1
-    """PWM channel 1 is GPIO13 (pin 33), wired to BIN1."""
-    body_direction_line: int = 23
-    """GPIO23 (pin 16), wired to BIN2."""
-    sleep_line: int = 24
-    """GPIO24 (pin 18), wired to nSLEEP so the driver sleeps while Lucy is still; -1 if not
-    wired."""
+    """PWM channel 1 is GPIO13 (pin 33), wired to 3,4EN."""
+    body_forward_line: int = 24
+    """GPIO24 (pin 18), wired to 3A: high runs the body motor forward."""
+    body_backward_line: int = 25
+    """GPIO25 (pin 22), wired to 4A: high runs the body motor backward."""
     motion: MotionSettings = field(default_factory=MotionSettings)
+
+    def lines(self) -> dict[str, int]:
+        """The four input lines, by setting name (without ``motors.``)."""
+        return {
+            "beak_forward_line": self.beak_forward_line,
+            "beak_backward_line": self.beak_backward_line,
+            "body_forward_line": self.body_forward_line,
+            "body_backward_line": self.body_backward_line,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,6 +215,9 @@ class SetupSettings:
     hold_to_start_s: float = 3.0
     """Holding her wing while she wakes up, this long after she is ready, starts setup mode.
     0 turns the gesture off."""
+    voice_command: bool = True
+    """While she is awake, the knock (two taps on her wing, then holding it) and the words
+    "enter setup mode" start setup mode (lucy.core.knock)."""
     when_offline: bool = True
     """Start setup mode by herself when no network has connected ``offline_wait_s`` after boot."""
     offline_wait_s: float = 90.0
@@ -231,6 +248,7 @@ class Config:
     power: PowerSettings = field(default_factory=PowerSettings)
     turn: TurnSettings = field(default_factory=TurnSettings)
     session: SessionSettings = field(default_factory=SessionSettings)
+    volume: VolumeSettings = field(default_factory=VolumeSettings)
     setup: SetupSettings = field(default_factory=SetupSettings)
 
 
@@ -350,6 +368,7 @@ def _validate(config: Config) -> None:
     problems += [
         f"{name} must be between 0 and 2" for name, value in volumes.items() if not 0 <= value <= 2
     ]
+    problems += _sound_problems(config)
     if cloud.timeout_s <= 0 or cloud.rest_s < 0:
         problems.append("tts.cloud.timeout_s must be positive and tts.cloud.rest_s >= 0")
     if config.turn.first_clause_min_words < 0:
@@ -362,6 +381,8 @@ def _validate(config: Config) -> None:
         problems.append("local.history_exchanges must be >= 0 and local.stt_threads >= 1")
     if config.session.tap_max_s >= config.session.max_record_s:
         problems.append("session.tap_max_s must be shorter than session.max_record_s")
+    if not 0 < config.session.tap_gap_s <= 3:
+        problems.append("session.tap_gap_s must be above 0 and at most 3 (seconds)")
     if config.session.awake_s <= 0 or config.session.forget_after_s <= 0:
         problems.append("session.awake_s and session.forget_after_s must be positive")
     if config.motors.enabled:
@@ -369,6 +390,25 @@ def _validate(config: Config) -> None:
     problems += _setup_problems(config.setup)
     if problems:
         raise ConfigError("invalid configuration: " + "; ".join(problems))
+
+
+def _sound_problems(config: Config) -> list[str]:
+    """Her goose voice, honks, chimes, and the volume a child can change."""
+    problems = []
+    if not 0 <= config.tts.goose_voice <= 1:
+        problems.append("tts.goose_voice must be between 0 (her plain voice) and 1")
+    if not 0 <= config.session.earcon_volume <= 1.5:
+        problems.append("session.earcon_volume must be between 0 and 1.5")
+    if not 0 <= config.turn.opening_honk_chance <= 1:
+        problems.append("turn.opening_honk_chance must be between 0 and 1")
+    volume = config.volume
+    if not 0 < volume.step_db <= 12:
+        problems.append("volume.step_db must be above 0 and at most 12")
+    if not 0 <= volume.max_db <= 12:
+        problems.append("volume.max_db must be between 0 and 12")
+    if not -40 <= volume.min_db <= 0:
+        problems.append("volume.min_db must be between -40 and 0")
+    return problems
 
 
 def _setup_problems(setup: SetupSettings) -> list[str]:
@@ -387,12 +427,7 @@ def _motor_problems(config: Config) -> list[str]:
         problems.append("motors.beak_pwm_channel and motors.body_pwm_channel must differ")
     if not 1_000 <= motors.pwm_frequency_hz <= 50_000:
         problems.append("motors.pwm_frequency_hz must be between 1000 and 50000 (20000 is silent)")
-    lines = {
-        "motors.beak_direction_line": motors.beak_direction_line,
-        "motors.body_direction_line": motors.body_direction_line,
-    }
-    if motors.sleep_line != -1:
-        lines["motors.sleep_line"] = motors.sleep_line
+    lines = {f"motors.{name}": line for name, line in motors.lines().items()}
     taken = {}
     if config.button.chip == motors.gpio_chip and config.button.backend == "gpio":
         taken[config.button.line] = "button.line"

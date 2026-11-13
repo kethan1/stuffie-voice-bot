@@ -2,8 +2,9 @@
 Description=Lucy the Goose setup mode: her own Wi-Fi and a settings page for a grown-up's phone
 Documentation=file:///opt/lucy/src/docs/OPERATIONS.md
 # Setup mode uses her speaker, motors, and wing button, so Lucy rests while it runs.
-# Started by lucy-setup.path (her wing held while she wakes up), lucy-setup-offline.service
-# (no network after boot), or by hand: sudo lucy setup
+# Started by lucy-setup.path (her wing held while she wakes up, or two taps on it and "enter
+# setup mode" while she is awake), lucy-setup-offline.service (no network after boot), or by
+# hand: sudo lucy setup
 Conflicts=lucy.service
 After=lucy.service NetworkManager.service sound.target
 Wants=NetworkManager.service

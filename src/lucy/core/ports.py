@@ -75,6 +75,10 @@ class Speaker(Protocol):
         """Silence immediately and drop everything queued. True if anything was playing."""
         ...
 
+    def set_volume(self, db: float) -> None:
+        """Play every clip queued from now on ``db`` decibels louder (quieter, below 0)."""
+        ...
+
     async def open(self) -> None:
         """Open the output device ahead of time so the first word is not delayed."""
         ...
@@ -98,14 +102,11 @@ class PlaybackListener(Protocol):
 
 class Motors(Protocol):
     def drive(self, motor: Motor, power: float) -> None:
-        """Run ``motor`` at ``power``, from -1 to 1: the sign picks the way, 0 lets it coast.
-
-        Wakes the motor driver if it is asleep.
-        """
+        """Run ``motor`` at ``power``, from -1 to 1: the sign picks the way, 0 lets it coast."""
         ...
 
     def sleep(self) -> None:
-        """Let every motor coast and put the driver to sleep, drawing next to nothing."""
+        """Let every motor coast, with the driver's outputs off."""
         ...
 
 
@@ -124,6 +125,19 @@ class PowerControl(Protocol):
 
     async def restore(self) -> None:
         """Put the system back the way it was before Lucy started."""
+        ...
+
+
+class SetupStarter(Protocol):
+    """Starts setup mode (:mod:`lucy.setup`) when Lucy asks for it while she is awake."""
+
+    @property
+    def available(self) -> bool:
+        """False where asking cannot work (on a laptop, or without her systemd service)."""
+        ...
+
+    async def start(self) -> bool:
+        """Ask for setup mode, and wait to be stopped for it. False if it did not start."""
         ...
 
 

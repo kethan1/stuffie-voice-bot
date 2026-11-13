@@ -19,6 +19,10 @@ The speaker can report to a :class:`~lucy.core.ports.PlaybackListener` (Lucy's
 motors) when each clip will actually be heard. The callback knows when the
 buffer it fills reaches the DAC (PortAudio's ``outputBufferDacTime``), so the
 report is accurate to a sample, however much audio is queued ahead of it.
+
+Its master volume (:meth:`SoundDeviceSpeaker.set_volume`, which a child changes by
+asking, :mod:`lucy.core.volume`) scales each clip as it is queued. The listener is
+told about the clip as it was made, so Lucy's beak opens just as wide at any volume.
 """
 
 import asyncio
@@ -30,7 +34,7 @@ from functools import partial
 from time import monotonic
 from typing import Any
 
-from lucy.core.audio import SAMPLE_WIDTH, Pcm
+from lucy.core.audio import SAMPLE_WIDTH, Pcm, adjust_volume
 from lucy.core.errors import AudioDeviceError
 from lucy.core.ports import PlaybackListener
 
@@ -144,13 +148,18 @@ class SoundDeviceSpeaker:
         self._stream: Any = None
         self._opening: asyncio.Task[None] | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._volume_db = 0.0
+
+    def set_volume(self, db: float) -> None:
+        self._volume_db = db
 
     def enqueue(self, audio: Pcm) -> asyncio.Future[None]:
         if audio.sample_rate != self._sample_rate:
             raise ValueError(f"speaker runs at {self._sample_rate} Hz, got {audio.sample_rate} Hz")
         self._loop = asyncio.get_running_loop()
         future: asyncio.Future[None] = self._loop.create_future()
-        clip = _Clip(audio, memoryview(audio.data), future)
+        played = adjust_volume(audio, self._volume_db)
+        clip = _Clip(audio, memoryview(played.data), future)
         with self._lock:
             self._queue.append(clip)
         future.add_done_callback(partial(self._withdraw, clip))

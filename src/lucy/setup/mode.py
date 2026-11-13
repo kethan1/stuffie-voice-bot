@@ -369,6 +369,7 @@ class SetupMode:
             try:
                 await self._body.try_voice(
                     volume=changes["tts.volume"],
+                    goose_voice=changes["tts.goose_voice"],
                     honks=changes["tts.honks"],
                     honk_volume=changes["tts.honk_volume"],
                 )

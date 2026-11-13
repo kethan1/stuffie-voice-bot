@@ -124,13 +124,13 @@ async def _say(config: Config, text: str, *, on_device: bool) -> int:
     from lucy.adapters.sound import SoundDeviceSpeaker
     from lucy.config import device
     from lucy.motors import start_motion
-    from lucy.voices import build_voice, load_on_device_voice, with_honks
+    from lucy.voices import as_goose, build_voice, load_on_device_voice
 
     async with AsyncExitStack() as stack:
         puppeteer = await start_motion(config, stack)  # her beak and body move as she speaks
         voice = build_voice(config, await asyncio.to_thread(load_on_device_voice, config))
         stack.push_async_callback(voice.aclose)
-        tts = with_honks(config, voice.on_device) if on_device else voice.tts
+        tts = as_goose(config, voice.on_device) if on_device else voice.tts
         speaker = SoundDeviceSpeaker(
             sample_rate=tts.sample_rate,
             device=device(config.audio.output_device),
@@ -167,7 +167,7 @@ async def _motors(config: Config, *, off: bool) -> int:
         print("Lucy has no motors in this config ([motors] enabled = false)")
         return 0
     try:
-        driver = await asyncio.to_thread(open_motors, config)  # both motors still, driver asleep
+        driver = await asyncio.to_thread(open_motors, config)  # both motors still, outputs off
     except OSError as error:
         raise ConfigError(f"cannot open the motors: {error}") from error
     try:

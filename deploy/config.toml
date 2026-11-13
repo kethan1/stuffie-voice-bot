@@ -66,6 +66,8 @@ voice = "/opt/lucy/voices/en_US-lessac-medium.onnx"
 threads = 3                    # leave one core free for audio and the event loop
 length_scale = 1.0             # > 1.0 speaks more slowly
 volume = 0.9
+goose_voice = 0.7              # 0 = her plain voice, 1 = as much of a goose as she can be
+                               # (higher and smaller, honky, raspy); either voice
 honks = true                   # "Honk!" is a goose call, not the word read aloud
 honk_volume = 1.0              # 1.0 = about as loud as her voice
 
@@ -100,18 +102,19 @@ line = 27                      # BCM 27 = physical pin 13, through a 330 ohm res
 active_low = false
 
 [motors]
-# Lucy's beak and body motors on a DRV8833 driver (docs/HARDWARE.md, "Motors"). Switched on,
+# Lucy's beak and body motors on an L293D driver (docs/HARDWARE.md, "Motors"). Switched on,
 # with the PWM overlay they need, by: sudo deploy/install.sh --motors. Check the wiring with:
 #   sudo systemctl stop lucy && sudo lucy motors
 enabled = false
 pwm_chip = "/sys/class/pwm/pwmchip0"   # dtoverlay=pwm-2chan,pin=12,func=4,pin2=13,func2=4
 pwm_frequency_hz = 20000       # above hearing, so the motors don't whine
 gpio_chip = "/dev/gpiochip0"
-beak_pwm_channel = 0           # GPIO12 (pin 32) -> AIN1
-beak_direction_line = 22       # GPIO22 (pin 15) -> AIN2
-body_pwm_channel = 1           # GPIO13 (pin 33) -> BIN1
-body_direction_line = 23       # GPIO23 (pin 16) -> BIN2
-sleep_line = 24                # GPIO24 (pin 18) -> nSLEEP; -1 if your board ties it high
+beak_pwm_channel = 0           # GPIO12 (pin 32) -> 1,2EN (L293D pin 1): the beak's speed
+beak_forward_line = 22         # GPIO22 (pin 15) -> 1A    (L293D pin 2): high opens the beak
+beak_backward_line = 23        # GPIO23 (pin 16) -> 2A    (L293D pin 7)
+body_pwm_channel = 1           # GPIO13 (pin 33) -> 3,4EN (L293D pin 9): the body's speed
+body_forward_line = 24         # GPIO24 (pin 18) -> 3A    (L293D pin 10)
+body_backward_line = 25        # GPIO25 (pin 22) -> 4A    (L293D pin 15)
 
 [motors.motion]
 lead_s = 0.05                  # move this much before the sound (motors take a moment)
@@ -137,16 +140,29 @@ sentence_pause_s = 0.2
 clause_pause_s = 0.08
 first_clause_min_words = 0     # 0 = whole sentences (most natural); 4 = start sooner on Piper
 max_chunk_words = 30
+opening_honk_chance = 0.5      # how often she starts a reply with a honk of her own (never a
+                               # sad or serious one); 0 leaves honking to the model
 log_transcripts = false        # privacy: keep children's words (and replies) out of the journal
 
 [session]
 tap_max_s = 0.3                # a shorter press is a tap: stops Lucy, or explains how to talk
+tap_gap_s = 0.7                # taps this close together, then a squeeze, are "the knock" (see
+                               # [setup] voice_command); her how-to-talk hint waits this long
 max_record_s = 15.0
 awake_s = 45.0                 # stay fast this long after a turn, then go dormant
 forget_after_s = 300.0         # then forget the conversation entirely
 max_turns_per_hour = 120       # protects the API quota from a stuck or hammered button
 greet_on_start = true
 earcons = true
+earcon_volume = 1.0            # the chimes: 1.0 = a little louder than her voice
+
+[volume]
+# A child can make Lucy louder or quieter by asking ("louder!", "too loud", "speak up"). It
+# applies to everything she plays, and lasts until she is turned off.
+commands = true
+step_db = 3.0                  # each request
+max_db = 9.0                   # loudest, above her usual loudness (peaks are rounded off, not clipped)
+min_db = -15.0                 # quietest
 
 [setup]
 # Setup mode: Lucy turns on her own Wi-Fi and a grown-up's phone opens her settings page (Wi-Fi
@@ -154,6 +170,8 @@ earcons = true
 # "Setup mode". Her setup Wi-Fi's name and password are on the card from: sudo lucy setup-card
 enabled = true
 hold_to_start_s = 3.0          # hold her wing while she wakes up, this long once she's ready; 0 = off
+voice_command = true           # while she's awake: tap her wing twice, then hold it and say
+                               # "enter setup mode"
 when_offline = true            # start setup mode by herself when no network connects after boot
 offline_wait_s = 90.0          # ... within this long
 idle_timeout_s = 600.0         # leave setup mode after this long with nothing happening on the page

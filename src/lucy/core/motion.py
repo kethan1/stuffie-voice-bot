@@ -1,6 +1,6 @@
 """Lucy's beak and body, moving in time with every sound she makes.
 
-Lucy has two DC motors on a DRV8833 driver (docs/HARDWARE.md). The beak motor
+Lucy has two DC motors on an L293D driver (docs/HARDWARE.md). The beak motor
 pushes her beak open against a spring, and the spring snaps it shut when the
 motor lets go. The body motor wiggles her, one way or both. :class:`Puppeteer`
 decides what they do:
@@ -27,7 +27,8 @@ everything at once.
 
 Safety and power: motor power is capped, no motor runs longer than
 ``max_hold_s`` without a short rest (so a stalled motor cannot overheat inside
-the plush), and whenever nothing is moving the driver sleeps.
+the plush), and whenever nothing is moving both motors coast, with the
+driver's outputs off.
 """
 
 import asyncio
@@ -314,7 +315,7 @@ class Puppeteer:
     # -- Moving ------------------------------------------------------------------------------
 
     def _schedule(self) -> None:
-        """Wake for the next move, or put the driver to sleep if there is none."""
+        """Wake for the next move, or let both motors coast if there is none."""
         if self._timer is not None:
             self._timer.cancel()
             self._timer = None

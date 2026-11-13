@@ -11,11 +11,14 @@ from pathlib import Path
 import httpx
 import pytest
 
-from lucy.app import SETUP_REQUEST, _hand_over_to_setup, request_setup
+from lucy.app import SETUP_REQUEST, SetupHandover, _hand_over_to_setup, request_setup
 from lucy.config import Config, ConfigError, load_config
+from lucy.core.controller import Controller, SessionSettings
+from lucy.core.conversation import Conversation
 from lucy.core.motion import MotionSettings
-from lucy.core.phrases import Phrase
-from lucy.core.safety import BLOCKED_WORDS, ReplyFilter
+from lucy.core.phrases import Phrase, PhraseBook
+from lucy.core.pipeline import Brain, TurnPipeline, TurnSettings
+from lucy.core.safety import BLOCKED_WORDS, ReplyFilter, SafetyScreen
 from lucy.persona import LUCY, SetupLine
 from lucy.setup.hotspot import Hotspot, card_html, load_hotspot, new_hotspot
 from lucy.setup.http import Request as HttpRequest
@@ -39,7 +42,17 @@ from lucy.setup.network import (
     split_terse,
 )
 from lucy.setup.settings import FIELD, SECTION, SettingsStore, parse_section
-from tests.fakes import FakeButton, until
+from tests.fakes import (
+    FakeButton,
+    FakeChat,
+    FakeIndicator,
+    FakeMic,
+    FakePower,
+    FakeSpeaker,
+    FakeSTT,
+    FakeTTS,
+    until,
+)
 
 REPO = Path(__file__).resolve().parent.parent
 HOTSPOT = Hotspot("Lucy-Setup-4821", "abcd-efgh-jkmn", address="127.0.0.1")
@@ -422,8 +435,17 @@ class FakeBody:
     async def say(self, text: str) -> None:
         self.said.append(text)
 
-    async def try_voice(self, *, volume: float, honks: bool, honk_volume: float) -> None:
-        self.voice_tries.append({"volume": volume, "honks": honks, "honk_volume": honk_volume})
+    async def try_voice(
+        self, *, volume: float, goose_voice: float, honks: bool, honk_volume: float
+    ) -> None:
+        self.voice_tries.append(
+            {
+                "volume": volume,
+                "goose_voice": goose_voice,
+                "honks": honks,
+                "honk_volume": honk_volume,
+            }
+        )
 
     async def try_motors(self, motion: MotionSettings) -> None:
         self.motor_tries.append(motion)
@@ -496,8 +518,11 @@ LUCY_FORM = {
     "tts.cloud.voice_id": "harper_32",
     "tts.cloud.volume": "1.1",
     "tts.volume": "0.7",
+    "tts.goose_voice": "0.5",
     "tts.honks": "on",
     "tts.honk_volume": "0.6",
+    "session.earcon_volume": "1.2",
+    "volume.commands": "on",
     "session.awake_s": "60",
     "session.max_turns_per_hour": "100",
     "turn.speech_threshold_dbfs": "-52",
@@ -568,7 +593,9 @@ class TestPage:
         async with Rig(config_file) as rig:
             before = read(config_file)
             assert (await rig.post("/try-voice", **LUCY_FORM)).status_code == 204
-            assert rig.body.voice_tries == [{"volume": 0.7, "honks": True, "honk_volume": 0.6}]
+            assert rig.body.voice_tries == [
+                {"volume": 0.7, "goose_voice": 0.5, "honks": True, "honk_volume": 0.6}
+            ]
             assert (await rig.post("/try-motors", **MOTOR_FORM)).status_code == 204
             assert rig.body.motor_tries[0].beak_max_power == 0.9
             bad = MOTOR_FORM | {"motors.motion.beak_min_power": "0.95"}
@@ -731,15 +758,83 @@ class TestStarting:
             def stopping(self) -> None:
                 pass
 
-        monkeypatch.setenv("RUNTIME_DIRECTORY", str(tmp_path))
         config, pipeline, stop = Config(), Pipeline(), asyncio.Event()
-        args = (pipeline, stop, Notifier())
+        handover = SetupHandover(stop, {"RUNTIME_DIRECTORY": str(tmp_path)})
+        args = (pipeline, handover, Notifier())
         assert not await _hand_over_to_setup(config, Wing(False), *args)  # type: ignore[arg-type]
         assert not await _hand_over_to_setup(config, object(), *args)  # type: ignore[arg-type]
         asyncio.get_running_loop().call_later(0.05, stop.set)  # systemd stops Lucy
         assert await _hand_over_to_setup(config, Wing(True), *args)  # type: ignore[arg-type]
         assert pipeline.said == [Phrase.SETUP]
         assert (tmp_path / SETUP_REQUEST).exists()
+
+    async def test_handover_waits_to_be_stopped(self, tmp_path: Path) -> None:
+        stop = asyncio.Event()
+        handover = SetupHandover(stop, {"RUNTIME_DIRECTORY": f"{tmp_path}:/run/other"})
+        assert handover.available
+        asyncio.get_running_loop().call_later(0.05, stop.set)  # systemd stops Lucy
+        assert await handover.start()
+        assert (tmp_path / SETUP_REQUEST).exists()  # systemd clears /run/lucy as she stops
+
+    async def test_handover_takes_its_request_back_if_nothing_comes_of_it(
+        self, tmp_path: Path
+    ) -> None:
+        handover = SetupHandover(asyncio.Event(), {"RUNTIME_DIRECTORY": str(tmp_path)}, wait_s=0.05)
+        assert not await handover.start()  # lucy-setup.path is not there to see it
+        assert not (tmp_path / SETUP_REQUEST).exists()  # so it cannot start setup mode later
+
+    async def test_the_knock_and_the_words_hand_over(self, tmp_path: Path) -> None:
+        """Tap, tap, hold, "enter into setup mode": through the real controller and pipeline,
+        up to the request that systemd acts on."""
+        stop = asyncio.Event()
+        handover = SetupHandover(stop, {"RUNTIME_DIRECTORY": str(tmp_path)}, wait_s=5.0)
+        tts, speaker, indicator, mic = FakeTTS(), FakeSpeaker(), FakeIndicator(), FakeMic()
+        chat, conversation = FakeChat(), Conversation(4)
+        pipeline = TurnPipeline(
+            brain=Brain("cloud", FakeSTT("Enter into setup mode."), chat),
+            tts=tts,
+            moderator=SafetyScreen(),
+            speaker=speaker,
+            indicator=indicator,
+            phrases=PhraseBook(LUCY.lines, tts),
+            conversation=conversation,
+            system_prompt=LUCY.system_prompt,
+            settings=TurnSettings(),
+            setup=handover,
+        )
+        controller = Controller(
+            pipeline=pipeline,
+            mic=mic,
+            speaker=speaker,
+            indicator=indicator,
+            power=FakePower(),
+            conversation=conversation,
+            warmers=[],
+            earcons=None,
+            settings=SessionSettings(greet_on_start=False),
+        )
+        button = FakeButton()
+        serving = asyncio.create_task(controller.run(button))
+        try:
+            for held, after in ((0.1, 5.0), (0.1, 0.2), (1.0, 0.2)):  # tap, tap, hold
+                button.press(at=button.now + after)
+                await until(lambda: mic.recording_now)
+                button.release(after=held)
+                await until(lambda: not mic.recording_now)
+            await until((tmp_path / SETUP_REQUEST).exists)
+            assert tts.texts == list(LUCY.lines[Phrase.SETUP])  # said before she asked
+            assert chat.calls == []
+            assert controller.busy  # waiting to be stopped, not taking the next question
+            stop.set()  # systemd stops Lucy to make way for setup mode
+            await until(lambda: not controller.busy)
+        finally:
+            serving.cancel()
+            await controller.close()
+
+    async def test_no_handover_outside_her_service(self) -> None:
+        handover = SetupHandover(asyncio.Event(), {})  # on a laptop: make run
+        assert not handover.available
+        assert not await handover.start()
 
 
 # -- the HTTP server ---------------------------------------------------------------------------

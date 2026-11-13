@@ -19,19 +19,54 @@ Tuning for a Raspberry Pi 4 (4 x Cortex-A72):
   running.
 * :meth:`warm_up` runs one inference at start-up so the first real sentence
   does not pay for memory-arena allocation and kernel selection.
+
+Pace. Lucy's goose voice (:mod:`lucy.core.goose_voice`) raises the pitch of whatever it
+is given, which also speeds it up, so the voice has to speak that much more slowly first
+(``slower``). Piper's ``length_scale`` does slow it down, but by less than the number
+says, because the short gaps Piper puts between sounds do not stretch. :data:`_PACE` is
+what it really does, so ``slower`` can be exact.
 """
 
 import asyncio
+import copy
 import json
 import logging
 from collections.abc import AsyncGenerator
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
+
+import numpy as np
 
 from lucy.core.audio import Pcm
 from lucy.core.errors import ConfigError
 
 log = logging.getLogger(__name__)
+
+# (length_scale, how many times longer the speech really is), measured over seven sentences
+# with en_US-lessac-medium, the voice Lucy ships with. Other Piper voices differ by a few
+# percent.
+_PACE = (
+    (0.7, 0.77),
+    (0.8, 0.875),
+    (0.9, 0.955),
+    (1.0, 1.0),
+    (1.1, 1.05),
+    (1.2, 1.115),
+    (1.3, 1.19),
+    (1.4, 1.27),
+    (1.5, 1.35),
+    (1.75, 1.545),
+    (2.0, 1.74),
+)
+
+
+def slowed_length_scale(length_scale: float, slower: float) -> float:
+    """The length scale at which Piper speaks ``slower`` times as slowly as at ``length_scale``."""
+    if slower == 1.0:
+        return length_scale
+    scales, lengths = zip(*_PACE, strict=True)
+    return float(np.interp(np.interp(length_scale, scales, lengths) * slower, lengths, scales))
 
 
 class PiperSpeech:
@@ -41,6 +76,7 @@ class PiperSpeech:
         *,
         threads: int = 3,
         length_scale: float | None = None,
+        slower: float = 1.0,
         volume: float = 1.0,
         speaker_id: int | None = None,
     ) -> None:
@@ -66,8 +102,13 @@ class PiperSpeech:
             session=session,
             config=PiperConfig.from_dict(json.loads(config_path.read_text(encoding="utf-8"))),
         )
+        self._length_scale = (
+            float(self._voice.config.length_scale) if length_scale is None else length_scale
+        )
         self._synthesis = SynthesisConfig(
-            speaker_id=speaker_id, length_scale=length_scale, volume=volume
+            speaker_id=speaker_id,
+            length_scale=slowed_length_scale(self._length_scale, slower),
+            volume=volume,
         )
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tts")
         log.info(
@@ -92,6 +133,15 @@ class PiperSpeech:
             chunk.audio_int16_bytes for chunk in self._voice.synthesize(text, self._synthesis)
         )
         return Pcm(audio, self.sample_rate)
+
+    def slowed(self, slower: float) -> "PiperSpeech":
+        """This voice speaking ``slower`` times as slowly: the same loaded model and worker
+        thread, so it costs nothing, and closing either closes both."""
+        voice = copy.copy(self)
+        voice._synthesis = replace(
+            self._synthesis, length_scale=slowed_length_scale(self._length_scale, slower)
+        )
+        return voice
 
     def warm_up(self) -> None:
         self.render("Honk! Hello there.")

@@ -16,6 +16,7 @@ from lucy.adapters.cloud import ChatModelSpec, StreamingChat, WhisperTranscriber
 from lucy.adapters.openai_api import ApiClient
 from lucy.adapters.piper_tts import PiperSpeech
 from lucy.core.conversation import Conversation
+from lucy.core.goose_voice import GooseVoice, pitch_ratio
 from lucy.core.metrics import TurnTimer
 from lucy.core.phrases import PhraseBook
 from lucy.core.pipeline import Brain, TurnPipeline, TurnSettings
@@ -71,6 +72,33 @@ async def test_full_turn_with_real_voice() -> None:
     first_audio = timer.get("first_audio")
     assert first_audio is not None
     assert first_audio < 2.0
+
+
+async def test_the_goose_voice_keeps_her_pace() -> None:
+    """Piper speaks more slowly by what the goose voice then speeds it up by, so the same
+    sentences take as long as in her plain voice (and the slowed voice shares the model).
+
+    Within 6%: Piper's timing varies a little from one rendering to the next, and from one
+    voice to another (the pace is measured for the voice Lucy ships with).
+    """
+    assert VOICE is not None
+    sentences = [
+        "Geese fly in a V shape because it saves energy on long trips.",
+        "A group of geese on the ground is called a gaggle.",
+        "Octopuses have three hearts and blue blood.",
+        "What has keys but can not open a single door? A piano!",
+        "Honey never spoils. Jars found in ancient tombs were still good to eat.",
+        "I can't see myself, so tell me, what color are my feathers?",
+    ]
+    plain = PiperSpeech(Path(VOICE), threads=2)
+    try:
+        for strength in (0.4, 0.7, 1.0):
+            goose = GooseVoice(plain.slowed(pitch_ratio(strength)), strength)
+            usual = sum([(await render(plain, text)).duration for text in sentences])
+            as_a_goose = sum([(await render(goose, text)).duration for text in sentences])
+            assert as_a_goose == pytest.approx(usual, rel=0.06)
+    finally:
+        plain.close()
 
 
 STT_MODEL = os.environ.get("LUCY_TEST_STT_MODEL")

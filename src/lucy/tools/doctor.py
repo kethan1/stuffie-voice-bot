@@ -215,19 +215,13 @@ def motors(config: Config) -> str:
             raise LucyError(
                 f"{chip} has {channels} channel(s), so there is no {name} channel {channel}"
             )
-    lines = [
-        (settings.beak_direction_line, "beak direction"),
-        (settings.body_direction_line, "body direction"),
-    ]
-    if settings.sleep_line != -1:
-        lines.append((settings.sleep_line, "driver sleep"))
-    for line, label in lines:
-        _gpio_line(settings.gpio_chip, line, label)
-    sleep = "not wired" if settings.sleep_line == -1 else f"GPIO{settings.sleep_line}"
+    for name, line in settings.lines().items():
+        _gpio_line(settings.gpio_chip, line, name.removesuffix("_line").replace("_", " "))
     return (
-        f"beak on PWM {settings.beak_pwm_channel} + GPIO{settings.beak_direction_line}, "
-        f"body on PWM {settings.body_pwm_channel} + GPIO{settings.body_direction_line}, "
-        f"sleep {sleep} (`lucy motors` moves them)"
+        f"L293D: beak on PWM {settings.beak_pwm_channel} + GPIO{settings.beak_forward_line}"
+        f"/GPIO{settings.beak_backward_line}, body on PWM {settings.body_pwm_channel} + "
+        f"GPIO{settings.body_forward_line}/GPIO{settings.body_backward_line} "
+        "(`lucy motors` moves them)"
     )
 
 

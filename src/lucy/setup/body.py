@@ -1,9 +1,9 @@
 """Lucy's voice, beak, and body in setup mode.
 
 Setup mode has no internet (the Wi-Fi is Lucy's own hotspot), so she speaks with her
-on-device voice, with her honks, and her beak moves as she talks. The page's "Hear her" and
-"Test motors" buttons use the numbers on the page before they are saved, so a grown-up can
-try a loudness or a beak power first.
+on-device voice, through her goose voice and with her honks, and her beak moves as she talks.
+The page's "Hear her" and "Test motors" buttons use the numbers on the page before they are
+saved, so a grown-up can try a loudness, a goose voice, or a beak power first.
 """
 
 import asyncio
@@ -12,17 +12,19 @@ from collections.abc import AsyncGenerator
 from contextlib import AsyncExitStack
 from typing import Protocol
 
-from lucy.adapters.motors import Drv8833
+from lucy.adapters.motors import L293d
 from lucy.adapters.piper_tts import PiperSpeech
 from lucy.adapters.sound import SoundDeviceSpeaker
 from lucy.config import Config, device
 from lucy.core.audio import Pcm, amplify
 from lucy.core.errors import ConfigError, LucyError
+from lucy.core.goose_voice import GooseVoice, pitch_ratio
 from lucy.core.honk import GooseCalls, HonkingVoice
 from lucy.core.motion import MotionSettings, Puppeteer
 from lucy.core.ports import TextToSpeech
 from lucy.core.speech import render
 from lucy.motors import exercise, open_motors
+from lucy.voices import load_on_device_voice
 
 log = logging.getLogger(__name__)
 
@@ -32,7 +34,9 @@ SAMPLE = "Honk! Hi, I'm Lucy. Is this loud enough? Honk honk!"
 class Body(Protocol):
     async def say(self, text: str) -> None: ...
 
-    async def try_voice(self, *, volume: float, honks: bool, honk_volume: float) -> None:
+    async def try_voice(
+        self, *, volume: float, goose_voice: float, honks: bool, honk_volume: float
+    ) -> None:
         """Say a sample sentence as she would with these (unsaved) settings."""
         ...
 
@@ -64,20 +68,14 @@ class LucysBody:
         self._stack = stack
         self._piper: PiperSpeech | None = None
         self._speaker: SoundDeviceSpeaker | None = None
-        self._motors: Drv8833 | None = None
+        self._motors: L293d | None = None
         self._lock = asyncio.Lock()  # one sound or movement at a time
 
     async def open(self) -> None:
         """Load the voice (a few seconds on a Pi) and claim the motors, if she has them."""
         config = self._config
-        # At full loudness: each line is scaled to the loudness wanted (see _voice).
-        self._piper = piper = await asyncio.to_thread(
-            PiperSpeech,
-            config.tts.voice,
-            threads=config.tts.threads,
-            length_scale=config.tts.length_scale,
-            speaker_id=config.tts.speaker_id,
-        )
+        # At full loudness: each line is scaled to the loudness wanted (see _speak).
+        self._piper = piper = await asyncio.to_thread(load_on_device_voice, config, volume=1.0)
         self._stack.callback(piper.close)
         puppeteer = None
         if config.motors.enabled:
@@ -99,10 +97,20 @@ class LucysBody:
 
     async def say(self, text: str) -> None:
         tts = self._config.tts
-        await self._speak(text, volume=tts.volume, honks=tts.honks, honk_volume=tts.honk_volume)
+        await self._speak(
+            text,
+            volume=tts.volume,
+            goose_voice=tts.goose_voice,
+            honks=tts.honks,
+            honk_volume=tts.honk_volume,
+        )
 
-    async def try_voice(self, *, volume: float, honks: bool, honk_volume: float) -> None:
-        await self._speak(SAMPLE, volume=volume, honks=honks, honk_volume=honk_volume)
+    async def try_voice(
+        self, *, volume: float, goose_voice: float, honks: bool, honk_volume: float
+    ) -> None:
+        await self._speak(
+            SAMPLE, volume=volume, goose_voice=goose_voice, honks=honks, honk_volume=honk_volume
+        )
 
     async def try_motors(self, motion: MotionSettings) -> None:
         async with self._lock:
@@ -118,10 +126,15 @@ class LucysBody:
             raise ConfigError(f"Lucy's motors are not working: {error}") from error
         self._stack.callback(self._motors.close)
 
-    async def _speak(self, text: str, *, volume: float, honks: bool, honk_volume: float) -> None:
+    async def _speak(
+        self, text: str, *, volume: float, goose_voice: float, honks: bool, honk_volume: float
+    ) -> None:
         if self._piper is None or self._speaker is None:
             raise LucyError("Lucy's voice is not loaded")
-        voice: TextToSpeech = _Louder(self._piper, volume)
+        # At the pace this goose voice needs, which may not be the saved one's.
+        voice: TextToSpeech = _Louder(self._piper.slowed(pitch_ratio(goose_voice)), volume)
+        if goose_voice > 0:
+            voice = GooseVoice(voice, goose_voice)
         if honks:
             voice = HonkingVoice(voice, GooseCalls(voice.sample_rate, volume=honk_volume))
         async with self._lock:
@@ -136,7 +149,9 @@ class SilentBody:
     async def say(self, text: str) -> None:
         log.info("(Lucy would say) %s", text)
 
-    async def try_voice(self, *, volume: float, honks: bool, honk_volume: float) -> None:
+    async def try_voice(
+        self, *, volume: float, goose_voice: float, honks: bool, honk_volume: float
+    ) -> None:
         raise ConfigError("Lucy's voice is not working in setup mode (see the journal)")
 
     async def try_motors(self, motion: MotionSettings) -> None:

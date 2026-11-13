@@ -4,7 +4,7 @@
 #   sudo deploy/install.sh [options]
 #
 #   --i2s-amp              add the MAX98357A I2S amplifier overlay (reboot required)
-#   --motors               Lucy's beak and body motors on a DRV8833: the hardware PWM overlay
+#   --motors               Lucy's beak and body motors on an L293D: the hardware PWM overlay
 #                          (reboot required), PWM access for the gpio group, [motors] enabled
 #   --playback-card NAME   ALSA card id for the speaker   (default: auto-detect)
 #   --capture-card NAME    ALSA card id for the microphone (default: auto-detect)
@@ -157,6 +157,17 @@ enable_section() {
   section_enabled "$name" || warn "could not enable [$name] in $ETC/config.toml; set enabled = true there"
 }
 
+# Lucy's motors used to run on a DRV8833. Its settings would stop an L293D config from loading
+# (unknown settings are errors), so drop them from an older config: the L293D's own settings
+# then take their defaults, which match the wiring in docs/HARDWARE.md.
+drop_drv8833_settings() {
+  local keys='beak_direction_line|body_direction_line|sleep_line'
+  sed -n '/^\[motors\]/,/^\[/p' "$ETC/config.toml" | grep -Eq "^($keys) *=" || return 0
+  sed -i -E "/^\[motors\]/,/^\[/ { /^($keys) *=/d }" "$ETC/config.toml"
+  warn "removed the old DRV8833 motor settings from $ETC/config.toml: Lucy's motors now run on"
+  warn "an L293D, wired as docs/HARDWARE.md shows (pins 15, 16, 18 and 22 changed jobs)"
+}
+
 # The id of an ALSA card with a PCM of the given kind (p = playback, c = capture).
 # USB devices win over the onboard outputs; HDMI audio is never chosen.
 detect_card() {
@@ -242,6 +253,7 @@ install -m 0755 "$REPO_DIR/deploy/bin/lucy" /usr/local/bin/lucy
 log "installing configuration into $ETC"
 install -d -m 0755 "$ETC"
 install_config "$REPO_DIR/deploy/config.toml" "$ETC/config.toml"
+drop_drv8833_settings
 sed -i "s|^voice = \"/opt/lucy/voices/.*\"|voice = \"$PREFIX/voices/$VOICE.onnx\"|" "$ETC/config.toml"
 install -d -m 0700 "$ETC/credentials"
 KEY_FILE="$ETC/credentials/groq_api_key"

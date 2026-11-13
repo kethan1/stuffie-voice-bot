@@ -31,6 +31,11 @@ Latency and power choices:
   request waits the second or so Speechify asks for, once, rather than
   switching voices.
 
+Pace. Lucy's goose voice (:mod:`lucy.core.goose_voice`) raises the pitch of whatever it
+is given, which also speeds it up, so the voice has to speak that much more slowly first
+(``slower``). Speechify takes that as SSML (``<prosody rate="-15%">``), and does not count
+the tags as characters.
+
 Only the text of Lucy's own replies is sent. The child's voice never is.
 """
 
@@ -40,6 +45,7 @@ from collections.abc import AsyncGenerator
 from contextlib import aclosing
 from typing import Any
 from urllib.parse import urlencode
+from xml.sax.saxutils import escape
 
 from lucy.adapters.openai_api import ApiClient, JsonObject
 from lucy.core.audio import SAMPLE_WIDTH, Pcm, amplify
@@ -60,6 +66,7 @@ class SpeechifySpeech:
         voice_id: str,
         model: str = "simba-3.2",
         sample_rate: int = 22_050,
+        slower: float = 1.0,
         volume: float = 1.0,
         timeout_s: float = 2.0,
         part_s: float = 0.1,
@@ -77,6 +84,8 @@ class SpeechifySpeech:
             "output_format": f"pcm_{sample_rate}",
         }
         self._sample_rate = sample_rate
+        # Speaking ``slower`` times as slowly is a rate that much lower, as a whole percentage.
+        self._rate = round((1 / slower - 1) * 100)
         self._volume = volume
         self._timeout_s = timeout_s
         self._part_bytes = max(1, round(part_s * sample_rate)) * SAMPLE_WIDTH
@@ -86,7 +95,7 @@ class SpeechifySpeech:
         return self._sample_rate
 
     async def stream(self, text: str) -> AsyncGenerator[Pcm, None]:
-        payload = {**self._request, "input": text}
+        payload = {**self._request, "input": self._paced(text)}
         if any(ch.isdigit() for ch in text):
             # Says "56" as "fifty-six". It costs a little latency, so only when it is needed.
             payload["options"] = {"text_normalization": True}
@@ -104,6 +113,11 @@ class SpeechifySpeech:
         async with aclosing(self._stream(payload)) as parts:
             async for part in parts:
                 yield part
+
+    def _paced(self, text: str) -> str:
+        if self._rate == 0:
+            return text
+        return f'<speak><prosody rate="{self._rate:+d}%">{escape(text)}</prosody></speak>'
 
     async def _stream(self, payload: dict[str, Any]) -> AsyncGenerator[Pcm, None]:
         pending = bytearray()

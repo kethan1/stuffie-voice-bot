@@ -164,3 +164,31 @@ async def test_real_model_understands_lucys_own_voice() -> None:
         stt.close()
     assert "geese" in text.lower()
     assert "winter" in text.lower()
+
+
+@pytest.mark.skipif(not (STT_MODEL and VOICE), reason="set LUCY_TEST_STT_MODEL and LUCY_TEST_VOICE")
+async def test_real_model_hears_the_words_for_setup_mode() -> None:
+    """Offline, the knock's words are heard by her own ears: whatever they write (it varies:
+    "setup", "set up", "Setup Mode") has to count."""
+    from lucy.adapters.piper_tts import PiperSpeech
+    from lucy.core.knock import asks_for_setup
+    from lucy.core.speech import render
+    from lucy.tools.bench import resample
+
+    assert STT_MODEL is not None
+    assert VOICE is not None
+    tts = PiperSpeech(Path(VOICE), threads=2)
+    stt = FasterWhisperTranscriber(Path(STT_MODEL), threads=2)
+    try:
+        for said in ("Enter into setup mode.", "Enter setup mode.", "Lucy, go into setup mode."):
+            # Two tries: Piper says a sentence a little differently each time, and a small
+            # model now and then mishears one of them.
+            heard = [
+                await stt.transcribe(resample(await render(tts, said), 16_000)) for _ in range(2)
+            ]
+            assert any(asks_for_setup(text) for text in heard), heard
+        question = resample(await render(tts, "Why do geese fly south in the winter?"), 16_000)
+        assert not asks_for_setup(await stt.transcribe(question))
+    finally:
+        tts.close()
+        stt.close()

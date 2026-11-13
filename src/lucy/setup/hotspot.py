@@ -4,8 +4,9 @@ Each goose gets her own name (``Lucy-Setup-4821``) and password, made once by
 ``lucy setup-card`` (the installer runs it) and kept root-only in
 ``/etc/lucy/setup-hotspot.toml``. The card is printed and sewn inside the zipper, where only
 grown-ups go: whoever has it can change Lucy's settings, so children cannot, even if one
-holds her wing while she wakes up. The QR code on it joins the Wi-Fi in one scan, and the
-phone then opens the settings page by itself.
+holds her wing while she wakes up or finds out how to ask for setup mode
+(:mod:`lucy.core.knock`). The QR code on it joins the Wi-Fi in one scan, and the phone then
+opens the settings page by itself.
 """
 
 import html
@@ -124,7 +125,8 @@ def card_html(hotspot: Hotspot) -> str:
   <dl><dt>Wi-Fi</dt><dd>{ssid}</dd><dt>Password</dt><dd>{password}</dd>
   <dt>Settings page</dt><dd>{url}</dd></dl>
   <ol>
-    <li>Hold Lucy's wing while she wakes up, until she says it's setup time. (If she can't
+    <li>Hold Lucy's wing while she wakes up, until she says it's setup time. Or, when she is
+      awake: tap her wing twice, then hold it and say "enter setup mode". (If she can't
       find any Wi-Fi she knows, she starts setup by herself.)</li>
     <li>Scan the code with a phone camera to join her Wi-Fi.</li>
     <li>Her settings page opens by itself. If it doesn't, open {url} in the browser.</li>

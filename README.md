@@ -14,11 +14,19 @@ one to three short, witty sentences, usually starting within about a second.
   natural-sounding voices available (11th of 103 in a blind listening arena).
   It is free for up to 500,000 characters a month, about 3,000 replies, with no
   credit card. Her on-device Piper voice takes over whenever the cloud voice
-  can't speak, so she never goes silent. When she says "Honk!" you hear a goose
-  call, not the word read aloud.
+  can't speak, so she never goes silent.
+* **A goose, through and through:** whichever voice speaks, it goes through her
+  goose voice: higher and smaller, honky, and raspy as she starts each phrase,
+  while every word stays clear. She honks a lot (never in a sad or serious
+  answer), and when she says "Honk!" you hear a goose call, not the word read
+  aloud: the low growl, the break, and the short bright honk of a Canada goose,
+  synthesised on the Pi from measurements of real ones.
+* **Louder or quieter on request:** "Louder!", "speak up", "too loud", or "use
+  your indoor voice" changes her volume at once, chimes included. She goes back
+  to her usual loudness when she is turned off.
 * **Alive:** her beak opens and shuts in time with every syllable, and her body
   flaps whenever she honks and bobs as she starts each phrase. Two small motors
-  on a DRV8833 driver follow the sound itself, as it reaches the speaker. She
+  on an L293D driver follow the sound itself, as it reaches the speaker. She
   keeps still while she listens, and if the motors aren't wired she simply
   talks without them.
 * **Fast:** everything streams. Lucy starts speaking her first sentence while
@@ -43,8 +51,9 @@ one to three short, witty sentences, usually starting within about a second.
   by the systemd watchdog if wedged, and supports a read-only root filesystem
   for power yanks.
 * **Set up from a phone:** no SSH, keyboard, or monitor after the first install.
-  Hold her wing while she wakes up (or take her somewhere with no Wi-Fi she
-  knows) and she turns on her own Wi-Fi. Scanning the card sewn inside her
+  Hold her wing while she wakes up, or tap it twice and then hold it and say
+  "enter setup mode" (or take her somewhere with no Wi-Fi she knows), and she
+  turns on her own Wi-Fi. Scanning the card sewn inside her
   zipper opens her settings page on a phone, where a grown-up picks a network,
   changes her settings and API keys, and tries her voice and motors. She says
   out loud whether a network worked, and puts everything back if it did not.
@@ -163,7 +172,7 @@ src/lucy/
   core/          pure logic: controller (state machine), pipeline (streaming turn),
                  chunker, text cleaning, safety screen, conversation, phrases, motion, ports
   adapters/      Groq/OpenAI-compatible HTTP, Speechify, Piper, PortAudio, libgpiod,
-                 motors (DRV8833 on hardware PWM), power knobs
+                 motors (L293D on hardware PWM), power knobs
   platform/      systemd notify/watchdog, journald-aware logging
   tools/         `lucy doctor`, `lucy bench`
   setup/         setup mode: her own Wi-Fi hotspot, the settings page, NetworkManager

@@ -1,6 +1,7 @@
 import io
 import wave
 
+import numpy as np
 import pytest
 
 from lucy.core.audio import (
@@ -53,6 +54,15 @@ class TestPcm:
         audio = chime([(440.0, 0.05), (880.0, 0.05)], 22_050)
         assert audio.duration == pytest.approx(0.1, abs=1e-3)
         assert audio.cues == (Cue(CueKind.CHIME, 0.0, audio.duration),)  # not Lucy's voice
+
+    def test_chime_peaks_at_its_volume_with_a_brighter_overtone(self) -> None:
+        plain = chime([(587.0, 0.06)], 22_050, volume=0.6)
+        bright = chime([(587.0, 0.06)], 22_050, volume=0.6, overtone=0.35)
+        for audio in (plain, bright):
+            assert np.abs(audio.samples()).max() / 32767 == pytest.approx(0.6, abs=0.01)
+        spectrum = np.abs(np.fft.rfft(bright.samples().astype(float)))
+        freqs = np.fft.rfftfreq(bright.frames, 1 / 22_050)
+        assert spectrum[np.abs(freqs - 1174) < 40].max() > 0.2 * spectrum.max()  # the octave
 
 
 class TestCues:

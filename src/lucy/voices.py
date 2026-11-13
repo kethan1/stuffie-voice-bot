@@ -1,7 +1,7 @@
 """Assembling Lucy's voice: Speechify in the cloud, with Piper on the Pi standing in.
 
-Whichever voice speaks, an interjected "Honk!" becomes a goose call
-(:mod:`lucy.core.honk`).
+Whichever voice speaks, it goes through Lucy's goose voice (:mod:`lucy.core.goose_voice`),
+and an interjected "Honk!" becomes a goose call (:mod:`lucy.core.honk`).
 
 Piper is always loaded. It speaks whenever the cloud voice cannot (no network,
 no free characters left, a failing service), and it is Lucy's only voice when
@@ -18,6 +18,7 @@ from lucy.adapters.openai_api import ApiClient
 from lucy.adapters.piper_tts import PiperSpeech
 from lucy.adapters.speechify_tts import SpeechifySpeech
 from lucy.config import Config, read_api_key
+from lucy.core.goose_voice import GooseVoice, pitch_ratio
 from lucy.core.honk import GooseCalls, HonkingVoice
 from lucy.core.ports import Prewarmable, TextToSpeech
 from lucy.core.speech import FallbackVoice
@@ -52,19 +53,27 @@ class Voice:
         self.on_device.close()
 
 
-def load_on_device_voice(config: Config) -> PiperSpeech:
-    """Load Piper (blocking: reads the model and builds the onnxruntime session)."""
+def load_on_device_voice(config: Config, *, volume: float | None = None) -> PiperSpeech:
+    """Load Piper (blocking: reads the model and builds the onnxruntime session).
+
+    It speaks more slowly by as much as the goose voice will speed it up, so Lucy keeps her
+    usual pace. ``volume`` replaces ``tts.volume`` (setup mode tries loudnesses itself).
+    """
     return PiperSpeech(
         config.tts.voice,
         threads=config.tts.threads,
         length_scale=config.tts.length_scale,
-        volume=config.tts.volume,
+        slower=pitch_ratio(config.tts.goose_voice),
+        volume=config.tts.volume if volume is None else volume,
         speaker_id=config.tts.speaker_id,
     )
 
 
-def with_honks(config: Config, tts: TextToSpeech) -> TextToSpeech:
-    """``tts``, calling each interjected "Honk!" as a goose would (unless ``tts.honks`` is off)."""
+def as_goose(config: Config, tts: TextToSpeech) -> TextToSpeech:
+    """``tts`` through Lucy's goose voice, then calling each interjected "Honk!" as a goose
+    would (unless ``tts.honks`` is off)."""
+    if config.tts.goose_voice > 0:
+        tts = GooseVoice(tts, config.tts.goose_voice)
     if not config.tts.honks:
         return tts
     return HonkingVoice(tts, GooseCalls(tts.sample_rate, volume=config.tts.honk_volume))
@@ -98,15 +107,16 @@ def build_voice(config: Config, on_device: PiperSpeech) -> Voice:
     on_device_name = config.tts.voice.stem
     api = connect_cloud_voice(config)
     if api is None:
-        return Voice(with_honks(config, on_device), on_device, on_device_name)
+        return Voice(as_goose(config, on_device), on_device, on_device_name)
     cloud = SpeechifySpeech(
         api,
         voice_id=settings.voice_id,
         model=settings.model,
         sample_rate=on_device.sample_rate,
+        slower=pitch_ratio(config.tts.goose_voice),  # as the on-device voice is
         volume=settings.volume,
         timeout_s=settings.timeout_s,
     )
     fallback = FallbackVoice(cloud, on_device, available=api.reachable, rest_s=settings.rest_s)
     name = f"Speechify {settings.voice_id}, backed by {on_device_name}"
-    return Voice(with_honks(config, fallback), on_device, name, cloud, api, fallback)
+    return Voice(as_goose(config, fallback), on_device, name, cloud, api, fallback)

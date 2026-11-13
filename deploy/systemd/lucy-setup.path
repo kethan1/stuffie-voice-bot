@@ -1,5 +1,7 @@
 [Unit]
-Description=Start Lucy's setup mode when she asks for it (her wing held while she wakes up)
+Description=Start Lucy's setup mode when she asks for it
+# She asks when her wing is held while she wakes up, or when it is tapped twice and then
+# held while a grown-up says "enter setup mode".
 Documentation=file:///opt/lucy/src/docs/OPERATIONS.md
 
 [Path]

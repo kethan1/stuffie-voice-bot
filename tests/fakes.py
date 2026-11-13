@@ -108,8 +108,12 @@ class FakeSpeaker:
         self.queued: list[tuple[Pcm, asyncio.Future[None]]] = []
         self.opened = 0
         self.closed = 0
+        self.volume_db = 0.0
         self._worker: asyncio.Task[None] | None = None
         self._wake = asyncio.Event()
+
+    def set_volume(self, db: float) -> None:
+        self.volume_db = db
 
     def enqueue(self, audio: Pcm) -> asyncio.Future[None]:
         future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
@@ -241,11 +245,13 @@ class FakeResponder:
         self.respond_s = respond_s
         self.say_s = say_s
         self.recordings: list[Pcm] = []
+        self.knocks: list[bool] = []
         self.said: list[Phrase] = []
         self.cancelled = 0
 
-    async def respond(self, recording: Pcm, timer: TurnTimer) -> None:
+    async def respond(self, recording: Pcm, timer: TurnTimer, *, knocked: bool = False) -> None:
         self.recordings.append(recording)
+        self.knocks.append(knocked)
         try:
             await asyncio.sleep(self.respond_s)
         except asyncio.CancelledError:
@@ -259,3 +265,16 @@ class FakeResponder:
         except asyncio.CancelledError:
             self.cancelled += 1
             raise
+
+
+class FakeSetup:
+    """Stands in for setup mode as Lucy asks for it (lucy.app.SetupHandover)."""
+
+    def __init__(self, *, available: bool = True, starts: bool = True) -> None:
+        self.available = available
+        self.starts = starts
+        self.asked = 0
+
+    async def start(self) -> bool:
+        self.asked += 1
+        return self.starts

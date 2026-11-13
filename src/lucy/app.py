@@ -6,6 +6,7 @@ port. Everything below it receives its collaborators through its constructor.
 
 import asyncio
 import contextlib
+import dataclasses
 import logging
 import os
 import signal
@@ -29,6 +30,7 @@ from lucy.core.ports import Button, Indicator, PowerControl
 from lucy.core.safety import AllowAll, ReplyFilter, SafetyScreen
 from lucy.core.tasks import BackgroundTasks
 from lucy.core.types import PowerMode, Status
+from lucy.core.volume import Volume
 from lucy.motors import start_motion
 from lucy.persona import LUCY
 from lucy.platform.systemd import SystemdNotifier
@@ -146,6 +148,7 @@ async def run(config: Config, *, keyboard: bool = False) -> int:
         stack.push_async_callback(power.restore)
 
         conversation = Conversation(config.llm.history_exchanges)
+        handover = SetupHandover(stop)
         phrases = PhraseBook(LUCY.lines, tts)
         voice.on_recovery(phrases.forget)  # lines cached in the on-device voice: render again
         pipeline = TurnPipeline(
@@ -160,8 +163,13 @@ async def run(config: Config, *, keyboard: bool = False) -> int:
             phrases=phrases,
             conversation=conversation,
             system_prompt=system_prompt,
-            settings=config.turn,
+            # With honks off she would say the word, so she leaves honking to the model.
+            settings=config.turn
+            if config.tts.honks
+            else dataclasses.replace(config.turn, opening_honk_chance=0.0),
             reply_screen=ReplyFilter() if config.safety.screen else None,
+            volume=Volume(speaker, config.volume),
+            setup=handover if config.setup.enabled and config.setup.voice_command else None,
         )
         controller = Controller(
             pipeline=pipeline,
@@ -171,7 +179,7 @@ async def run(config: Config, *, keyboard: bool = False) -> int:
             power=power,
             conversation=conversation,
             warmers=[cloud.api, *voice.warmers],
-            earcons=Earcons.generate(tts.sample_rate),
+            earcons=Earcons.generate(tts.sample_rate, volume=config.session.earcon_volume),
             settings=config.session,
         )
         stack.push_async_callback(controller.close)
@@ -189,22 +197,28 @@ async def run(config: Config, *, keyboard: bool = False) -> int:
             voice.name,
             "moving" if puppeteer is not None else "keeping still",
         )
-        if await _hand_over_to_setup(config, button, pipeline, stop, notifier):
+        if await _hand_over_to_setup(config, button, pipeline, handover, notifier):
             return 0
-        serving = asyncio.create_task(controller.run(button), name="controller")
-        stopping = asyncio.create_task(stop.wait(), name="stop")
-        await asyncio.wait({serving, stopping}, return_when=asyncio.FIRST_COMPLETED)
-        stopping.cancel()
-        exit_code = 0
-        if serving.done():
-            exit_code = await _explain_failure(serving, pipeline)
-        else:
-            serving.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await serving
+        exit_code = await _serve(controller, button, pipeline, stop)
         notifier.stopping()
         log.info("Lucy is going to sleep")
     return exit_code
+
+
+async def _serve(
+    controller: Controller, button: Button, pipeline: TurnPipeline, stop: asyncio.Event
+) -> int:
+    """Answer the wing button until Lucy is told to stop. Returns the exit code."""
+    serving = asyncio.create_task(controller.run(button), name="controller")
+    stopping = asyncio.create_task(stop.wait(), name="stop")
+    await asyncio.wait({serving, stopping}, return_when=asyncio.FIRST_COMPLETED)
+    stopping.cancel()
+    if serving.done():
+        return await _explain_failure(serving, pipeline)
+    serving.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await serving
+    return 0
 
 
 @runtime_checkable
@@ -220,25 +234,72 @@ starts lucy-setup.service, which stops Lucy while it runs and wakes her afterwar
 SETUP_HANDOVER_S = 30.0
 
 
+def _setup_request(environ: Mapping[str, str]) -> Path | None:
+    """The file that asks for setup mode. None if Lucy is not running as lucy.service."""
+    runtime = environ.get("RUNTIME_DIRECTORY")  # set by RuntimeDirectory= in lucy.service
+    return Path(runtime.split(":")[0]) / SETUP_REQUEST if runtime else None
+
+
 def request_setup(environ: Mapping[str, str] = os.environ) -> bool:
     """Ask systemd for setup mode. False if Lucy is not running as lucy.service."""
-    runtime = environ.get("RUNTIME_DIRECTORY")  # set by RuntimeDirectory= in lucy.service
-    if not runtime:
+    request = _setup_request(environ)
+    if request is None:
         log.warning("setup mode can only start when Lucy runs as lucy.service")
         return False
     try:
-        (Path(runtime.split(":")[0]) / SETUP_REQUEST).touch()
+        request.touch()
     except OSError as error:
         log.warning("could not ask for setup mode: %s", error)
         return False
     return True
 
 
+class SetupHandover:
+    """Lucy's way into setup mode while she is running: the pipeline's
+    :class:`~lucy.core.ports.SetupStarter`.
+
+    She asks systemd for it, and systemd stops her to make way: ``stop`` is set when that
+    happens. Used when her wing is held as she wakes up, and when a grown-up asks with the
+    knock (:mod:`lucy.core.knock`).
+    """
+
+    def __init__(
+        self,
+        stop: asyncio.Event,
+        environ: Mapping[str, str] = os.environ,
+        *,
+        wait_s: float = SETUP_HANDOVER_S,
+    ) -> None:
+        self._stop = stop
+        self._environ = environ
+        self._wait_s = wait_s
+
+    @property
+    def available(self) -> bool:
+        return _setup_request(self._environ) is not None
+
+    async def start(self) -> bool:
+        """Ask for setup mode and wait to be stopped for it. False if nothing came of it."""
+        if not request_setup(self._environ):
+            return False
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(self._stop.wait(), self._wait_s)  # systemd stops Lucy
+        if self._stop.is_set():
+            return True
+        log.warning("setup mode did not start (is lucy-setup.path installed and running?)")
+        request = _setup_request(self._environ)
+        if request is not None:
+            # Taken back, so that it cannot start setup mode out of the blue later on.
+            with contextlib.suppress(OSError):
+                request.unlink(missing_ok=True)
+        return False
+
+
 async def _hand_over_to_setup(
     config: Config,
     button: Button,
     pipeline: TurnPipeline,
-    stop: asyncio.Event,
+    handover: SetupHandover,
     notifier: SystemdNotifier,
 ) -> bool:
     """If her wing is held while she wakes up, hand over to setup mode. True once stopped."""
@@ -254,14 +315,11 @@ async def _hand_over_to_setup(
     log.info("wing held while waking up: asking for setup mode")
     with contextlib.suppress(LucyError):
         await pipeline.say(Phrase.SETUP)
-    if request_setup():
-        with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(stop.wait(), SETUP_HANDOVER_S)  # systemd stops Lucy
-    if stop.is_set():
+    if await handover.start():
         notifier.stopping()
         log.info("Lucy is resting while setup mode runs")
         return True
-    log.warning("setup mode did not start; carrying on as usual")
+    log.warning("carrying on as usual, without setup mode")
     return False
 
 

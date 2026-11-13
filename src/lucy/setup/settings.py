@@ -69,12 +69,42 @@ SECTIONS = (
                 2,
                 0.05,
             ),
+            Field(
+                "tts.goose_voice",
+                "Goose voice",
+                float,
+                "How much like a goose she sounds: 0 is her plain voice. Try it with Hear her.",
+                0,
+                1,
+                0.05,
+            ),
             Field("tts.honks", "Honk like a real goose", bool, "Off: she says the word."),
             Field(
                 "tts.honk_volume", "Honk loudness", float, "1 is as loud as her voice.", 0, 2, 0.05
             ),
             Field("session.greet_on_start", "Say hello when she wakes up", bool),
             Field("session.earcons", "Chime when she starts and stops listening", bool),
+            Field(
+                "session.earcon_volume",
+                "Chime loudness",
+                float,
+                "1 is a little louder than her voice.",
+                0,
+                1.5,
+                0.05,
+            ),
+            Field(
+                "volume.commands",
+                "Children can ask her to talk louder or quieter",
+                bool,
+                "She goes back to her usual loudness when she is turned off.",
+            ),
+            Field(
+                "setup.voice_command",
+                "Setup mode can be started by voice",
+                bool,
+                'Tap her wing twice, then hold it and say "enter setup mode".',
+            ),
             Field(
                 "session.awake_s",
                 "Stay quick to answer for (seconds)",

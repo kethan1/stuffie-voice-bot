@@ -39,7 +39,7 @@ sudo reboot
 | Option | Use it when |
 |---|---|
 | `--i2s-amp` | You wired the MAX98357A amplifier |
-| `--motors` | You wired the beak and body motors to a DRV8833 (HARDWARE.md, "Motors"). Adds the hardware PWM overlay, lets the `gpio` group use PWM, and turns on `[motors]` |
+| `--motors` | You wired the beak and body motors to an L293D (HARDWARE.md, "Motors"). Adds the hardware PWM overlay, lets the `gpio` group use PWM, and turns on `[motors]` |
 | `--playback-card ID`, `--capture-card ID` | Auto-detection picked the wrong sound card (`aplay -l`, `arecord -l`) |
 | `--voice en_US-hfc_female-medium` | You want a different on-device (backup) Piper voice |
 | `--tune` | Always, for a finished toy: boot-time power savings, unused services off, journal in RAM |
@@ -127,6 +127,12 @@ grown-ups go: whoever has it can change her settings.
 
 * Hold her wing while she wakes up: plug her in and keep squeezing until she
   says "Setup time!"
+* While she is awake, knock and ask: tap her wing twice, quickly, then squeeze
+  it and hold while you say "enter setup mode", and let go. She says "Setup
+  time!" It takes both halves. The words without the taps are a question like
+  any other, and the taps without the words are an ordinary turn, so children
+  do not start it by accident. She has to hear the words, so this needs Wi-Fi
+  (or her offline brain, section 4).
 * Take her somewhere with no Wi-Fi she knows. About 90 seconds after she
   wakes up, she starts setup mode by herself.
 * Over SSH: `sudo lucy setup`.
@@ -147,7 +153,7 @@ grown-ups go: whoever has it can change her settings.
      from there, a network with no way to the internet), forgets it, and
      turns her setup Wi-Fi back on within a minute: join it again to retry.
      The networks she already knew are never touched by a failed attempt.
-   * **Lucy** and **Motors:** her voice and loudness, honks, how long she
+   * **Lucy** and **Motors:** her voice, her goose voice, loudness, honks, chimes, how long she
      stays quick to answer, the questions-per-hour limit, and the beak and
      body powers. **Hear her** and **Test motors** try the numbers on the
      page before you save them.
@@ -184,6 +190,7 @@ says so.
 |---|---|---|
 | `enabled` | `true` | Setup mode at all |
 | `hold_to_start_s` | `3.0` | How long the wing must stay held once she is awake; `0` turns the gesture off |
+| `voice_command` | `true` | Two taps, then holding her wing and saying "enter setup mode", starts it while she is awake (also on her settings page) |
 | `when_offline` | `true` | Start by herself when no network connects after boot. Turn it off if she runs offline on purpose (`--local-backup` with no Wi-Fi) |
 | `offline_wait_s` | `90.0` | How long after boot she waits for a network |
 | `idle_timeout_s` | `600.0` | How long setup mode waits with nothing happening |
@@ -218,6 +225,10 @@ All settings are in `/etc/lucy/config.toml` (documented inline).
 | A different voice | `sudo lucy voices`, then `tts.cloud.voice_id` |
 | Both voices equally loud | `tts.cloud.volume` (cloud) or `tts.volume` (on-device) |
 | Softer honks, or the word instead of the goose call | `tts.honk_volume = 0.6`; `tts.honks = false` |
+| More or less of a goose voice | `tts.goose_voice`: 0 is her plain voice, 1 the most goose-like (default 0.7: higher, honky, and raspy, with every word still clear). In setup mode, **Hear her** tries a value before you save it |
+| More or fewer honks | `turn.opening_honk_chance` (0 to 1): how often she starts a reply with a honk of her own. The prompt asks for honks in most answers too |
+| Louder or softer chimes | `session.earcon_volume` (1 is a little louder than her voice) |
+| Children may not change her volume, or not as much | `volume.commands = false`; or a smaller range with `volume.max_db` and `volume.min_db` |
 | Longer or shorter answers | A `system_prompt_file` with a different length rule (the built-in prompt asks for at most 40 words) |
 | Faster first word from the on-device voice | `turn.first_clause_min_words = 4` (the first sentence may be split at a comma, which sounds less natural); a `-low` Piper voice |
 | Longer battery life | Shorter `session.awake_s`; `power.standby_governor = "powersave"` |
@@ -263,19 +274,22 @@ installed and up to date without `--local-backup`.
 | Button does nothing | Wiring or pin number | `lucy doctor`; `gpioinfo` shows `lucy-button` on line 17 |
 | `CPU governor ... not writable` in doctor | Service never started since boot | Start it once; its `ExecStartPre` grants access |
 | Lucy "thinks on her own" though the Wi-Fi works | Groq is blocked (firewall, DNS) | `curl -sI https://api.groq.com`; the next press re-checks automatically |
+| Lucy is much louder or quieter than usual | A child asked her to ("louder", "too loud") | Ask her ("quieter"), or `sudo systemctl restart lucy`: she always wakes up at her usual loudness |
 | Lucy sounds robotic | Her cloud voice is unavailable, so the on-device voice speaks: no Speechify key, the month's free characters are used up, or Speechify is blocked | `lucy doctor` ("cloud voice"); `journalctl -u lucy -g "cloud voice"`; usage at <https://platform.speechify.ai/usage> |
 | Lucy stops mid-answer and changes the subject | Speechify's content screen refused a sentence | Working as intended. The journal shows `ContentRefused` |
 | Offline: "Can a grown-up check the Wi-Fi?" | The offline brain is not running | `systemctl status ollama`; `ollama list` should show `gemma3:1b`; `sudo lucy doctor` |
 | Journal: `local brain is not ready` | Ollama started after Lucy, or the model is missing | `sudo ollama pull gemma3:1b && sudo systemctl restart lucy` |
 | Journal: `Lucy will keep still: her motors are not working` | No PWM overlay (needs a reboot after `--motors`), a line in use, or no permission | `sudo lucy doctor` ("motors") says which; `ls /sys/class/pwm` should show `pwmchip0` |
 | `lucy motors`: "cannot claim GPIO … Device or resource busy" | The service holds the lines | `sudo systemctl stop lucy` first |
-| A motor turns the wrong way | Its two wires are swapped | Swap them at the driver's AOUT/BOUT terminals |
-| The beak barely moves, or only on loud words | Not enough power to beat its spring | Raise `motors.motion.beak_min_power`, or use a weaker spring |
-| Motors do nothing, but `lucy motors` gives no error | Motor battery off or flat, no shared ground, or SLP not reaching the Pi | Check the battery switch, the GND link between Pi and driver, and `motors.sleep_line` |
+| A motor turns the wrong way | Its two wires are swapped | Swap them at the L293D's outputs (1Y/2Y for the beak, 3Y/4Y for the body) |
+| The beak barely moves, or only on loud words | Not enough power to beat its spring (the L293D loses about 2 V) | Raise `motors.motion.beak_min_power`, charge the motor battery, or use a weaker spring |
+| Motors do nothing, but `lucy motors` gives no error | Motor battery off or flat, no shared ground, or no logic supply | Check the battery switch, the GND link between the Pi and the L293D, and that its VCC1 (pin 16) has the Pi's 5 V |
 | A motor stops for a moment in a long sentence | The `max_hold_s` safety rest | Working as intended: no motor runs more than 2 s without a pause |
 | "Setup time!", then "I couldn't turn on my setup Wi-Fi" | NetworkManager could not start the hotspot. Most often the Wi-Fi country is not set | `journalctl -u lucy-setup -e`; set the country with `sudo raspi-config nonint do_wifi_country GB` (your country's code) |
 | The phone joined her setup Wi-Fi, but no page opened | The phone skipped its sign-in check | Open <http://10.42.0.1> in the browser |
 | Holding her wing at wake-up does nothing | Setup mode is not installed (no NetworkManager), or `setup.hold_to_start_s = 0` | `systemctl status lucy-setup.path`; re-run the installer |
+| Tap, tap, hold, "enter setup mode" gets an ordinary answer | She did not take it for the knock (each tap under 0.3 s, and no more than 0.7 s between them and before the squeeze), she heard other words, or `setup.voice_command = false` | `journalctl -u lucy -g knock` shows each knock she noticed. Tap quicker, or raise `session.tap_gap_s`. `turn.log_transcripts = true` shows what she heard |
+| "I can't start my setup mode right now" | Setup mode is not installed (no NetworkManager), or Lucy is not running as her service | `systemctl status lucy-setup.path`; re-run the installer |
 | She starts setup mode at every boot | No Wi-Fi she knows is in range | Add one in setup mode, or set `setup.when_offline = false` |
 | Changes from setup mode are gone after unplugging her | With `--read-only`, copying them to the SD card failed | `journalctl -u lucy-setup -g lucy-persist` |
 

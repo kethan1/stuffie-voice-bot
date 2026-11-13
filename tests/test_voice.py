@@ -7,10 +7,12 @@ import numpy as np
 import pytest
 
 from lucy.adapters.openai_api import ApiClient
+from lucy.adapters.piper_tts import slowed_length_scale
 from lucy.adapters.speechify_tts import SpeechifySpeech
 from lucy.config import Config, ConfigError, load_config
 from lucy.core.audio import Pcm
 from lucy.core.errors import ContentRefused, RateLimited, ServiceError, ServiceUnreachable
+from lucy.core.goose_voice import GooseVoice
 from lucy.core.honk import HonkingVoice
 from lucy.core.speech import FallbackVoice, render
 from lucy.voices import build_voice
@@ -74,6 +76,22 @@ class TestSpeechify:
 
         await parts_of(speechify(handler), "Seven times eight is 56.")
         assert bodies[0]["options"] == {"text_normalization": True}
+
+    async def test_speaks_more_slowly_for_the_goose_voice(self) -> None:
+        bodies: list[dict[str, object]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            bodies.append(json.loads(request.content))
+            return httpx.Response(200, content=b"\x00\x00")
+
+        # 1.175 times as slowly is 85% of the usual rate. The text becomes SSML, so it is
+        # escaped: a stray "<" or "&" must not be read as a tag.
+        await parts_of(speechify(handler, slower=1.175), "Is 3 < 5? Yes & no.")
+        await parts_of(speechify(handler, slower=1.0), "Is 3 < 5? Yes & no.")
+        assert bodies[0]["input"] == (
+            '<speak><prosody rate="-15%">Is 3 &lt; 5? Yes &amp; no.</prosody></speak>'
+        )
+        assert bodies[1]["input"] == "Is 3 < 5? Yes & no."  # at her usual pace: plain text
 
     async def test_volume(self) -> None:
         loud = Pcm.from_float(np.full(40, 0.5), PCM_RATE).data
@@ -247,6 +265,26 @@ class TestFallbackVoice:
             FallbackVoice(other, FakeTTS())
 
 
+class TestPiperPace:
+    """Piper's length scale slows it by less than it says: ``slower`` asks for what is meant."""
+
+    def test_no_change_is_no_change(self) -> None:
+        assert slowed_length_scale(1.0, 1.0) == 1.0
+        assert slowed_length_scale(1.15, 1.0) == 1.15
+        assert slowed_length_scale(3.0, 1.0) == 3.0  # even beyond what was measured
+
+    def test_asks_for_more_than_the_ratio_to_get_the_ratio(self) -> None:
+        # Measured: a length scale of 1.3 makes speech about 1.19 times as long.
+        assert slowed_length_scale(1.0, 1.19) == pytest.approx(1.3, abs=0.005)
+        assert slowed_length_scale(1.0, 1.175) == pytest.approx(1.28, abs=0.005)
+        assert slowed_length_scale(1.0, 1.25) == pytest.approx(1.375, abs=0.005)
+
+    def test_slows_from_the_pace_she_is_set_to(self) -> None:
+        # From 1.2 (really 1.115 times as long) to 1.21 times that: 1.35 times as long.
+        assert slowed_length_scale(1.2, 1.21) == pytest.approx(1.5, abs=0.01)
+        assert slowed_length_scale(1.0, 1.1) < slowed_length_scale(1.0, 1.2)
+
+
 def piper_at(rate: int = 22_050) -> FakeTTS:
     piper = FakeTTS()
     piper.sample_rate = rate
@@ -263,7 +301,7 @@ class TestBuildVoice:
     @staticmethod
     def config(tmp_path: Path, toml: str = "") -> Config:
         path = tmp_path / "c.toml"
-        path.write_text("[tts]\nhonks = false\n" + toml)
+        path.write_text("[tts]\nhonks = false\ngoose_voice = 0.0\n" + toml)
         return load_config(path)
 
     async def test_without_a_key_the_on_device_voice_speaks(self, tmp_path: Path) -> None:
@@ -276,6 +314,11 @@ class TestBuildVoice:
         voice = build_voice(load_config(None), piper_at())  # type: ignore[arg-type]
         assert isinstance(voice.tts, HonkingVoice)
 
+    async def test_speaks_with_her_goose_voice_inside_the_honks(self) -> None:
+        voice = build_voice(load_config(None), piper_at())  # type: ignore[arg-type]
+        assert isinstance(voice.tts, HonkingVoice)
+        assert isinstance(voice.tts._tts, GooseVoice)  # honks are goose calls already
+
     async def test_with_a_key_the_cloud_voice_speaks_first(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -286,6 +329,20 @@ class TestBuildVoice:
             assert voice.cloud is not None
             assert voice.cloud.sample_rate == 22_050  # the speaker plays either voice
             assert voice.warmers == (voice.api,)
+        finally:
+            assert voice.api is not None
+            await voice.api.aclose()
+
+    async def test_the_cloud_voice_slows_down_by_what_the_goose_voice_speeds_up(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SPEECHIFY_API_KEY", "sk-test")
+        path = tmp_path / "c.toml"
+        path.write_text("[tts]\ngoose_voice = 0.7\n")
+        voice = build_voice(load_config(path), piper_at())  # type: ignore[arg-type]
+        try:
+            assert voice.cloud is not None
+            assert voice.cloud._paced("Hi.") == '<speak><prosody rate="-15%">Hi.</prosody></speak>'
         finally:
             assert voice.api is not None
             await voice.api.aclose()

@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import random
 from collections.abc import AsyncGenerator
 
 import pytest
@@ -12,8 +13,18 @@ from lucy.core.phrases import Phrase, PhraseBook
 from lucy.core.pipeline import SCREENED, Brain, TurnPipeline, TurnSettings, phrase_for
 from lucy.core.safety import ReplyFilter, SafetyScreen
 from lucy.core.types import Concern, Role, Status
+from lucy.core.volume import Volume, VolumeSettings
 from lucy.persona import LUCY
-from tests.fakes import FakeChat, FakeIndicator, FakeSpeaker, FakeSTT, FakeTTS, tone, until
+from tests.fakes import (
+    FakeChat,
+    FakeIndicator,
+    FakeSetup,
+    FakeSpeaker,
+    FakeSTT,
+    FakeTTS,
+    tone,
+    until,
+)
 
 
 class Rig:
@@ -27,6 +38,9 @@ class Rig:
         tts: FakeTTS | None = None,
         reply_screen: ReplyFilter | None = None,
         log_transcripts: bool = False,
+        volume: VolumeSettings | None = None,
+        setup: FakeSetup | None = None,
+        opening_honk_chance: float = 0.0,
     ) -> None:
         self.stt = stt or FakeSTT()
         self.chat = chat or FakeChat()
@@ -50,14 +64,20 @@ class Rig:
             conversation=self.conversation,
             system_prompt=LUCY.system_prompt,
             settings=TurnSettings(
-                sentence_pause_s=0.0, clause_pause_s=0.0, log_transcripts=log_transcripts
+                sentence_pause_s=0.0,
+                clause_pause_s=0.0,
+                log_transcripts=log_transcripts,
+                opening_honk_chance=opening_honk_chance,  # off, except to test her own honks
             ),
             reply_screen=reply_screen,
+            volume=Volume(self.speaker, volume) if volume is not None else None,
+            setup=setup,
+            rng=random.Random(7),
         )
         self.timer = TurnTimer()
 
-    async def respond(self, recording: Pcm | None = None) -> None:
-        await self.pipeline.respond(recording or tone(1.0), self.timer)
+    async def respond(self, recording: Pcm | None = None, *, knocked: bool = False) -> None:
+        await self.pipeline.respond(recording or tone(1.0), self.timer, knocked=knocked)
 
     def spoken_phrase(self, phrase: Phrase) -> bool:
         return any(text in LUCY.lines[phrase] for text in self.tts.texts)
@@ -84,7 +104,7 @@ async def test_streamed_sentences_play_part_by_part() -> None:
 
 async def test_pauses_follow_each_sentence() -> None:
     rig = Rig()
-    rig.pipeline._settings = TurnSettings(sentence_pause_s=0.01)
+    rig.pipeline._settings = TurnSettings(sentence_pause_s=0.01, opening_honk_chance=0.0)
     await rig.respond()
     assert [any(clip.data) for clip in rig.speaker.played] == [True, False] * 3
 
@@ -340,3 +360,146 @@ async def test_without_a_backup_an_outage_is_reported() -> None:
     assert len(rig.stt.calls) == 1  # with no backup, the cloud is still tried
     assert rig.spoken_phrase(Phrase.OFFLINE)
     assert not rig.spoken_phrase(Phrase.OWN_BRAIN)
+
+
+class TestVolumeRequests:
+    async def test_lucy_gets_louder_and_says_so_without_asking_the_model(self) -> None:
+        rig = Rig(stt=FakeSTT("Lucy, can you talk a little louder?"), volume=VolumeSettings())
+        await rig.respond()
+        assert rig.speaker.volume_db == 3.0
+        assert rig.chat.calls == []
+        assert rig.spoken_phrase(Phrase.LOUDER)
+        heard, said = rig.conversation.prompt("", "next")[1:3]
+        assert heard.content == "Lucy, can you talk a little louder?"
+        assert said.content in LUCY.lines[Phrase.LOUDER]
+
+    async def test_says_when_she_is_as_quiet_as_she_goes(self) -> None:
+        rig = Rig(stt=FakeSTT("too loud"), volume=VolumeSettings(step_db=3, min_db=-6))
+        for _ in range(3):
+            await rig.respond()
+        assert rig.speaker.volume_db == -6.0
+        assert rig.tts.texts[-1] in LUCY.lines[Phrase.QUIETEST]
+
+    async def test_a_question_about_loudness_goes_to_the_model(self) -> None:
+        rig = Rig(stt=FakeSTT("Which is louder, a lion or a whale?"), volume=VolumeSettings())
+        await rig.respond()
+        assert rig.speaker.volume_db == 0.0
+        assert len(rig.chat.calls) == 1
+
+    async def test_requests_go_to_the_model_when_children_may_not_change_it(self) -> None:
+        rig = Rig(stt=FakeSTT("louder"), volume=VolumeSettings(commands=False))
+        await rig.respond()
+        assert rig.speaker.volume_db == 0.0
+        assert len(rig.chat.calls) == 1
+
+    async def test_the_safety_screen_comes_first(self) -> None:
+        rig = Rig(stt=FakeSTT("talk louder, I am going to hurt myself"), volume=VolumeSettings())
+        await rig.respond()
+        assert rig.speaker.volume_db == 0.0
+        assert rig.spoken_phrase(Phrase.TELL_A_GROWN_UP)
+
+
+class TestSetupByVoice:
+    """After the knock (two taps, then the squeeze), "enter setup mode" starts setup mode."""
+
+    async def test_the_knock_and_the_words_start_setup_mode(self) -> None:
+        setup = FakeSetup()
+        rig = Rig(stt=FakeSTT("Enter into setup mode."), setup=setup)
+        await rig.respond(knocked=True)
+        assert setup.asked == 1
+        assert rig.tts.texts == list(LUCY.lines[Phrase.SETUP])  # said in full, then she asks
+        assert rig.chat.calls == []
+        assert len(rig.conversation) == 0
+
+    async def test_the_words_alone_are_a_question_for_the_model(self) -> None:
+        setup = FakeSetup()
+        rig = Rig(stt=FakeSTT("Enter into setup mode."), setup=setup)
+        await rig.respond()
+        assert setup.asked == 0
+        assert len(rig.chat.calls) == 1
+        assert not rig.spoken_phrase(Phrase.SETUP)
+
+    async def test_the_knock_alone_is_an_ordinary_turn(self) -> None:
+        setup = FakeSetup()
+        rig = Rig(setup=setup)  # "why is the sky blue"
+        await rig.respond(knocked=True)
+        assert setup.asked == 0
+        assert rig.tts.texts == ["Honk!", "The sky is blue because of sunlight.", "Neat?"]
+
+    async def test_says_so_when_setup_mode_cannot_start_here(self) -> None:
+        setup = FakeSetup(available=False)
+        rig = Rig(stt=FakeSTT("Enter setup mode"), setup=setup)
+        await rig.respond(knocked=True)
+        assert setup.asked == 0
+        assert rig.tts.texts == list(LUCY.lines[Phrase.NO_SETUP])
+        assert rig.chat.calls == []
+
+    async def test_says_so_when_setup_mode_does_not_start(self) -> None:
+        setup = FakeSetup(starts=False)
+        rig = Rig(stt=FakeSTT("Enter setup mode"), setup=setup)
+        await rig.respond(knocked=True)
+        assert setup.asked == 1
+        assert rig.tts.texts == [*LUCY.lines[Phrase.SETUP], *LUCY.lines[Phrase.NO_SETUP]]
+        assert rig.indicator.current is Status.ERROR
+
+    async def test_goes_to_the_model_when_it_is_turned_off(self) -> None:
+        rig = Rig(stt=FakeSTT("Enter setup mode"))  # no setup mode to ask for
+        await rig.respond(knocked=True)
+        assert len(rig.chat.calls) == 1
+
+    async def test_the_safety_screen_comes_first(self) -> None:
+        setup = FakeSetup()
+        rig = Rig(stt=FakeSTT("enter setup mode, I am going to hurt myself"), setup=setup)
+        await rig.respond(knocked=True)
+        assert setup.asked == 0
+        assert rig.spoken_phrase(Phrase.TELL_A_GROWN_UP)
+
+    async def test_works_offline_when_her_own_brain_can_hear_the_words(self) -> None:
+        setup = FakeSetup()
+        local = (FakeSTT("Enter into set up mode."), FakeChat())
+        rig = Rig(local=local, cloud_reachable=False, setup=setup)
+        await rig.respond(knocked=True)
+        assert rig.stt.calls == []  # the cloud was never asked
+        assert setup.asked == 1
+        assert rig.local_chat.calls == []
+
+    async def test_offline_without_her_own_brain_she_cannot_hear_them(self) -> None:
+        setup = FakeSetup()
+        rig = Rig(stt=FakeSTT(error=ServiceUnreachable("no route")), setup=setup)
+        await rig.respond(knocked=True)
+        assert setup.asked == 0
+        assert rig.spoken_phrase(Phrase.OFFLINE)
+
+
+class TestOpeningHonks:
+    async def test_lucy_opens_a_reply_with_a_honk_of_her_own(self) -> None:
+        chat = FakeChat(["Geese can sleep ", "while floating. ", "Cool, right?"])
+        rig = Rig(chat=chat, opening_honk_chance=1.0)
+        await rig.respond()
+        first, *rest = rig.tts.texts
+        assert first in (
+            "Honk! Geese can sleep while floating.",
+            "Honk honk! Geese can sleep while floating.",
+        )
+        assert rest == ["Cool, right?"]  # only the first sentence
+        assert rig.conversation.prompt("", "next")[2].content.startswith("Honk")
+
+    async def test_not_when_the_model_already_honked(self) -> None:
+        rig = Rig(opening_honk_chance=1.0)  # its reply starts with "Honk!"
+        await rig.respond()
+        assert rig.tts.texts[0] == "Honk!"
+
+    async def test_never_on_a_sad_or_serious_reply(self) -> None:
+        chat = FakeChat(["I'm so sorry your fish died. ", "That is really sad."])
+        rig = Rig(chat=chat, opening_honk_chance=1.0)
+        await rig.respond()
+        assert rig.tts.texts[0] == "I'm so sorry your fish died."
+
+    async def test_about_as_often_as_the_chance_says(self) -> None:
+        honked = 0
+        for seed in range(200):
+            rig = Rig(chat=FakeChat(["Geese fly in a V."]), opening_honk_chance=0.5)
+            rig.pipeline._rng = random.Random(seed)
+            await rig.respond()
+            honked += rig.tts.texts[0].startswith("Honk")
+        assert 70 < honked < 130

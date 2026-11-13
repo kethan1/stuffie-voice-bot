@@ -1,4 +1,4 @@
-"""Assembling Lucy's moving body: the DRV8833 motor driver, and the Puppeteer that moves it
+"""Assembling Lucy's moving body: the L293D motor driver, and the Puppeteer that moves it
 in time with everything she says (:mod:`lucy.core.motion`).
 
 The motors are optional. If they are turned off, or cannot be opened (no PWM overlay, a
@@ -11,7 +11,7 @@ import logging
 from collections.abc import Callable
 from contextlib import AsyncExitStack
 
-from lucy.adapters.motors import Drv8833, open_drv8833
+from lucy.adapters.motors import L293d, open_l293d
 from lucy.config import Config
 from lucy.core.errors import ConfigError
 from lucy.core.motion import MotionSettings, Puppeteer
@@ -21,21 +21,28 @@ from lucy.core.types import Motor
 log = logging.getLogger(__name__)
 
 
-def open_motors(config: Config) -> Drv8833:
+def open_motors(config: Config) -> L293d:
     """Claim the motor driver's PWM channels and GPIO lines, with both motors still.
 
     Blocking: it may wait a moment for udev to make a newly exported PWM channel writable.
     """
     settings = config.motors
-    return open_drv8833(
+    return open_l293d(
         pwm_chip=settings.pwm_chip,
         frequency_hz=settings.pwm_frequency_hz,
         gpio_chip=settings.gpio_chip,
         channels={
-            Motor.BEAK: (settings.beak_pwm_channel, settings.beak_direction_line),
-            Motor.BODY: (settings.body_pwm_channel, settings.body_direction_line),
+            Motor.BEAK: (
+                settings.beak_pwm_channel,
+                settings.beak_forward_line,
+                settings.beak_backward_line,
+            ),
+            Motor.BODY: (
+                settings.body_pwm_channel,
+                settings.body_forward_line,
+                settings.body_backward_line,
+            ),
         },
-        sleep_line=None if settings.sleep_line == -1 else settings.sleep_line,
     )
 
 

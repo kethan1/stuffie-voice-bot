@@ -20,6 +20,16 @@ already known to be down, or the moment a request fails to connect. Lucy says
 she is "thinking with her own goose brain" so the slower local answer is
 expected rather than a mystery.
 
+A child asking Lucy to talk louder or quieter (:mod:`lucy.core.volume`) is answered on the
+Pi too, after the safety screen: the volume changes, and Lucy says so at her new loudness.
+So is a grown-up asking for setup mode, which only counts in a turn that came with the knock
+(:mod:`lucy.core.knock`): Lucy says so, and hands over.
+
+Lucy is a goose, so she honks a lot. The prompt asks the model to, and when its reply does
+not open with a honk, she adds one of her own to some replies (``opening_honk_chance``),
+never to one that sounds sad or serious. The call is pre-rendered, so it plays the moment
+the first sentence is ready, while the voice is still starting on the words.
+
 When a safety screen answers instead of the model, the conversation remembers
 the exchange as :data:`SCREENED` and the fixed line Lucy said, never the child's
 words. A follow-up such as "yes!" (to "Want a weird animal fact instead?") or
@@ -28,6 +38,8 @@ words. A follow-up such as "yes!" (to "Want a weird animal fact instead?") or
 
 import asyncio
 import logging
+import random
+import re
 from collections import deque
 from collections.abc import AsyncGenerator, Callable
 from contextlib import aclosing
@@ -46,6 +58,8 @@ from lucy.core.errors import (
     ServiceError,
     ServiceUnreachable,
 )
+from lucy.core.honk import starts_with_honk
+from lucy.core.knock import asks_for_setup
 from lucy.core.metrics import TurnTimer
 from lucy.core.phrases import Phrase, PhraseBook
 from lucy.core.ports import (
@@ -53,6 +67,7 @@ from lucy.core.ports import (
     Indicator,
     Moderator,
     ReplyScreen,
+    SetupStarter,
     Speaker,
     SpeechToText,
     TextToSpeech,
@@ -60,6 +75,7 @@ from lucy.core.ports import (
 from lucy.core.tasks import detach, run_together
 from lucy.core.textnorm import to_speakable
 from lucy.core.types import Concern, Status
+from lucy.core.volume import Volume
 
 log = logging.getLogger(__name__)
 
@@ -69,6 +85,14 @@ and sentences join without gaps even when the network hiccups."""
 
 SCREENED = "(Lucy's safety screen stopped this part of the conversation.)"
 """What the conversation remembers a child saying when a safety screen answered for Lucy."""
+
+_SOMBER = re.compile(
+    r"\b(?:sorry|sad|sadly|died|dies|dead|death|hurt|hurts|pain|scared|afraid|sick|lonely|"
+    r"cry|crying|upset|worried|bully|bullied|grown-?ups?|trust|safe|unsafe|danger|dangerous|"
+    r"nurse|counselor|private|war|wars)\b",
+    re.IGNORECASE,
+)
+"""Words in a reply's first sentence that make it no place for a playful honk."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,6 +108,10 @@ class TurnSettings:
     end at a comma once it has this many words: a sooner first word from the on-device voice,
     at the cost of a seam in the first sentence."""
     max_chunk_words: int = 30
+    opening_honk_chance: float = 0.5
+    """How often Lucy opens a reply with a honk of her own, when the model's reply does not
+    already start with one. Never for a reply that sounds sad or serious. 0 leaves honking
+    to the model."""
     log_transcripts: bool = False
     """Privacy: what a child said and what the model replied (which can echo it) are kept out
     of the logs unless this is enabled."""
@@ -110,11 +138,15 @@ class Brain:
 class _Turn:
     timer: TurnTimer
     brain: Brain
+    knocked: bool = False
+    """Whether the turn came with the knock, so it may ask for setup mode."""
     heard: str = ""
     """What the child said, once the input screen has let it through to the model."""
     reply: list[str] = field(default_factory=list)
     """The model's reply as it streamed in."""
     spoken: list[str] = field(default_factory=list)
+    opened: bool = False
+    """Whether the reply's first words have been voiced (and maybe given a honk)."""
 
     def received(self, delta: str) -> None:
         """The next piece of the model's reply arrived."""
@@ -137,6 +169,9 @@ class TurnPipeline:
         system_prompt: str,
         settings: TurnSettings,
         reply_screen: ReplyScreen | None = None,
+        volume: Volume | None = None,
+        setup: SetupStarter | None = None,
+        rng: random.Random | None = None,
     ) -> None:
         self._brain = brain
         self._backup = backup
@@ -149,10 +184,17 @@ class TurnPipeline:
         self._conversation = conversation
         self._system_prompt = system_prompt
         self._settings = settings
+        self._volume = volume
+        self._setup = setup
+        self._rng = rng or random.Random()
 
-    async def respond(self, recording: Pcm, timer: TurnTimer) -> None:
-        """Answer one recording. Never raises except for cancellation (barge-in)."""
-        turn = _Turn(timer, self._brain)
+    async def respond(self, recording: Pcm, timer: TurnTimer, *, knocked: bool = False) -> None:
+        """Answer one recording. Never raises except for cancellation (barge-in).
+
+        ``knocked``: the squeeze came with the knock (:mod:`lucy.core.knock`), so what was
+        said may be a grown-up asking for setup mode.
+        """
+        turn = _Turn(timer, self._brain, knocked)
         try:
             await self._respond(recording, turn)
         except asyncio.CancelledError:
@@ -242,8 +284,32 @@ class TurnPipeline:
             await self._redirect(screened_phrase(assessment.concern))
             return
 
+        if turn.knocked and self._setup is not None and asks_for_setup(text):
+            await self._start_setup(self._setup)
+            return
+
+        if self._volume is not None and (request := self._volume.request(text)) is not None:
+            phrase = self._volume.change(request)
+            log.info("asked to be %s: volume now %+.0f dB", request.value, self._volume.db)
+            said = await self._say(phrase)
+            if said:
+                self._conversation.record(text, said)
+            return
+
         turn.heard = text
         await self._stream_reply(text, turn)
+
+    async def _start_setup(self, setup: SetupStarter) -> None:
+        """A grown-up asked for setup mode with the knock: say so, then hand over to it."""
+        if not setup.available:
+            log.warning("asked for setup mode, which cannot start here")
+            await self.say(Phrase.NO_SETUP)
+            return
+        log.info("asked for setup mode with the knock")
+        await self.say(Phrase.SETUP)  # all of it, before Lucy is stopped to make way
+        self._indicator.show(Status.THINKING)
+        if not await setup.start():
+            await self.say(Phrase.NO_SETUP, status=Status.ERROR)
 
     async def _transcribe(self, speech: Pcm, turn: _Turn) -> str:
         try:
@@ -313,6 +379,18 @@ class TurnPipeline:
                 raise ContentRefused("Lucy's reply screen stopped a sentence", assessment.concern)
         return words
 
+    def _with_opening_honk(self, words: str, turn: _Turn) -> str:
+        """``words`` from the reply; the first of them sometimes get a honk of Lucy's own."""
+        if turn.opened or not words:
+            return words
+        turn.opened = True
+        chance = self._settings.opening_honk_chance
+        if chance <= 0 or starts_with_honk(words) or _SOMBER.search(words):
+            return words
+        if self._rng.random() >= chance:
+            return words
+        return ("Honk honk! " if self._rng.random() < 0.25 else "Honk! ") + words
+
     async def _stream_reply(self, text: str, turn: _Turn) -> None:
         settings = self._settings
         texts: asyncio.Queue[Chunk | None] = asyncio.Queue()
@@ -335,7 +413,7 @@ class TurnPipeline:
 
         async def voice() -> None:
             while (chunk := await texts.get()) is not None:
-                words = self._speakable(chunk.text)
+                words = self._with_opening_honk(self._speakable(chunk.text), turn)
                 if not words:
                     continue
                 label: str | None = words

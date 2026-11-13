@@ -1,27 +1,34 @@
-"""Lucy's beak and body motors on a DRV8833 dual H-bridge (docs/HARDWARE.md).
+"""Lucy's beak and body motors on an L293D dual H-bridge (docs/HARDWARE.md).
 
-Each motor has two driver inputs. xIN1 is on a hardware PWM channel and xIN2 on
-a plain GPIO line that picks the direction. With the DRV8833's truth table, one
-PWM channel per motor is enough for both directions:
+Each motor has one half of the L293D: an enable pin (1,2EN or 3,4EN) on a hardware PWM
+channel, which sets its speed (the Pi 4 has exactly two), and two inputs (1A and 2A, or 3A
+and 4A) on GPIO lines, which pick its direction. ``power`` runs from -1 to 1: the sign picks
+the way, and 0 lets the motor **coast**, so the beak's spring can snap it shut.
 
-=============  =========  ======================  ===============================
-power          xIN2       xIN1                    the motor
-=============  =========  ======================  ===============================
-above 0        low        PWM, duty = power       forward, coasting between pulses
-below 0        high       PWM, duty = 1 - |power| reverse, braking between pulses
-0              low        low                     coasts (the beak's spring shuts it)
-=============  =========  ======================  ===============================
+=============  ======  ======  ==============  ================================
+power          1A      2A      EN              the motor
+=============  ======  ======  ==============  ================================
+above 0        high    low     PWM, = power    forward, coasting between pulses
+below 0        low     high    PWM, = |power|  reverse, coasting between pulses
+0              (kept)  (kept)  low             coasts (the beak's spring shuts it)
+=============  ======  ======  ==============  ================================
 
-The PWM runs in hardware at 20 kHz, which is above hearing (so the motors do not
-whine) and takes no CPU. Each change of speed is one sysfs write of a few
-microseconds, made on the event loop: no threads and no polling. While nothing
-moves, nSLEEP is held low and the driver draws next to nothing.
+An L293D brakes a motor whenever its two inputs are at the same level and its enable pin is
+high. A braked beak motor would fight the spring and hold the beak open, so the PWM goes on
+the enable pin: with it low the outputs are off and the motor coasts. The inputs change only
+when the direction does, with the enable pin low first, so turning around never brakes
+either. The L293D has no sleep mode: with both enable pins low its outputs are off, but its
+logic keeps drawing a little from the Pi's 5 V.
+
+The PWM runs in hardware at 20 kHz, which is above hearing (so the motors do not whine) and
+takes no CPU. Each change of speed is one sysfs write of a few microseconds, made on the
+event loop: no threads and no polling.
 
 Every line Lucy drives is pulled low while the Pi boots (GPIO 9 to 27 default to
-pull-down, and the DRV8833 pulls nSLEEP down), so the motors stay still until
-Lucy starts. A sysfs PWM channel keeps running after the process that set it
-exits, so ``close()`` stops everything, and the service's ``ExecStopPost`` runs
-``lucy motors --off`` in case Lucy was killed before she could.
+pull-down), so both enable pins stay low and the motors stay still until Lucy starts. A
+sysfs PWM channel keeps running after the process that set it exits, so ``close()`` stops
+everything, and the service's ``ExecStopPost`` runs ``lucy motors --off`` in case Lucy was
+killed before she could.
 """
 
 import contextlib
@@ -127,92 +134,88 @@ class SysfsPwm:
 
 
 class HBridge:
-    """One DRV8833 channel: xIN1 on a PWM channel, xIN2 on a GPIO line."""
+    """One half of the L293D: its enable pin on a PWM channel, its two inputs on GPIO lines."""
 
-    def __init__(self, pwm: Pwm, direction: Line) -> None:
+    def __init__(self, pwm: Pwm, forward: Line, backward: Line) -> None:
         self._pwm = pwm
-        self._direction = direction
-        self._reverse = False
-        direction.set(False)
+        self._forward = forward
+        self._backward = backward
+        self._way = 0  # 1 forward, -1 backward, 0 both inputs low
         pwm.set(0.0)
+        forward.set(False)
+        backward.set(False)
 
     def drive(self, power: float) -> None:
         power = min(1.0, max(-1.0, power))
-        reverse = power < 0
-        if reverse != self._reverse:
-            self._direction.set(reverse)
-            self._reverse = reverse
-        self._pwm.set(1.0 - abs(power) if reverse else power)
+        way = (power > 0) - (power < 0)
+        if way and way != self._way:
+            self._pwm.set(0.0)  # outputs off while the inputs change, so it never brakes
+            self._forward.set(way > 0)
+            self._backward.set(way < 0)
+            self._way = way
+        self._pwm.set(abs(power))
 
     def close(self) -> None:
-        self.drive(0.0)
+        """Let the motor coast with both inputs low, then release the channel and the lines."""
+        self._pwm.set(0.0)
+        self._forward.set(False)
+        self._backward.set(False)
+        self._way = 0
         self._pwm.close()
-        self._direction.close()
+        self._forward.close()
+        self._backward.close()
 
 
-class Drv8833:
-    """Lucy's motors (:class:`~lucy.core.ports.Motors`) on one DRV8833."""
+class L293d:
+    """Lucy's motors (:class:`~lucy.core.ports.Motors`) on one L293D."""
 
-    def __init__(self, bridges: Mapping[Motor, HBridge], sleep_line: Line | None) -> None:
+    def __init__(self, bridges: Mapping[Motor, HBridge]) -> None:
         self._bridges = dict(bridges)
-        self._sleep_line = sleep_line
-        self._awake = False
         self.sleep()
 
     def drive(self, motor: Motor, power: float) -> None:
-        if power and not self._awake:
-            self._awake = True
-            if self._sleep_line is not None:
-                self._sleep_line.set(True)  # awake within about a millisecond
         self._bridges[motor].drive(power)
 
     def sleep(self) -> None:
         for bridge in self._bridges.values():
             bridge.drive(0.0)
-        if self._sleep_line is not None:
-            self._sleep_line.set(False)
-        self._awake = False
 
     def close(self) -> None:
-        """Stop both motors, put the driver to sleep, and release every line."""
+        """Stop both motors and release every line."""
         with contextlib.suppress(OSError):
             self.sleep()
-        for part in (*self._bridges.values(), self._sleep_line):
-            if part is None:
-                continue
+        for bridge in self._bridges.values():
             try:
-                part.close()
+                bridge.close()
             except OSError as error:
                 log.warning("could not release a motor line: %s", error)
 
 
-def open_drv8833(
+def open_l293d(
     *,
     pwm_chip: Path,
     frequency_hz: float,
     gpio_chip: str,
-    channels: Mapping[Motor, tuple[int, int]],
-    sleep_line: int | None,
-) -> Drv8833:
-    """Claim a PWM channel and a direction line per motor, and the sleep line, all off.
+    channels: Mapping[Motor, tuple[int, int, int]],
+) -> L293d:
+    """Claim a PWM channel and two input lines per motor, with both motors still.
 
-    ``channels`` maps each motor to (PWM channel, direction GPIO line). Blocking: it may
-    wait a moment for udev to make a newly exported PWM channel writable.
+    ``channels`` maps each motor to (PWM channel on its enable pin, forward line on 1A or
+    3A, backward line on 2A or 4A). Blocking: it may wait a moment for udev to make a newly
+    exported PWM channel writable.
     """
     from lucy.adapters.gpio import GpioOutput
 
     with ExitStack() as opened:
         bridges = {}
-        for motor, (channel, line) in channels.items():
+        for motor, (channel, forward_line, backward_line) in channels.items():
             pwm = SysfsPwm.open(pwm_chip, channel, frequency_hz)
             opened.callback(pwm.close)
-            direction = GpioOutput(gpio_chip, line, consumer=f"lucy-{motor}")
-            opened.callback(direction.close)
-            bridges[motor] = HBridge(pwm, direction)
-        sleep = None
-        if sleep_line is not None:
-            sleep = GpioOutput(gpio_chip, sleep_line, consumer="lucy-motor-sleep")
-            opened.callback(sleep.close)
-        driver = Drv8833(bridges, sleep)
+            forward = GpioOutput(gpio_chip, forward_line, consumer=f"lucy-{motor}-forward")
+            opened.callback(forward.close)
+            backward = GpioOutput(gpio_chip, backward_line, consumer=f"lucy-{motor}-backward")
+            opened.callback(backward.close)
+            bridges[motor] = HBridge(pwm, forward, backward)
+        driver = L293d(bridges)
         opened.pop_all()
     return driver

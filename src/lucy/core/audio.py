@@ -119,6 +119,36 @@ def amplify(pcm: Pcm, gain: float) -> Pcm:
     return Pcm(clipped.astype("<i2").tobytes(), pcm.sample_rate, pcm.cues)
 
 
+def soft_limit(samples: npt.NDArray[np.floating], knee: float = 0.5) -> npt.NDArray[np.float64]:
+    """Round off peaks smoothly instead of clipping them: never beyond full scale (1.0).
+
+    Samples up to ``knee`` pass unchanged. Louder ones are squeezed into the room left
+    between the knee and full scale (a tanh curve, which starts with the same slope, so
+    there is no kink). Clipping sounds harsh; this keeps loud audio clean.
+    """
+    out = np.asarray(samples, dtype=np.float64).copy()
+    magnitude = np.abs(out)
+    over = magnitude > knee
+    room = 1.0 - knee
+    out[over] = np.sign(out[over]) * (knee + room * np.tanh((magnitude[over] - knee) / room))
+    return out
+
+
+def adjust_volume(pcm: Pcm, db: float) -> Pcm:
+    """``pcm`` made ``db`` decibels louder (or quieter, below 0), keeping its cues.
+
+    Lucy's voice has only a few decibels of room below full scale, so above 0 dB the
+    loudest peaks are rounded off (:func:`soft_limit`) rather than clipped: she sounds
+    louder, not harsh.
+    """
+    if db == 0.0 or pcm.frames == 0:
+        return pcm
+    samples = pcm.samples().astype(np.float64) * (10.0 ** (db / 20.0) / _INT16_FULL_SCALE)
+    if db > 0:
+        samples = soft_limit(samples)
+    return replace(Pcm.from_float(samples, pcm.sample_rate), cues=pcm.cues)
+
+
 def level_dbfs(pcm: Pcm) -> float:
     """RMS level relative to full scale; :data:`SILENCE_DBFS` for empty or silent audio."""
     if pcm.frames == 0:
@@ -152,18 +182,28 @@ def trim_silence(
     return Pcm(pcm.data[start * SAMPLE_WIDTH : end * SAMPLE_WIDTH], pcm.sample_rate)
 
 
-def chime(notes: list[tuple[float, float]], sample_rate: int, *, volume: float = 0.25) -> Pcm:
-    """Render a short sequence of ``(frequency_hz, seconds)`` sine notes.
+def chime(
+    notes: list[tuple[float, float]],
+    sample_rate: int,
+    *,
+    volume: float = 0.25,
+    overtone: float = 0.0,
+) -> Pcm:
+    """Render a short sequence of ``(frequency_hz, seconds)`` notes, peaking at ``volume``.
 
-    Each note gets a raised-cosine envelope so there are no clicks. Used for the
-    tiny "I'm listening" / "got it" earcons, which are generated at start-up
-    rather than shipped as binary assets. The result is cued as a chime, so
-    Lucy's beak stays shut while it plays.
+    Each note gets a raised-cosine envelope so there are no clicks. ``overtone`` adds the
+    octave above each note at that fraction of its loudness: a brighter tone that a small
+    speaker plays louder than a pure sine. Used for the tiny "I'm listening" / "got it"
+    earcons, which are generated at start-up rather than shipped as binary assets. The
+    result is cued as a chime, so Lucy's beak stays shut while it plays.
     """
     parts: list[npt.NDArray[np.float64]] = []
     for frequency, seconds in notes:
         n = max(1, round(seconds * sample_rate))
         t = np.arange(n) / sample_rate
         envelope = np.sin(np.pi * np.arange(n) / n) ** 2
-        parts.append(np.sin(2 * np.pi * frequency * t) * envelope)
-    return Pcm.from_float(np.concatenate(parts) * volume, sample_rate).cued(CueKind.CHIME)
+        tone = np.sin(2 * np.pi * frequency * t) + overtone * np.sin(4 * np.pi * frequency * t)
+        parts.append(tone * envelope)
+    samples = np.concatenate(parts)
+    peak = float(np.max(np.abs(samples))) or 1.0
+    return Pcm.from_float(samples * (volume / peak), sample_rate).cued(CueKind.CHIME)

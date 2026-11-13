@@ -10,9 +10,9 @@
 | MAX98357A I2S amplifier breakout + 3 W, 4 Ω speaker | Loud, efficient, and gated by the kernel when idle. A USB speaker also works. |
 | Momentary push button | Sewn into the wing. A 12 mm tactile switch or a soft "squeeze" switch. |
 | 5 mm LED + 330 Ω resistor (optional) | Status light, e.g. behind an eye. |
-| DRV8833 dual motor driver breakout | Drives the beak and body motors from their own battery. Its inputs work at the Pi's 3.3 V logic. |
-| 2 small DC gear motors (3–6 V, e.g. N20 or TT) | One pushes the beak open against a spring, one wiggles the body. Prefer a low stall current (under about 0.5 A). |
-| Motor battery: 4 × AA NiMH (4.8 V) in a holder with a switch | Motor power only (the DRV8833's VM, 2.7–10.8 V). The Pi keeps its own supply, so a motor starting up can never brown it out. |
+| L293D dual H-bridge motor driver (16-pin DIP) | Drives the beak and body motors from their own battery. It reads the Pi's 3.3 V signals as high, and has its motor diodes built in (the "D"; a plain L293 would need eight more). |
+| 2 small DC gear motors (6 V, e.g. N20 or TT) | One pushes the beak open against a spring, one wiggles the body. The stall current must be under 0.6 A, the L293D's limit per motor. |
+| Motor battery: 6 × AA NiMH (7.2 V) in a holder with a switch | Motor power only (the L293D's VCC2, 4.5–36 V). The L293D loses about 2 V inside itself, so the motors get about 5 V. The Pi keeps its own supply, so a motor starting up can never brown it out. |
 | A light spring or elastic band | Closes the beak whenever the motor lets go. |
 | 5.1 V / 3 A USB-C supply, or a USB-C PD power bank (5 V / 3 A) | A weak power bank causes under-voltage resets (`vcgencmd get_throttled`). |
 | Female-to-female jumper wires, heat-shrink | Keep connections secure: children squeeze things. |
@@ -36,29 +36,33 @@ pin** (what you count on the board).
 | MAX98357A SD | GPIO4 (pin 7) | Shutdown pin: the kernel turns the amp on only while audio plays |
 | MAX98357A GAIN | leave unconnected | 9 dB default; tie to GND for 12 dB if Lucy is too quiet |
 | USB microphone | any USB port | |
-| DRV8833 AIN1 | GPIO12 (pin 32) | Beak speed: hardware PWM channel 0 |
-| DRV8833 AIN2 | GPIO22 (pin 15) | Beak direction |
-| DRV8833 BIN1 | GPIO13 (pin 33) | Body speed: hardware PWM channel 1 |
-| DRV8833 BIN2 | GPIO23 (pin 16) | Body direction |
-| DRV8833 nSLEEP (SLP) | GPIO24 (pin 18) | Lucy wakes the driver only to move. See "Motors" if your board pulls it up |
-| DRV8833 GND | GND (pin 34) | **Shared ground**: the Pi, the driver, and the motor battery's − |
-| DRV8833 VM | motor battery + | **Never** the Pi's 5 V pins |
-| Beak motor | DRV8833 AOUT1, AOUT2 | Swap the two wires if the beak pushes shut instead of open |
-| Body motor | DRV8833 BOUT1, BOUT2 | |
+| L293D 1,2EN (chip pin 1) | GPIO12 (pin 32) | Beak speed: hardware PWM channel 0 |
+| L293D 1A (chip pin 2) | GPIO22 (pin 15) | Beak forward (opens it) |
+| L293D 2A (chip pin 7) | GPIO23 (pin 16) | Beak backward |
+| L293D 3,4EN (chip pin 9) | GPIO13 (pin 33) | Body speed: hardware PWM channel 1 |
+| L293D 3A (chip pin 10) | GPIO24 (pin 18) | Body forward |
+| L293D 4A (chip pin 15) | GPIO25 (pin 22) | Body backward |
+| L293D VCC1 (chip pin 16) | 5 V (pin 4) | The chip's logic supply |
+| L293D GND (chip pins 4, 5, 12, 13) | GND (pin 34) | **Shared ground**: the Pi, the L293D, and the motor battery's −. Connect all four |
+| L293D VCC2 (chip pin 8) | motor battery + | **Never** the Pi's 5 V pins |
+| Beak motor | L293D 1Y, 2Y (chip pins 3, 6) | Swap the two wires if the beak pushes shut instead of open |
+| Body motor | L293D 3Y, 4Y (chip pins 11, 14) | |
 
 ```
                     3V3  (1) (2)  5V ──────── MAX98357A VIN
-                         (3) (4)  5V
+                         (3) (4)  5V ──────── L293D VCC1 (chip pin 16)
                          (5) (6)  GND ─────── MAX98357A GND
          amp SD ─ GPIO4  (7) (8)
          button ─ GND    (9) (10)
          button ─ GPIO17 (11) (12) GPIO18 ─── MAX98357A BCLK
             LED ─ GPIO27 (13) (14) GND ────── LED cathode
-  DRV8833 AIN2 ─ GPIO22 (15) (16) GPIO23 ─── DRV8833 BIN2
-                         (17) (18) GPIO24 ─── DRV8833 nSLEEP
+      L293D 1A ─ GPIO22 (15) (16) GPIO23 ─── L293D 2A
+                         (17) (18) GPIO24 ─── L293D 3A
+                         (19) (20)
+                         (21) (22) GPIO25 ─── L293D 4A
                          ...
-                         (31) (32) GPIO12 ─── DRV8833 AIN1 (beak PWM)
-  DRV8833 BIN1 ─ GPIO13 (33) (34) GND ────── DRV8833 GND (+ motor battery −)
+                         (31) (32) GPIO12 ─── L293D 1,2EN (beak PWM)
+   L293D 3,4EN ─ GPIO13 (33) (34) GND ────── L293D GND (+ motor battery −)
         amp LRC ─ GPIO19 (35) (36)
                          ...  (40) GPIO21 ─── MAX98357A DIN
 ```
@@ -102,14 +106,30 @@ sudo systemctl start lucy
 
 If a motor turns the wrong way, swap its two wires at the driver.
 
-**Driver boards.** Any DRV8833 breakout works (Adafruit, Pololu, and the
-generic purple boards). Some pull SLP (nSLEEP) up to the motor battery on the
-board. If yours does, **do not wire SLP to the Pi**: a battery above 3.3 V
-would push current into the GPIO pin. Leave SLP unconnected and set
-`motors.sleep_line = -1`. The driver then stays awake, which costs a couple of
-milliamps from the motor battery. The Pi's ground, the driver's GND, and the
-motor battery's − must all be connected, or the driver cannot read the Pi's
-signals.
+**The L293D.** Each motor uses one half of the chip. Its enable pin (1,2EN or
+3,4EN) sets the speed with hardware PWM, and its two inputs (1A and 2A, or 3A
+and 4A) set the direction. The PWM is on the enable pins because an L293D
+brakes a motor whose two inputs are at the same level. With the enable pin
+low, its outputs are off and the motor coasts, so the spring can snap the
+beak shut. When wiring it:
+
+* **Two supplies.** VCC1 (chip pin 16) powers the chip's logic: connect it to
+  the Pi's 5 V. VCC2 (chip pin 8) powers the motors: connect it to the motor
+  battery, never to the Pi.
+* **All four GND pins** (chip pins 4, 5, 12, 13) go to ground. They also carry
+  the chip's heat away, so on a soldered board give them a wide copper area.
+  The Pi's ground, the L293D's GND, and the motor battery's − must all be
+  connected, or the chip cannot read the Pi's signals.
+* **It loses about 2 V.** The L293D's output transistors drop about 2 to
+  2.5 V, so each motor gets that much less than the battery. That is why the
+  battery is 7.2 V for 6 V motors. If the beak barely moves, raise
+  `beak_min_power` before anything else.
+* **It has no sleep mode.** With both enable pins low the outputs are off and
+  nothing moves, but the chip still draws a little from the Pi's 5 V and from
+  the motor battery. Switch the motor battery off when Lucy is put away.
+* Pin 1 of the chip is next to the notch (or dot) on its top. Upgrading from a
+  DRV8833? `deploy/install.sh` removes its old settings from
+  `/etc/lucy/config.toml`; rewire to the table above.
 
 **The PWM channels** come from the Pi's PWM hardware, so the onboard 3.5 mm
 audio must stay off (`dtparam=audio=off`, which `--tune` sets): it uses the
@@ -118,7 +138,7 @@ same hardware. GPIO12 and GPIO13 are not used by the I2S amplifier
 
 **Safety.** Software keeps the motors gentle. Power is capped, no motor runs
 longer than `max_hold_s` (2 s) without a rest, nothing moves while the wing is
-squeezed, and the driver sleeps whenever Lucy is still. If Lucy crashes or is
+squeezed, and both motors coast whenever Lucy is still. If Lucy crashes or is
 killed, systemd stops both motors (`ExecStopPost=lucy motors --off`). Every
 motor line is pulled low at power-up, so nothing moves while the Pi boots. The
 mechanics are up to the builder:
@@ -127,9 +147,10 @@ mechanics are up to the builder:
   and round off its edges.
 * **Enclose every gear and linkage** in a box or sleeve, so no fingers,
   fabric, or stuffing can be caught in them.
-* Choose motors and a battery voltage within the motors' rating. The DRV8833
-  limits current (about 1.5 A per motor) and shuts down if it overheats, but
-  a small motor can still get hot if it is stalled at too high a voltage.
+* Choose motors and a battery voltage within the motors' rating. The L293D
+  turns its outputs off if it overheats, but it does not limit current, so
+  pick motors that stall at under 0.6 A. A small motor can still get hot if
+  it is stalled at too high a voltage.
 * **Secure the battery** in a closed pocket with its switch reachable only by
   a grown-up. Use rechargeable NiMH or a proper holder; never loose cells.
 

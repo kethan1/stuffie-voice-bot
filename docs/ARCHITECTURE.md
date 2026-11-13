@@ -3,8 +3,9 @@
 Lucy is a push-to-talk voice companion for elementary-school children. She runs
 on a Raspberry Pi 4B (4 GB) inside a plush goose. A child squeezes Lucy's wing,
 asks a question, lets go, and Lucy answers out loud in one or two short,
-friendly sentences. Her beak moves in time with her voice, and her body flaps
-whenever she honks.
+friendly sentences. She speaks with a goose's voice and honks a lot, her beak
+moves in time with her voice, her body flaps whenever she honks, and she gets
+louder or quieter when a child asks.
 
 This document explains how the system is built and why. It covers the
 technology choices, the software structure, the runtime behaviour, and how
@@ -39,8 +40,8 @@ that never fails (§3, §5.5).
  │                                                                      │
  │  wing button ──GPIO17──┐                ┌──I2S──► MAX98357A ─► speaker│
  │  eye LED ◄────GPIO27───┤  Raspberry Pi  │                             │
- │  USB microphone ──USB──┤  4B · 4 GB     ├──PWM+GPIO─► DRV8833 ─┬► beak│
- │                        │                │  motor battery ─► VM └► body│
+ │  USB microphone ──USB──┤  4B · 4 GB     ├──PWM+GPIO─► L293D ───┬► beak│
+ │                        │                │ motor battery ─►VCC2 └► body│
  │                        │                ├──Wi-Fi──┐                   │
  │                        └───────┬────────┘         │                   │
  │      optional offline brain    │ localhost        │                   │
@@ -85,7 +86,7 @@ by Ollama. It is slower, so it is used only when GroqCloud cannot be reached
 | **Moderation** | On-device distress screen + system prompt + gpt-oss safety training | Groq retired Llama Guard 4 in March 2026. Its replacement (`gpt-oss-safeguard-20b`) is a preview model at 3 requests/minute on the free tier, so it cannot screen every turn. See §8. |
 | **Audio I/O** | PortAudio via `sounddevice`, ALSA `plug` for rate conversion | Callback-driven: no polling, and gapless output. `plug` converts rates in C, so Lucy records at Whisper's native 16 kHz and plays at Piper's 22.05 kHz on any hardware. |
 | **GPIO** | libgpiod v2 (`gpiod`) | The supported interface on current kernels (sysfs and RPi.GPIO are deprecated). Edges arrive through a file descriptor in the event loop, with kernel debouncing and kernel timestamps: no threads, no polling. |
-| **Motors** | DRV8833 dual H-bridge; the Pi's hardware PWM (`pwm-2chan` overlay, sysfs) at 20 kHz | Two small DC motors (beak, body) on their own battery. Hardware PWM uses no CPU, thread, or timer, and at 20 kHz it is above hearing, so the motors do not whine. Each speed change is one sysfs write of a few microseconds. Rejected: software PWM (`lgpio`, `pigpio`) needs a thread or daemon that wakes the CPU thousands of times a second; a servo HAT adds an I2C chip and needs a different mechanism; on/off drive cannot open the beak part-way. One PWM channel plus one direction line per motor covers both directions (§5.7). |
+| **Motors** | L293D dual H-bridge; the Pi's hardware PWM (`pwm-2chan` overlay, sysfs) at 20 kHz on its enable pins | Two small DC motors (beak, body) on their own battery. Hardware PWM uses no CPU, thread, or timer, and at 20 kHz it is above hearing, so the motors do not whine. Each speed change is one sysfs write of a few microseconds. Rejected: software PWM (`lgpio`, `pigpio`) needs a thread or daemon that wakes the CPU thousands of times a second; a servo HAT adds an I2C chip and needs a different mechanism; on/off drive cannot open the beak part-way. One PWM channel on the enable pin plus two direction lines per motor covers both directions, and lets a stopped motor coast instead of braking (§5.7). |
 | **Concurrency** | `asyncio` + a few dedicated threads | Network streaming, timers, and button events are all I/O-bound and event-driven. CPU-bound synthesis runs in one worker thread (onnxruntime releases the GIL). |
 | **HTTP** | `httpx` with HTTP/2 (thin client, no vendor SDK) | One multiplexed TLS connection for every request, pre-warmed on button press. Avoiding the SDK avoids its pydantic import cost and keeps the client provider-neutral (Groq, OpenAI, Ollama all speak this protocol). |
 | **Config** | One strict TOML file + systemd credentials | Typos fail at start-up. API keys are never in the file or the environment of other processes. |
@@ -119,7 +120,7 @@ interfaces, and a single composition root wires them together.
                                 │ implements               │ implements
    lucy.adapters ──────────────┴──────────────────────────┴─────────────────────────
      gpio.py        GpioButton, LedIndicator, GpioOutput (libgpiod)
-     motors.py      Drv8833, HBridge, SysfsPwm (Lucy's motors: hardware PWM + GPIO)
+     motors.py      L293d, HBridge, SysfsPwm (Lucy's motors: hardware PWM + GPIO)
      sound.py       SoundDeviceMicrophone, SoundDeviceSpeaker (PortAudio)
      speechify_tts.py  SpeechifySpeech (Lucy's voice: streamed PCM over the HTTP client below)
      piper_tts.py   PiperSpeech (onnxruntime; the backup voice)
@@ -179,7 +180,11 @@ types. The core maps those to what Lucy *says* (`pipeline.phrase_for`):
   turn. Kernel timestamps mean the "held" time is measured at the button
   itself, not when Python got around to it.
 * **Tap:** if Lucy was talking, a tap just stops her. If she was idle, she
-  explains how to talk to her.
+  explains how to talk to her, after `tap_gap_s` (0.7 s), in case the tap
+  turns out to start a knock.
+* **Knock:** two taps (or more), each within `tap_gap_s` of the last, and then
+  the squeeze, within `tap_gap_s` again. The turn that follows is marked as
+  knocked, and may ask for setup mode (§5.8). Nothing else about it differs.
 * **Stuck button:** recording stops by itself after `max_record_s`.
 * **Hammered button:** an hourly turn budget protects the API quota.
 * **Quiet:** after `awake_s` Lucy goes DORMANT (power saving). After
@@ -198,6 +203,10 @@ limit timer, and the dormant timer can never interleave half-way.
  Whisper (Groq) ─────────────────── empty? → "I didn't hear that"
    ▼
  SafetyScreen (on device, µs) ───── concern? → a fixed reply to match (LLM never sees it)
+   ▼
+ asks_for_setup (on device, µs) ─── knocked, and "enter setup mode"? → say so, hand over (§5.8)
+   ▼
+ volume_request (on device, µs) ─── "louder!"? → change the volume, say so at the new level
    ▼
  ┌─ think() ─────────────┐   ┌─ voice() ───────────────┐   ┌─ speak() ───────────────┐
  │ gpt-oss-20b SSE stream│──►│ to_speakable → Lucy's   │──►│ speaker queue, ≥ 0.3 s  │
@@ -302,37 +311,126 @@ brain is Groq. The optional local brain is faster-whisper plus Ollama on the Pi.
 Both voices produce 22.05 kHz audio (Speechify streams at Piper's rate), so one
 speaker stream plays either, with no resampling on the Pi.
 
+**The goose voice** (`core/goose_voice.py`). Whichever voice speaks, its speech
+goes through `GooseVoice` on the way out, scaled by `tts.goose_voice` (0 to 1,
+default 0.7). It gives a human voice the three things that make a goose sound
+like a goose, taken from the same measurements of real geese as her honk (§5.6):
+
+* **Smaller.** Resampling raises her pitch and her resonances together by up
+  to 25% (17.5% at the default, nearly three semitones): the sound of a smaller
+  creature. That speeds speech up by as much, so each voice is asked to speak
+  that much more slowly first and comes out at its usual pace. Speechify takes
+  that as SSML (`<prosody rate="-15%">`; the tags are not billed, and the text
+  is escaped). Piper takes a `length_scale`, which slows it by less than the
+  number says (the short gaps it puts between sounds do not stretch), so
+  `piper_tts.py` holds the measured relation and asks for what is meant.
+* **Honky.** A linear-phase FIR filter (255 taps) gives her voice a goose's
+  resonances: the windpipe's ring at 1.35 kHz (up to +12 dB), the dip near
+  2.9 kHz, and the brassy second peak near 4 kHz, and takes out the chest
+  tones below 300 Hz. It also removes anything the resampler would fold back
+  down (aliasing).
+* **Raspy.** A goose's voice starts as a growl and breaks upward into the honk,
+  and drops back into period doubling in between. `Rasp` does that to her
+  voice: every other cycle comes out weaker, which is heard as a rasp an octave
+  below her pitch. It finds the cycles the way a guitar's octave pedal does (a
+  low-pass filter leaves only the fundamental, and a trigger with hysteresis
+  counts its upward zero crossings), so the rasp follows her pitch instead of
+  buzzing over it. It is deepest for the first 150 ms after a silence, as a
+  honk starts with its growl, and sways lightly the rest of the time. Silence
+  gets none.
+
+The filter is normalised so speech comes out at the level it went in: her beak
+(§5.7) opens as wide as before, and the volume settings mean what they did. To
+the ear she is 2 to 4 dB louder, because the sound has moved to where ears are
+keenest. Peaks are rounded off (`soft_limit`), not clipped.
+
+Each stage carries its state from one streamed part to the next (the filters'
+histories, the resampler's fractional position, the trigger and its switch, the
+running loudness), so parts join without a seam: streaming in any part sizes
+gives the same samples as one block. It costs about 0.4 ms per 100 ms part on
+a laptop. The goose voice sits inside `HonkingVoice`, so honks, which are goose
+calls already, pass through untouched. A filter rather than a "goose" voice
+from the catalogue keeps her words as clear as the natural voice they come
+from, and works the same for Piper.
+
+How clear: thirty of Lucy's kind of sentences (330 words), spoken by Piper and
+transcribed by two speech recognisers on a laptop. Whisper `small.en` got 11
+words wrong in her plain voice, 10 at the default 0.7, and 13 at 1.0. The much
+weaker `tiny.en` got 14, 20, and 33, which is why the default is 0.7.
+
+**Her volume** (`core/volume.py`). A child can say "louder", "speak up", "I
+can't hear you", "too loud", "use your indoor voice", and so on. After the
+safety screen, `volume_request` matches short requests aimed at Lucy, with no
+model involved. Questions ("which is louder, a lion or a whale?") and other
+subjects ("can a whale be louder than a jet?") are not requests. The change is
+a master volume on the speaker (`Speaker.set_volume`): 3 dB a step, from −15 dB
+to +9 dB by default (`[volume]`), applied to everything she plays, chimes
+included. Lucy has only a few decibels of room below full scale, so above 0 dB
+her peaks are rounded off (`soft_limit`, a tanh knee) rather than clipped. The
+motors see each clip as it was made, so her beak opens as wide at any volume.
+She confirms at the new level ("Honk! Is this better?", or "this is as loud as
+this goose goes!"). The volume lasts until she is turned off, so a grown-up's
+setting always comes back.
+
 ### 5.6 The honk (`core/honk.py`)
 
 Read aloud, "Honk!" is a person saying a word. So `HonkingVoice`, wrapped
 around whichever voice speaks, replaces each *interjected* honk ("Honk!",
 "Honk honk!", "…, honk!") with a goose call. A honk used as a word ("geese honk
 to stay together") is still spoken. The calls are synthesised with numpy at
-start-up (~90 ms), like the earcons, so no audio files are shipped:
+start-up (about 0.1 s for all nine on a laptop), like the earcons, so no audio
+files are shipped. They are built from measurements of real Canada geese: two
+free recordings on Wikimedia Commons ("Branta canadensis.ogg", public domain,
+and "Low flyover by five Canadian Geese.flac", CC0), of different birds, which
+agree. A honk turns out to be three things, not one:
 
 ```
- breath "h" ─► buzzy "aw": pitch jumps up, then glides; period-doubling rasp ─► nasal "ng" ─► soft "k"
-   70 ms              ~170 ms (about 20 harmonics shaped by moving formants)     70 ms        ~70 ms
+ the growl: quiet, low pulses ─► the break: pulses race, then ─► the honk: short, loud, high, ─► beak closes,
+ ~150 ms, 130-200 a second,       the voice jumps the last        2nd partial loudest; holds      duller, gone
+ 15-25 dB below the honk          octave in a few ms (~35 ms)     ~40 ms, then falls a fifth      (~110 ms in all)
 ```
 
-Punctuation sets the mood. "Honk!" falls, "Honk?" rises like a question, and
-"Honk." or "Honk," is lower and calmer. There are three variants of each,
-picked at random, and calls are normalised to the loudness of Lucy's voice
-(`tts.honk_volume` scales them). The system prompt keeps honks to about one
-answer in three, so the call stays a treat rather than a tic. Each call is
-also cued as a honk (§5.7), so her body flaps with it.
+* **The growl** ("ha"). Pulses at about a fifth of the honk's pitch, getting
+  quicker. After each one the windpipe rings at about 1.3 kHz, so every
+  partial is given the phase a real resonance has (minimum phase, from the
+  cepstrum): each pulse is followed by its ringing, not surrounded by it.
+* **The break.** One train of pulses does the whole call. In the growl's last
+  35 ms it speeds up to half the honk's pitch. Then its odd partials fade out
+  in 8 ms, which leaves the octave above: the honk. Nothing is cross-faded.
+* **The honk** ("RONK"). 600 to 850 Hz in real geese (Lucy's are 650 to
+  800 Hz), far higher than a person saying "honk". Its second partial is the
+  loudest, there is a dip near 3 kHz, and a second peak near 4 kHz gives the
+  brassy edge. It starts 5% flat, holds, and falls by a fifth as it dies away,
+  growing duller as the beak closes. For moments it drops back into period
+  doubling (the rasp), and the pulses waver in time and size (jitter, shimmer).
+
+Punctuation sets the mood. "Honk!" is the bright call above, "Honk?" ends on a
+rise like a question (the one thing here a real goose does not do), and "Honk."
+or "Honk," is lower and longer. There are three variants of each, at slightly
+different pitches, picked at random. Calls are levelled so that, to the ear,
+they are about as loud as the loud parts of her speech (`tts.honk_volume`
+scales them), with peaks rounded off rather than clipped. Each call is also
+cued as a honk (§5.7), so her body flaps with it.
+
+**She honks a lot.** The system prompt asks for a honk in most answers (never
+in a sad or serious one). The model does not always oblige, so the pipeline
+also opens some replies with a honk of Lucy's own (`turn.opening_honk_chance`,
+default one in two, sometimes "Honk honk!") when the reply does not already
+start with one and its first sentence has no sad or serious words ("sorry",
+"hurt", "grown-up", …). The call is pre-rendered, so it plays the moment the
+first sentence is ready, while the voice is still starting on the words.
 
 ### 5.7 Moving in time with her voice (`core/motion.py`)
 
-Lucy has two DC motors on a DRV8833 driver (docs/HARDWARE.md): the **beak**
+Lucy has two DC motors on an L293D driver (docs/HARDWARE.md): the **beak**
 motor pushes her beak open against a spring, and the **body** motor wiggles
 her. `Puppeteer` drives them from two inputs:
 
 ```
  SoundDeviceSpeaker ── PlaybackListener.playing(clip, heard_at) ──┐
-   (the audio callback knows when its buffer reaches the DAC)     ├─► Puppeteer ─► Motors ─► DRV8833
- Controller / pipeline ── Indicator.show(status) ─────────────────┘   (timeline     (PWM duty +
-                                                                       of moves)     direction line)
+   (the audio callback knows when its buffer reaches the DAC)     ├─► Puppeteer ─► Motors ─► L293D
+ Controller / pipeline ── Indicator.show(status) ─────────────────┘   (timeline     (PWM duty on EN +
+                                                                       of moves)     two direction lines)
 ```
 
 * **The beak follows the loudness of what is playing.** Each clip is measured
@@ -373,13 +471,17 @@ posted just before the stop, so a clip that was cut off never moves the beak.
 wakes for the earliest, applies every move that is due, and re-arms. There is
 no thread and no polling: about 25 wake-ups a second while Lucy speaks, and
 none while she is quiet. When nothing is planned and both motors are still,
-the driver goes to sleep (nSLEEP low).
+both enable pins go low and the motors coast.
 
-**The driver** (`adapters/motors.py`): xIN1 of each H-bridge is a hardware PWM
-channel and xIN2 a GPIO line. Forward is xIN2 low with xIN1's duty at the
-power, coasting between pulses so the beak's spring works freely. Reverse is
-xIN2 high with the duty at 1 − power, braking between pulses. So one PWM
-channel per motor covers both directions, and the Pi 4 has exactly two.
+**The driver** (`adapters/motors.py`): each motor's half of the L293D has its
+enable pin on a hardware PWM channel (the Pi 4 has exactly two) and its two
+inputs on GPIO lines. Forward is 1A high and 2A low, reverse the other way
+round, with the enable pin's duty at the power. An L293D brakes a motor whose
+inputs are equal, which would hold the beak open against its spring, so the
+PWM goes on the enable pin instead: between pulses, and whenever the power is
+0, the outputs are off and the motor coasts. The inputs change only when the
+direction does, after the enable pin goes low, so turning around never brakes
+either.
 
 **Motor safety.** Power is capped (`beak_max_power`, `body_power`). No motor
 runs longer than `max_hold_s` (2 s) without a 0.2 s rest, whatever the plan,
@@ -387,7 +489,7 @@ so a stalled motor cannot overheat inside the plush. A sysfs PWM channel
 keeps running after its process dies, so the unit's `ExecStopPost` runs
 `lucy motors --off` after any stop: a crash, a watchdog kill, or `systemctl
 stop`. Every motor line is pulled low at power-up (GPIO 9–27 default to
-pull-down, and the DRV8833 pulls nSLEEP down), so nothing moves while the Pi
+pull-down), so both enable pins stay low and nothing moves while the Pi
 boots. If the motors cannot be opened (no overlay, a line in use), Lucy logs
 it and keeps talking without moving, with the prompt for a Lucy who cannot
 move: she only says she can wiggle when she really can.
@@ -399,10 +501,11 @@ teacher. In setup mode, Lucy becomes a Wi-Fi hotspot with a settings page, and
 a grown-up configures her from a phone.
 
 ```
- wing held at wake-up ─► lucy writes /run/lucy/setup-request ─► lucy-setup.path ─┐
- no network 90 s after boot ─► lucy-setup-offline.service ───────────────────────┤
- sudo lucy setup ────────────────────────────────────────────────────────────────┤
-                                                                                 ▼
+ wing held at wake-up ───────────────┐
+ the knock, and "enter setup mode" ──┴► lucy writes /run/lucy/setup-request ─► lucy-setup.path ─┐
+ no network 90 s after boot ─► lucy-setup-offline.service ──────────────────────────────────────┤
+ sudo lucy setup ───────────────────────────────────────────────────────────────────────────────┤
+                                                                                                ▼
   lucy-setup.service (Conflicts=lucy.service: Lucy rests; her speaker, motors, and wing are free)
    scan ─► hotspot "Lucy-Setup-4821" (NetworkManager, 10.42.0.1) ─► "My setup Wi-Fi is on!"
    phone scans the card's QR code ─► joins ─► asks for any web page ─► DNS answers 10.42.0.1
@@ -411,6 +514,23 @@ a grown-up configures her from a phone.
                                            └─ no ─► delete it, hotspot back, say why
   ExecStopPost: lucy-persist (read-only root) ─► systemctl start lucy
 ```
+
+**Asking for it while she is awake** (`core/knock.py`). Holding her wing at
+wake-up means unplugging her first. So a grown-up can also knock and ask: tap,
+tap, hold, and "enter setup mode". The controller notices the taps (§5.1) and
+marks the turn. The pipeline matches the words on the Pi, after the safety
+screen, as it does a volume request: no model is involved. Lucy says "Setup
+time!" in full, writes the same request file as the wake-up gesture
+(`SetupHandover` in `app.py`), and waits for systemd to stop her. It takes both
+halves on purpose. The words alone are an ordinary question for the model, so
+a child saying them, or a story that contains them, changes nothing. The knock
+alone is an ordinary turn. The words are short and loosely matched ("go into
+set-up mode", "start setup"), but not as a question or with a "don't". She has
+to hear them, so offline this needs her own brain (§5.4); otherwise she says
+she cannot reach her thinking cloud, as for any question. If setup mode cannot
+start (it is not installed, or she is on a laptop), she says so, and takes the
+request back so that it cannot start setup mode out of the blue later.
+`setup.voice_command = false` turns all of this off.
 
 **Why a hotspot, not a page on the school network.** The page must work
 before Lucy is on any network, and school networks often block devices from
@@ -559,8 +679,9 @@ Process-level savings:
   SD pin from the PCM state, so closing the speaker stream powers the amp down
   (and silences idle hiss inside the plush).
 
-**Motors sleep.** The DRV8833 sleeps (nSLEEP low, microamps) whenever nothing
-is moving, and wakes in about a millisecond for the next move. The PWM runs
+**Motors rest.** Whenever nothing is moving both enable pins are low, so the
+L293D's outputs are off. It has no sleep mode, so its logic still draws a
+little from the Pi's 5 V. The PWM runs
 in hardware, and moves are event-loop timers that exist only while Lucy
 speaks. The motors run from their own battery, so they never draw from the
 Pi's supply.
@@ -699,7 +820,7 @@ grown-up.
 | Bad configuration | Refused at start-up with a precise message. Exit code 78 stops restart loops. If the voice loaded, Lucy says she needs a grown-up. |
 | Power yanked | `--read-only` overlay root: nothing on the SD card is being written. |
 | Missing API key | Lucy still starts, explains out loud that she needs a grown-up, and `lucy doctor` says exactly what to do. Without a Speechify key she simply speaks with her backup voice. |
-| Motors missing or broken (no PWM overlay, a line in use) | Lucy keeps still and keeps talking, with the prompt for a Lucy who cannot move. `lucy doctor` names the problem. The DRV8833 itself limits current and shuts down if it overheats. |
+| Motors missing or broken (no PWM overlay, a line in use) | Lucy keeps still and keeps talking, with the prompt for a Lucy who cannot move. `lucy doctor` names the problem. The L293D turns its outputs off if it overheats. |
 | Lucy crashes or is killed mid-sentence | `ExecStopPost` runs `lucy motors --off`, so no motor is left running on a stale PWM duty cycle. |
 | A new Wi-Fi network fails in setup mode | Its profile is deleted, the networks that worked before are untouched, Lucy says why, and her hotspot comes back (§5.8). |
 | Setup mode crashes, times out, or is stopped | `ExecStopPost` starts Lucy again (after copying the changes to the SD card on a read-only root). |
@@ -754,13 +875,17 @@ grown-up.
 | Turn pipeline and controller (barge-in, taps, record limit, dozing, budget, error phrases) | Fakes for every port (`tests/fakes.py`) |
 | HTTP adapters (SSE parsing, error translation, fallback, prewarm) | `httpx.MockTransport` |
 | Lucy's voice (PCM streaming in whole samples, content refusals, rate limits, falling back to Piper, resting, recovery) | `tests/test_voice.py`: `httpx.MockTransport` and fakes |
-| The honk (which honks are interjections, pitch contour per mood, loudness, no clipping) | `tests/test_honk.py`, with an autocorrelation pitch tracker |
-| Motion (beak follows loudness, shuts for chimes, no dip between streamed parts, flaps on every honk of a rendered line, bobs at phrase starts but not too often, ponders, still while listening, barge-in, hold limit, driver sleep) | `tests/test_motion.py`, with motors that record each command and its time |
-| Motor driver (DRV8833 truth table, sysfs PWM on a fake tree, waiting for udev, cleanup after a partial open, config validation, keeping still when broken) | `tests/test_motors.py` |
+| The honk (which honks are interjections; the growl's pulse rate, the break of more than two octaves up into the honk, how quiet the growl is and how fast the honk dies away, pitch contour per mood, a goose's spectrum, period doubling, loudness, no clipping) | `tests/test_honk.py`, with an autocorrelation pitch tracker and spectra |
+| The goose voice (pitch raised by the ratio, a goose's resonances in and the chest tones out, level kept, peaks rounded off, the rasp following her pitch and deepest as a phrase starts, seamless across any part sizes) | `tests/test_goose_voice.py`, with speech-shaped noise and voiced tones |
+| Her pace under the goose voice (the cloud voice's SSML rate and its escaping, Piper's measured length scale; with the real voice, the same sentences take as long as in her plain voice) | `tests/test_voice.py`, `tests/test_integration.py` |
+| Volume requests (what counts as a request and what goes to the model, steps and limits, soft limiting) and her own honks (how often, never twice, never on a sad reply) | `tests/test_volume.py`, `tests/test_pipeline.py` |
+| Motion (beak follows loudness, shuts for chimes, no dip between streamed parts, flaps on every honk of a rendered line, bobs at phrase starts but not too often, ponders, still while listening, barge-in, hold limit, coasting when idle) | `tests/test_motion.py`, with motors that record each command and its time |
+| Motor driver (L293D truth table, never braking on a change of direction, sysfs PWM on a fake tree, waiting for udev, cleanup after a partial open, config validation, keeping still when broken) | `tests/test_motors.py` |
 | Safety screens (what must be caught, and what must get through) | `tests/test_safety.py`. New disguises are also checked against an English word list. |
 | Audio adapters (gapless splicing, stop, cancel, open failure, mic capping, when each clip is heard) | A simulated `sounddevice` whose thread calls the real callbacks |
 | Config, power knobs, systemd notify | Temp files, a fake sysfs tree, a real Unix datagram socket |
 | Setup mode (keyfiles and nmcli parsing, join with rollback, the settings store and its comments, the card, every page action over real HTTP, joining, failing, idle and wing exits, the wake-up gesture) | `tests/test_setup.py`: a fake nmcli, the demo network, and a body that records what Lucy says |
+| Asking for setup mode by voice (which taps and squeezes make a knock, the hint that waits for one; which words ask; knock and words together and each alone, the safety screen first, offline with and without her own brain, what she says when it cannot start; end to end from the button to the request file, which is taken back if nothing comes of it) | `tests/test_controller.py`, `tests/test_knock.py`, `tests/test_pipeline.py`, `tests/test_setup.py`; with the real models, `tests/test_local.py` |
 | Offline brain (fallback at each stage, remembered outages, recovery, history limit, never mixing brains) | Fakes in `tests/test_pipeline.py`; a simulated faster-whisper in `tests/test_local.py` |
 | Real voice end to end | `tests/test_integration.py` (runs when `LUCY_TEST_VOICE` is set) |
 | Real offline turn: Piper speaks a question, faster-whisper hears it, a mocked Ollama answers | `tests/test_integration.py`, `tests/test_local.py` (with `LUCY_TEST_STT_MODEL`) |
