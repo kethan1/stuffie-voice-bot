@@ -1,6 +1,7 @@
 """Setup mode: Wi-Fi through NetworkManager, the settings, the card, and the page end to end."""
 
 import asyncio
+import dataclasses
 import re
 import socket
 import stat
@@ -11,14 +12,17 @@ from pathlib import Path
 import httpx
 import pytest
 
+from lucy.adapters.logbook import Logbook
 from lucy.app import SETUP_REQUEST, SetupHandover, _hand_over_to_setup, request_setup
 from lucy.config import Config, ConfigError, load_config
 from lucy.core.controller import Controller, SessionSettings
 from lucy.core.conversation import Conversation
+from lucy.core.metrics import TurnTimer
 from lucy.core.motion import MotionSettings
 from lucy.core.phrases import Phrase, PhraseBook
 from lucy.core.pipeline import Brain, TurnPipeline, TurnSettings
 from lucy.core.safety import BLOCKED_WORDS, ReplyFilter, SafetyScreen
+from lucy.core.types import Concern, Outcome, TurnRecord
 from lucy.persona import LUCY, SetupLine
 from lucy.setup.hotspot import Hotspot, card_html, load_hotspot, new_hotspot
 from lucy.setup.http import Request as HttpRequest
@@ -51,6 +55,7 @@ from tests.fakes import (
     FakeSpeaker,
     FakeSTT,
     FakeTTS,
+    tone,
     until,
 )
 
@@ -474,6 +479,7 @@ class Rig:
         self.network = network or DemoNetwork()
         self.body = FakeBody()
         self.store = SettingsStore(config_file, config_file.parent / "credentials")
+        self.logbook = Logbook(config_file.parent / "state" / "logbook.db")
         self.now = 0.0
         self.mode = SetupMode(
             config=self.store.load(),
@@ -483,6 +489,7 @@ class Rig:
             hotspot=HOTSPOT,
             address=("127.0.0.1", self.port),
             button=button,
+            logbook=self.logbook,
             clock=lambda: self.now,
             handoff_s=0.0,
             wing_hold_s=0.05,
@@ -501,6 +508,7 @@ class Rig:
 
     async def __aexit__(self, *exc: object) -> None:
         await self.client.aclose()
+        self.logbook.close()
         if self.task is not None and not self.task.done():
             self.task.cancel()
             await asyncio.gather(self.task, return_exceptions=True)
@@ -511,6 +519,13 @@ class Rig:
     async def finished(self) -> int:
         assert self.task is not None
         return await asyncio.wait_for(self.task, 2.0)
+
+    def wrote(self, *turns: TurnRecord) -> None:
+        """What Lucy wrote in her logbook before setup mode started."""
+        lucy = Logbook(self.logbook.path)
+        for turn in turns:
+            lucy.record(turn)
+        lucy.close()
 
 
 LUCY_FORM = {
@@ -698,6 +713,184 @@ class TestPage:
         assert await rig.mode.run() == 1
         assert rig.body.heard(SetupLine.NO_HOTSPOT)
         await rig.client.aclose()
+
+
+def chat(conversation: int, heard: str, said: str = "Honk!") -> TurnRecord:
+    return TurnRecord(conversation, heard, said, brain="cloud")
+
+
+DISCLOSURE = TurnRecord(
+    1,
+    "my brother hits me",
+    "Please tell a grown-up you trust right away.",
+    Outcome.SCREENED,
+    Concern.NEEDS_GROWN_UP,
+    ("being-hurt",),
+    brain="cloud",
+)
+
+
+class TestConversations:
+    """Her logbook on the page: what was said to Lucy, for a grown-up to read and delete."""
+
+    async def test_the_settings_page_says_what_is_written_down(self, config_file: Path) -> None:
+        rig = Rig(config_file)
+        rig.wrote(chat(0, "why is the sky blue"), DISCLOSURE)
+        async with rig:
+            page = (await rig.client.get("/")).text
+            assert "2 conversations written down" in page
+            assert "1 of them with a safety screen stepping in" in page
+            assert 'href="/conversations"' in page
+            assert "why is the sky blue" not in page  # the words are one tap further in
+
+    async def test_conversations_are_shown_latest_first_with_what_the_screens_did(
+        self, config_file: Path
+    ) -> None:
+        rig = Rig(config_file)
+        stopped = TurnRecord(
+            2, "spell it", "Sure! Nope.", Outcome.STOPPED, Concern.OFF_LIMITS, ("blocked-word",)
+        )
+        stopped = dataclasses.replace(stopped, drafted="It is spelled S H", brain="local")
+        rig.wrote(chat(0, "why is the sky blue", "Sunlight!"), chat(0, "why?"), DISCLOSURE, stopped)
+        async with rig:
+            reply = await rig.client.get("/conversations")
+            assert reply.status_code == 200
+            text = reply.text
+            assert text.index("spell it") < text.index("my brother hits me") < text.index("sky")
+            assert text.index("why is the sky blue") < text.index("why?")  # in the order said
+            assert "Sunlight!" in text
+            assert "a safety screen answered · may need a grown-up (being-hurt)" in text
+            assert "a safety screen stopped her reply" in text
+            assert "The model had written: It is spelled S H" in text
+            assert "answered offline" in text
+            assert text.count('class="turn flagged"') == 2
+            assert "All (3)" in text
+            assert "Where a safety screen stepped in (2)" in text
+            assert "She deletes them after 30 days." in text
+            assert "<script" not in text.lower()
+
+            flagged = (await rig.client.get("/conversations?flagged=1")).text
+            assert "my brother hits me" in flagged
+            assert "spell it" in flagged
+            assert "why is the sky blue" not in flagged
+
+    async def test_what_was_said_is_shown_as_text_never_as_html(self, config_file: Path) -> None:
+        rig = Rig(config_file)
+        rig.wrote(chat(0, '<script>alert("hi")</script>', "<b>Honk</b> & honk"))
+        async with rig:
+            text = (await rig.client.get("/conversations")).text
+            assert "&lt;script&gt;alert(&quot;hi&quot;)&lt;/script&gt;" in text
+            assert "&lt;b&gt;Honk&lt;/b&gt; &amp; honk" in text
+            assert "<script>" not in text
+
+    async def test_long_logbooks_come_a_page_at_a_time(self, config_file: Path) -> None:
+        rig = Rig(config_file)
+        rig.wrote(*(chat(number, f"question number {number:02d}") for number in range(23)))
+        async with rig:
+            first = (await rig.client.get("/conversations")).text
+            assert "question number 22" in first
+            assert "question number 13" in first
+            assert "question number 12" not in first
+            assert "Page 1 of 3" in first
+            assert 'href="/conversations?page=2"' in first
+            assert "Newer" not in first
+            flagged = (await rig.client.get("/conversations?flagged=1")).text
+            assert "No safety screen has stepped in." in flagged
+            last = (await rig.client.get("/conversations?page=3")).text
+            assert "question number 02" in last
+            assert "question number 00" in last
+            assert "question number 03" not in last
+            assert "Older" not in last
+            for odd in ("99", "0", "-1", "x", "\u00b2"):  # anything else: the nearest real page
+                reply = await rig.client.get("/conversations", params={"page": odd})
+                assert reply.status_code == 200
+
+    async def test_deleting_needs_the_token_and_the_tick(self, config_file: Path) -> None:
+        rig = Rig(config_file)
+        rig.wrote(chat(0, "why is the sky blue"), DISCLOSURE)
+        async with rig:
+            stale = await rig.client.post(
+                "/conversations/clear", data={"token": "stale", "sure": "on"}
+            )
+            assert stale.status_code == 403
+            unsure = await rig.post("/conversations/clear")
+            assert unsure.status_code == 400
+            assert "Tick the box" in unsure.text
+            assert "my brother hits me" in (await rig.client.get("/conversations")).text
+
+            reply = await rig.post("/conversations/clear", sure="on")
+            assert reply.status_code == 303
+            assert reply.headers["location"] == "/conversations?done=cleared"
+            after = (await rig.client.get(reply.headers["location"])).text
+            assert "Every conversation is deleted." in after
+            assert "Nothing is written down yet." in after
+            assert "my brother hits me" not in after
+            assert b"my brother hits me" not in rig.logbook.path.read_bytes()
+            assert "Nothing is written down yet." in (await rig.client.get("/")).text
+
+    async def test_before_lucy_has_written_anything(self, config_file: Path) -> None:
+        async with Rig(config_file) as rig:
+            assert "Nothing is written down yet." in (await rig.client.get("/")).text
+            reply = await rig.client.get("/conversations")
+            assert reply.status_code == 200
+            assert "Nothing is written down yet." in reply.text
+            assert "Delete" not in reply.text
+            assert (await rig.post("/conversations/clear", sure="on")).status_code == 303
+            assert not rig.logbook.path.exists()  # setup mode (root) never makes Lucy's file
+
+    async def test_what_lucy_hears_today_is_on_the_page_tonight(self, config_file: Path) -> None:
+        """Through the real pipeline and the real file: a question, then a disclosure."""
+        rig = Rig(config_file)
+        lucy = Logbook(rig.logbook.path)
+        tts, stt, model = FakeTTS(), FakeSTT("why is the sky blue"), FakeChat()
+        pipeline = TurnPipeline(
+            brain=Brain("cloud", stt, model),
+            tts=tts,
+            moderator=SafetyScreen(),
+            speaker=FakeSpeaker(),
+            indicator=FakeIndicator(),
+            phrases=PhraseBook(LUCY.lines, tts),
+            conversation=Conversation(4),
+            system_prompt=LUCY.system_prompt,
+            settings=TurnSettings(opening_honk_chance=0.0),
+            logbook=lucy,
+        )
+        await pipeline.respond(tone(1.0), TurnTimer())
+        stt.text = "my brother hits me"
+        await pipeline.respond(tone(1.0), TurnTimer())
+        lucy.close()  # Lucy stops to make way for setup mode
+        assert len(model.calls) == 1  # the disclosure never went to the model
+        async with rig:
+            text = (await rig.client.get("/conversations")).text
+            assert "why is the sky blue" in text
+            assert "Honk! The sky is blue because of sunlight. Neat?" in text
+            assert "my brother hits me" in text
+            assert "may need a grown-up (being-hurt)" in text
+            assert "1 turn" not in text  # both turns are one conversation
+            assert "2 turns" in text
+
+    async def test_a_logbook_that_cannot_be_read_says_so(self, config_file: Path) -> None:
+        rig = Rig(config_file)
+        rig.logbook.path.parent.mkdir()
+        rig.logbook.path.write_bytes(b"not a database at all " * 64)
+        async with rig:
+            assert "Her logbook could not be read." in (await rig.client.get("/")).text
+            reply = await rig.client.get("/conversations")
+            assert reply.status_code == 400
+            assert "cannot read" in reply.text
+
+    async def test_its_settings_are_saved_from_the_page(self, config_file: Path) -> None:
+        async with Rig(config_file) as rig:
+            reply = await rig.post("/save", **{"section": "logbook", "logbook.keep_days": "7"})
+            assert reply.status_code == 303
+            config = load_config(config_file)
+            assert not config.logbook.enabled  # the box was not ticked
+            assert config.logbook.keep_days == 7
+            text = (await rig.client.get("/conversations")).text
+            assert "Writing them down is turned off" in text
+            bad = await rig.post("/save", **{"section": "logbook", "logbook.keep_days": "-3"})
+            assert bad.status_code == 400
+            assert "use a number from 0 to 3650" in bad.text
 
 
 class TestSpeech:

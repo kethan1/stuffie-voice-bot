@@ -21,6 +21,12 @@ one to three short, witty sentences, usually starting within about a second.
   answer), and when she says "Honk!" you hear a goose call, not the word read
   aloud: the low growl, the break, and the short bright honk of a Canada goose,
   synthesised on the Pi from measurements of real ones.
+* **Remembers the conversation:** the last few exchanges word for word, and a
+  few short notes on everything before them (your name, your favourite animal,
+  the riddle you haven't solved), so she still knows them many questions
+  later. The notes are written between turns, so no answer waits for them, and
+  her prompt never grows. Her memory stays in RAM and is forgotten after five
+  quiet minutes, so the next child starts fresh.
 * **Louder or quieter on request:** "Louder!", "speak up", "too loud", or "use
   your indoor voice" changes her volume at once, chimes included. She goes back
   to her usual loudness when she is turned off.
@@ -44,8 +50,14 @@ one to three short, witty sentences, usually starting within about a second.
   (however they're disguised), meanness, and attempts to trick her each get a
   fixed reply in her own voice, and none of those words leave the Pi. A second
   screen checks every sentence Lucy is about to say. A careful system prompt
-  covers everything else. No recordings are kept and no transcripts are
-  logged.
+  covers everything else. No recordings are kept.
+* **A logbook for grown-ups:** every conversation is written to an SQLite file
+  on her memory card: what was said to her, what she answered, and where a
+  safety screen stepped in. A grown-up reads it (and deletes it) from a phone
+  in setup mode, so a child who tells Lucy something serious has not told
+  nobody. It is written after each turn, off the event loop, so no answer
+  waits for it. Lucy never reads it herself, it never leaves the Pi, and
+  `logbook.enabled = false` turns it off.
 * **Robust:** Lucy explains problems out loud ("Can a grown-up check the
   Wi-Fi?"). She falls back to a second model when rate-limited, is restarted
   by the systemd watchdog if wedged, and supports a read-only root filesystem
@@ -170,12 +182,14 @@ different config. With `dev.toml`, the log shows what Lucy heard and what the mo
 ```
 src/lucy/
   core/          pure logic: controller (state machine), pipeline (streaming turn),
-                 chunker, text cleaning, safety screen, conversation, phrases, motion, ports
+                 chunker, text cleaning, safety screens, conversation and notes (her
+                 memory), phrases, motion, ports
   adapters/      Groq/OpenAI-compatible HTTP, Speechify, Piper, PortAudio, libgpiod,
-                 motors (L293D on hardware PWM), power knobs
+                 motors (L293D on hardware PWM), power knobs, the logbook (SQLite)
   platform/      systemd notify/watchdog, journald-aware logging
   tools/         `lucy doctor`, `lucy bench`
-  setup/         setup mode: her own Wi-Fi hotspot, the settings page, NetworkManager
+  setup/         setup mode: her own Wi-Fi hotspot, the settings page, the conversations
+                 in her logbook, NetworkManager
   persona.py     Lucy's personality spec, system prompt, and fixed lines
   app.py         composition root (brains.py, voices.py, and motors.py assemble the parts)
   config.py      strict TOML configuration

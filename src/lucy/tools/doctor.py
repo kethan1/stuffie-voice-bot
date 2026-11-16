@@ -2,7 +2,7 @@
 
 Run it after installing, after rewiring, or whenever Lucy is quiet. It checks
 the configuration, API keys, both voices, sound devices, GPIO lines, the
-motors' PWM channels, network/API access, and power controls. With
+motors' PWM channels, her logbook, network/API access, and power controls. With
 ``--listen`` it also records three seconds so microphone levels can be checked
 against ``turn.speech_threshold_dbfs``.
 """
@@ -15,6 +15,7 @@ import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
+from lucy.adapters.logbook import Logbook
 from lucy.adapters.power import CPUFREQ_ROOT
 from lucy.adapters.sound import import_sounddevice
 from lucy.adapters.speechify_tts import SpeechifySpeech
@@ -49,6 +50,8 @@ async def doctor(config: Config, config_path: Path | None, *, listen: bool) -> i
         probes.append(("LED GPIO", led_line))
     if config.motors.enabled:
         probes.append(("motors", motors))
+    if config.logbook.enabled:
+        probes.append(("logbook", logbook))
     probes.append(("AI service", service))
     if config.tts.cloud.enabled:
         probes.append(("cloud voice", cloud_voice))
@@ -77,6 +80,20 @@ async def _run(probe: Probe, config: Config) -> tuple[str, str]:
         return WARN, str(warning)
     except Exception as error:  # every failure is reported; none aborts the run
         return FAIL, f"{type(error).__name__}: {error}"
+
+
+async def logbook(config: Config) -> str:
+    settings = config.logbook
+    book = Logbook(settings.database, keep_days=settings.keep_days)
+    try:
+        found = await asyncio.to_thread(book.check)  # LogbookError if it cannot be written
+    finally:
+        book.close()
+    kept = f"kept {settings.keep_days} days" if settings.keep_days else "kept until deleted"
+    return (
+        f"{settings.database}: {found.conversations} conversation(s), {found.turns} turn(s), "
+        f"{kept}; read them in setup mode"
+    )
 
 
 def api_key(config: Config) -> str:
@@ -235,6 +252,8 @@ async def service(config: Config) -> str:
         await cloud.api.aclose()
     available = {model.get("id") for model in body.get("data", []) if isinstance(model, dict)}
     wanted = [config.stt.model, config.llm.model, config.llm.fallback_model]
+    if config.memory.notes:
+        wanted.append(config.memory.model)
     missing = [model for model in wanted if model and model not in available]
     if missing:
         raise LucyError(f"model(s) not offered by the API: {', '.join(missing)}")

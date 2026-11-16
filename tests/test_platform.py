@@ -22,10 +22,13 @@ class TestConfig:
         config = load_config(None)
         assert config.llm.model == "openai/gpt-oss-20b"
         assert config.llm.params["reasoning_effort"] == "low"
+        assert config.memory.notes
+        assert config.memory.model not in (config.llm.model, config.llm.fallback_model)
 
     def test_shipped_config_is_valid(self) -> None:
         config = load_config(REPO / "deploy" / "config.toml")
         assert config.button.backend == "gpio"
+        assert config == Config()  # it shows every setting at its built-in default
 
     def test_laptop_config_leaves_the_laptop_alone(self) -> None:
         config = load_config(REPO / "dev.toml")
@@ -35,6 +38,8 @@ class TestConfig:
         assert not config.power.manage_wifi
         assert config.tts.voice == REPO / "voices" / "en_US-lessac-medium.onnx"  # `make voice`
         assert config.local.stt_model == REPO / "models" / "faster-whisper-tiny.en"
+        assert config.logbook.database == REPO / "logbook.db"  # not /var/lib/lucy; gitignored
+        assert "logbook.db" in (REPO / ".gitignore").read_text().splitlines()
 
     def test_relative_paths_are_relative_to_the_config_file(self, tmp_path: Path) -> None:
         path = tmp_path / "c.toml"
@@ -75,6 +80,12 @@ class TestConfig:
             ("[volume]\nmax_db = 30\n", "volume.max_db"),
             ("[volume]\nstep_db = 0\n", "volume.step_db"),
             ("[volume]\nmin_db = 3\n", "volume.min_db"),
+            ("[llm]\nhistory_exchanges = -1\n", "llm.history_exchanges"),
+            ("[memory]\nmax_words = 3\n", "memory.max_words"),
+            ('[memory]\nmodel = ""\n', "memory.model"),
+            ("[memory]\nnote = true\n", "unknown setting"),
+            ("[logbook]\nkeep_days = -1\n", "logbook.keep_days"),
+            ("[logbook]\nkeep_days = 7.5\n", "logbook.keep_days should be int"),
             ("[[oops", "not valid TOML"),
         ],
     )

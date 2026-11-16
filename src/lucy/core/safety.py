@@ -16,6 +16,9 @@ cloud moderator cannot sit in front of every turn. Lucy layers safety instead:
    disguised: spelled out ("S. H. I. T."), censored ("f***"), in leetspeak
    ("sh!t"), backwards ("kcuf"), stretched ("shiiit", "shitt"), with look-alike
    letters or accents.
+4. :class:`NoteScreen` checks the notes Lucy keeps about a conversation
+   (:mod:`lucy.core.notes`) before they join her prompt: they must pass both
+   screens above, and must not read like rules for her.
 
 False positives are acceptable by design: every scripted reply is kind and
 harmless even when the child meant something innocent. Each pattern is
@@ -28,6 +31,7 @@ import re
 import unicodedata
 from collections.abc import Iterable, Iterator, Mapping
 
+from lucy.core.ports import Moderator, ReplyScreen
 from lucy.core.types import ALLOWED, Assessment, Concern
 
 log = logging.getLogger(__name__)
@@ -555,3 +559,38 @@ class ReplyFilter:
         if self._words.found_in(folded):
             return Assessment(Concern.OFF_LIMITS, ("blocked-word",))
         return ALLOWED
+
+
+# -- What Lucy remembers ----------------------------------------------------------------------
+
+# Notes are memories, never rules: nothing in them may say what Lucy must or may do. "Sam's
+# mom said Lucy is allowed to..." would otherwise sit in her prompt for the rest of the
+# conversation. Notes about a game's rules are lost with them, which costs little.
+NOTE_PATTERNS: dict[str, str] = {
+    "rules-for-lucy": (
+        r"\b(?:rules?|instructions?|programming|filters?|restrictions?|guidelines)\b"
+        r"|\b(?:allowed|permission|permitted|obey\w*)\b|\bboss of\b|\b(?:lucy'?s|her) boss\b"
+    ),
+}
+
+
+class NoteScreen:
+    """Moderator for the notes Lucy keeps about a conversation (:mod:`lucy.core.notes`).
+
+    A language model writes them from what a child said, and they become part of every later
+    prompt. So they must pass what a child's words must pass and what Lucy's replies must
+    pass, and must not read like rules for her.
+    """
+
+    def __init__(self, said: Moderator, replies: ReplyScreen) -> None:
+        self._said = said
+        self._replies = replies
+        self._rules = _compile(NOTE_PATTERNS)
+
+    async def assess(self, text: str) -> Assessment:
+        for assessment in (self._replies.screen(text), await self._said.assess(text)):
+            if not assessment.allowed:
+                return assessment
+        folded = fold(text)
+        reasons = tuple(name for name, rx in self._rules.items() if rx.search(folded))
+        return Assessment(Concern.TRICK, reasons) if reasons else ALLOWED

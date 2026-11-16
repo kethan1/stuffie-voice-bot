@@ -44,9 +44,15 @@ class ContentRefused(ServiceError):
     """A content screen refused the text. Retrying it unchanged cannot help.
 
     ``concern`` says why, so Lucy can answer to match: a service's own screen does not say,
-    and is treated as an off-limits topic.
+    and is treated as an off-limits topic. ``reasons`` names what Lucy's own screen matched.
     """
 
-    def __init__(self, message: str, concern: Concern = Concern.OFF_LIMITS) -> None:
+    def __init__(
+        self,
+        message: str,
+        concern: Concern = Concern.OFF_LIMITS,
+        reasons: tuple[str, ...] = (),
+    ) -> None:
         super().__init__(message)
         self.concern = concern
+        self.reasons = reasons

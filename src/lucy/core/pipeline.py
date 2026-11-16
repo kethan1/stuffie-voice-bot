@@ -34,6 +34,16 @@ When a safety screen answers instead of the model, the conversation remembers
 the exchange as :data:`SCREENED` and the fixed line Lucy said, never the child's
 words. A follow-up such as "yes!" (to "Want a weird animal fact instead?") or
 "but I'm scared to tell" then reaches a model that knows what Lucy just said.
+
+Every exchange goes into Lucy's short-term memory, and when that is full its older
+half is folded into her notes (:mod:`lucy.core.notes`). The notes are written in the
+background after the turn, so no reply ever waits for them.
+
+Every turn in which Lucy heard words is also written in her logbook (the ``TurnLog``
+port; :mod:`lucy.adapters.logbook`), however it ended: what the child said as it was
+transcribed, what Lucy said out loud, and whether a safety screen stepped in. That is
+a record for the grown-ups who look after her. Lucy never reads it back, and it is
+written after the turn, off the event loop.
 """
 
 import asyncio
@@ -61,6 +71,7 @@ from lucy.core.errors import (
 from lucy.core.honk import starts_with_honk
 from lucy.core.knock import asks_for_setup
 from lucy.core.metrics import TurnTimer
+from lucy.core.notes import NoteTaker
 from lucy.core.phrases import Phrase, PhraseBook
 from lucy.core.ports import (
     ChatModel,
@@ -71,10 +82,11 @@ from lucy.core.ports import (
     Speaker,
     SpeechToText,
     TextToSpeech,
+    TurnLog,
 )
 from lucy.core.tasks import detach, run_together
 from lucy.core.textnorm import to_speakable
-from lucy.core.types import Concern, Status
+from lucy.core.types import Concern, Outcome, Status, TurnRecord
 from lucy.core.volume import Volume
 
 log = logging.getLogger(__name__)
@@ -147,6 +159,14 @@ class _Turn:
     spoken: list[str] = field(default_factory=list)
     opened: bool = False
     """Whether the reply's first words have been voiced (and maybe given a honk)."""
+    transcript: str = ""
+    """What was heard, whether or not the input screen let it through. For the logbook."""
+    line: str = ""
+    """The fixed line Lucy said in place of an answer, or after one that went wrong."""
+    outcome: Outcome = Outcome.ANSWERED
+    concern: Concern = Concern.NONE
+    """Why a safety screen stepped in, if one did, and which patterns matched."""
+    reasons: tuple[str, ...] = ()
 
     def received(self, delta: str) -> None:
         """The next piece of the model's reply arrived."""
@@ -171,6 +191,8 @@ class TurnPipeline:
         reply_screen: ReplyScreen | None = None,
         volume: Volume | None = None,
         setup: SetupStarter | None = None,
+        notes: NoteTaker | None = None,
+        logbook: TurnLog | None = None,
         rng: random.Random | None = None,
     ) -> None:
         self._brain = brain
@@ -186,6 +208,8 @@ class TurnPipeline:
         self._settings = settings
         self._volume = volume
         self._setup = setup
+        self._notes = notes
+        self._logbook = logbook
         self._rng = rng or random.Random()
 
     async def respond(self, recording: Pcm, timer: TurnTimer, *, knocked: bool = False) -> None:
@@ -196,9 +220,19 @@ class TurnPipeline:
         """
         turn = _Turn(timer, self._brain, knocked)
         try:
+            await self._answer(recording, turn)
+        finally:
+            # However the turn ended, an interruption half-way through a safety line included.
+            self._write_down(turn)
+
+    async def _answer(self, recording: Pcm, turn: _Turn) -> None:
+        timer = turn.timer
+        try:
             await self._respond(recording, turn)
         except asyncio.CancelledError:
             log.info("turn interrupted (%s brain): %s", turn.brain.name, timer.report())
+            if turn.outcome is Outcome.ANSWERED:
+                turn.outcome = Outcome.INTERRUPTED
             self._remember(turn)  # what was said before the interruption, so "why?" works
             raise
         except Exception as error:
@@ -216,10 +250,13 @@ class TurnPipeline:
                 # Not even part of a refused sentence should be heard: cut it off, move on.
                 self._speaker.stop()
                 self._log_reply(turn)
-                await self._redirect(phrase_for(error))
+                turn.outcome, turn.concern = Outcome.STOPPED, error.concern
+                turn.reasons = error.reasons or ("cloud-screen",)  # a service's own screen
+                await self._redirect(phrase_for(error), turn)
                 return
+            turn.outcome = Outcome.FAILED
             if not turn.spoken:
-                await self.say(phrase_for(error), status=Status.ERROR)
+                await self._say(phrase_for(error), Status.ERROR, turn)
             self._remember(turn)
         else:
             log.info("turn complete (%s brain): %s", turn.brain.name, timer.report())
@@ -229,29 +266,65 @@ class TurnPipeline:
         """Speak one of Lucy's fixed lines. Never raises except for cancellation."""
         await self._say(phrase, status)
 
-    async def _say(self, phrase: Phrase, status: Status = Status.SPEAKING) -> str | None:
-        """Speak one of Lucy's fixed lines, and return it (None if it could not be said)."""
+    async def _say(
+        self, phrase: Phrase, status: Status = Status.SPEAKING, turn: _Turn | None = None
+    ) -> str | None:
+        """Speak one of Lucy's fixed lines, and return it (None if it could not be said).
+
+        ``turn``: the turn it is said in, whose record then shows the line, even when the
+        child interrupts it.
+        """
         try:
             text, audio = await self._phrases.line(phrase)
+            if turn is not None:
+                turn.line = text
             self._indicator.show(status)
             await self._speaker.enqueue(audio)
         except Exception:
             # Nothing left to say it with: the LED is the only way left to signal trouble.
             log.exception("could not speak phrase %s", phrase)
             self._indicator.show(Status.ERROR)
+            if turn is not None:
+                turn.line = ""
             return None
         return text
 
-    async def _redirect(self, phrase: Phrase) -> None:
+    async def _redirect(self, phrase: Phrase, turn: _Turn) -> None:
         """Say a safety line in place of an answer, and remember it, but not what led to it."""
-        said = await self._say(phrase)
+        said = await self._say(phrase, turn=turn)
         if said:
-            self._conversation.record(SCREENED, said)
+            self._record(SCREENED, said, screened=True)
 
     def _remember(self, turn: _Turn) -> None:
         """Remember what was actually said, even if interrupted, so "why?" still works."""
-        self._conversation.record(turn.heard, " ".join(turn.spoken))
+        self._record(turn.heard, " ".join(turn.spoken))
         self._log_reply(turn)
+
+    def _record(self, heard: str, said: str, *, screened: bool = False) -> None:
+        """Add an exchange to Lucy's memory, and let her notes catch up in the background."""
+        self._conversation.record(heard, said, screened=screened)
+        if self._notes is not None:
+            self._notes.catch_up()
+
+    def _write_down(self, turn: _Turn) -> None:
+        """Put the turn in Lucy's logbook, if she has one and heard any words. Never raises."""
+        if self._logbook is None or not turn.transcript:
+            return
+        stopped = turn.outcome is Outcome.STOPPED
+        record = TurnRecord(
+            conversation=self._conversation.era,
+            heard=turn.transcript,
+            said=" ".join(part for part in (*turn.spoken, turn.line) if part),
+            outcome=turn.outcome,
+            concern=turn.concern,
+            reasons=turn.reasons,
+            drafted="".join(turn.reply).strip() if stopped else "",
+            brain=turn.brain.name,
+        )
+        try:
+            self._logbook.record(record)
+        except Exception:  # a record that cannot be kept must never cost a child an answer
+            log.warning("could not write the turn in the logbook", exc_info=True)
 
     def _log_reply(self, turn: _Turn) -> None:
         if self._settings.log_transcripts and turn.reply:
@@ -275,41 +348,46 @@ class TurnPipeline:
             log.info("transcript was empty (%.2fs of sound)", speech.duration)
             await self.say(Phrase.DIDNT_HEAR)
             return
+        turn.transcript = text
         if settings.log_transcripts:
             log.info("child said: %r", text)
 
         assessment = await self._moderator.assess(text)
         if not assessment.allowed:
             log.info("screened: %s (%s)", assessment.concern.value, ", ".join(assessment.reasons))
-            await self._redirect(screened_phrase(assessment.concern))
+            turn.outcome, turn.concern = Outcome.SCREENED, assessment.concern
+            turn.reasons = assessment.reasons
+            await self._redirect(screened_phrase(assessment.concern), turn)
             return
 
         if turn.knocked and self._setup is not None and asks_for_setup(text):
-            await self._start_setup(self._setup)
+            turn.outcome = Outcome.SETUP
+            await self._start_setup(self._setup, turn)
             return
 
         if self._volume is not None and (request := self._volume.request(text)) is not None:
             phrase = self._volume.change(request)
             log.info("asked to be %s: volume now %+.0f dB", request.value, self._volume.db)
-            said = await self._say(phrase)
+            turn.outcome = Outcome.VOLUME
+            said = await self._say(phrase, turn=turn)
             if said:
-                self._conversation.record(text, said)
+                self._record(text, said)
             return
 
         turn.heard = text
         await self._stream_reply(text, turn)
 
-    async def _start_setup(self, setup: SetupStarter) -> None:
+    async def _start_setup(self, setup: SetupStarter, turn: _Turn) -> None:
         """A grown-up asked for setup mode with the knock: say so, then hand over to it."""
         if not setup.available:
             log.warning("asked for setup mode, which cannot start here")
-            await self.say(Phrase.NO_SETUP)
+            await self._say(Phrase.NO_SETUP, turn=turn)
             return
         log.info("asked for setup mode with the knock")
-        await self.say(Phrase.SETUP)  # all of it, before Lucy is stopped to make way
+        await self._say(Phrase.SETUP, turn=turn)  # all of it, before Lucy is stopped
         self._indicator.show(Status.THINKING)
         if not await setup.start():
-            await self.say(Phrase.NO_SETUP, status=Status.ERROR)
+            await self._say(Phrase.NO_SETUP, Status.ERROR, turn)
 
     async def _transcribe(self, speech: Pcm, turn: _Turn) -> str:
         try:
@@ -376,7 +454,11 @@ class TurnPipeline:
                     assessment.concern.value,
                     ", ".join(assessment.reasons),
                 )
-                raise ContentRefused("Lucy's reply screen stopped a sentence", assessment.concern)
+                raise ContentRefused(
+                    "Lucy's reply screen stopped a sentence",
+                    assessment.concern,
+                    assessment.reasons,
+                )
         return words
 
     def _with_opening_honk(self, words: str, turn: _Turn) -> str:

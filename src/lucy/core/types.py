@@ -83,3 +83,35 @@ class Assessment:
 
 
 ALLOWED = Assessment()
+
+
+class Outcome(StrEnum):
+    """How a turn ended, as Lucy's logbook records it."""
+
+    ANSWERED = "answered"
+    INTERRUPTED = "interrupted"  # the wing was squeezed again before she had finished
+    SCREENED = "screened"  # a safety screen answered what the child said, not the model
+    STOPPED = "stopped"  # a safety screen stopped Lucy's reply part-way
+    FAILED = "failed"  # something broke: no network, a rate limit, a sound device
+    VOLUME = "volume"  # asked to be louder or quieter
+    SETUP = "setup"  # a grown-up asked for setup mode
+
+
+@dataclass(frozen=True, slots=True)
+class TurnRecord:
+    """One turn of a conversation, as it is written in Lucy's logbook."""
+
+    conversation: int
+    """Which conversation of this run it belongs to (:attr:`Conversation.era`)."""
+    heard: str
+    """What the child said, as it was transcribed, even if a safety screen then answered."""
+    said: str
+    """What Lucy said out loud: her reply as far as it got, and any fixed line."""
+    outcome: Outcome = Outcome.ANSWERED
+    concern: Concern = Concern.NONE
+    """Why a safety screen stepped in, if one did."""
+    reasons: tuple[str, ...] = ()
+    """The names of the patterns that matched."""
+    drafted: str = ""
+    """What the model had written when a screen stopped it (never said in full)."""
+    brain: str = ""

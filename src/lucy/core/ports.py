@@ -12,7 +12,15 @@ from collections.abc import AsyncGenerator, AsyncIterator, Sequence
 from typing import Protocol
 
 from lucy.core.audio import Pcm
-from lucy.core.types import Assessment, ButtonEvent, Message, Motor, PowerMode, Status
+from lucy.core.types import (
+    Assessment,
+    ButtonEvent,
+    Message,
+    Motor,
+    PowerMode,
+    Status,
+    TurnRecord,
+)
 
 
 class SpeechToText(Protocol):
@@ -138,6 +146,14 @@ class SetupStarter(Protocol):
 
     async def start(self) -> bool:
         """Ask for setup mode, and wait to be stopped for it. False if it did not start."""
+        ...
+
+
+class TurnLog(Protocol):
+    """Keeps what was said, turn by turn, for the grown-ups who look after Lucy."""
+
+    def record(self, turn: TurnRecord) -> None:
+        """Write ``turn`` down. Returns at once: no reply ever waits for the SD card."""
         ...
 
 

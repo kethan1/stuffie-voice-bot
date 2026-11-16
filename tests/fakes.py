@@ -9,7 +9,7 @@ import numpy as np
 from lucy.core.audio import Pcm
 from lucy.core.metrics import TurnTimer
 from lucy.core.phrases import Phrase
-from lucy.core.types import ButtonEvent, Message, Motor, PowerMode, Status
+from lucy.core.types import ButtonEvent, Message, Motor, PowerMode, Status, TurnRecord
 
 RATE = 1_000  # tiny sample rate keeps fake audio cheap
 
@@ -63,6 +63,23 @@ class FakeChat:
                 if self.error and index == self.error_after:
                     raise self.error
                 await asyncio.sleep(self.delay)
+                yield delta
+        finally:
+            self.closed = True
+
+
+class GatedChat(FakeChat):
+    """Starts each reply only once ``opened`` is set: a model that takes its time."""
+
+    def __init__(self, deltas: Sequence[str]) -> None:
+        super().__init__(deltas)
+        self.opened = asyncio.Event()
+
+    async def stream(self, messages: Sequence[Message]) -> AsyncGenerator[str, None]:
+        self.calls.append(list(messages))
+        try:
+            await self.opened.wait()
+            for delta in self.deltas:
                 yield delta
         finally:
             self.closed = True
@@ -265,6 +282,19 @@ class FakeResponder:
         except asyncio.CancelledError:
             self.cancelled += 1
             raise
+
+
+class FakeLogbook:
+    """Keeps every turn it is given (lucy.adapters.logbook.Logbook writes them to a file)."""
+
+    def __init__(self, error: Exception | None = None) -> None:
+        self.turns: list[TurnRecord] = []
+        self.error = error
+
+    def record(self, turn: TurnRecord) -> None:
+        if self.error:
+            raise self.error
+        self.turns.append(turn)
 
 
 class FakeSetup:

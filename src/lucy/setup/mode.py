@@ -13,22 +13,29 @@
 
 Lucy says each step out loud, because the phone loses touch with her while she tries a
 network. Settings saved on the page take effect when she wakes up.
+
+The page also shows her logbook (:mod:`lucy.adapters.logbook`): the conversations she has
+had, for a grown-up to read, and to delete. Lucy is resting while setup mode runs, so the
+logbook does not change under the page.
 """
 
 import asyncio
 import contextlib
 import dataclasses
 import logging
+import math
 import secrets
 import signal
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import AsyncExitStack
+from functools import partial
 from http import HTTPStatus
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from lucy import __version__
+from lucy.adapters.logbook import Logbook, LogbookError, LoggedConversation, Summary
 from lucy.config import Config
 from lucy.core.errors import ConfigError, LucyError
 from lucy.core.ports import Button
@@ -94,6 +101,7 @@ class SetupMode:
         hotspot: Hotspot,
         address: tuple[str, int],
         button: Button | None = None,
+        logbook: Logbook | None = None,
         clock: Callable[[], float] = time.monotonic,
         handoff_s: float = HANDOFF_S,
         wing_hold_s: float = WING_HOLD_S,
@@ -107,6 +115,8 @@ class SetupMode:
         self._host, self._port = address
         self._origin = self._host if self._port == 80 else f"{self._host}:{self._port}"
         self._button = button
+        self._logbook = logbook
+        self._logged: Summary | None = Summary()  # what it holds; None if it cannot be read
         self._clock = clock
         self._handoff_s = handoff_s
         self._wing_hold_s = wing_hold_s
@@ -138,6 +148,8 @@ class SetupMode:
     async def run(self) -> int:
         """Run setup mode until it is time to leave. Returns the process exit code."""
         try:
+            with contextlib.suppress(LogbookError):  # the page says it could not be read
+                await self._count_conversations()
             await self._refresh_networks()  # before the hotspot: the radio can't scan well then
             if not await self._open():
                 await self._say(SetupLine.NO_HOTSPOT)
@@ -252,6 +264,9 @@ class SetupMode:
         if request.method in ("GET", "HEAD"):
             if request.path == "/card":  # only reachable by whoever already has the card
                 return Response.html(card_html(self._hotspot))
+            if request.path == "/conversations":
+                notice = pages.NOTICES.get(request.query.get("done", ""), "")
+                return await self._conversations(request.query, notice=notice)
             if request.path != "/":
                 return Response.redirect("/", HTTPStatus.FOUND)
             if not self._greeted:
@@ -271,6 +286,7 @@ class SetupMode:
             "/try-motors": self._try_motors,
             "/join": self._join,
             "/forget": self._forget,
+            "/conversations/clear": self._clear_conversations,
             "/finish": self._finish,
         }
         route = routes.get(request.path)
@@ -306,6 +322,7 @@ class SetupMode:
             can_undo=self._store.can_undo,
             version=__version__,
             idle_minutes=round(self._idle_timeout_s / 60),
+            logged=self._logged,
         )
         text = pages.page(state, notice=notice, errors=errors or [], where=where, posted=posted)
         return Response.html(text, HTTPStatus.BAD_REQUEST if errors else HTTPStatus.OK)
@@ -408,6 +425,73 @@ class SetupMode:
             return self._page(errors=[str(error)], where="wifi")
         self._saved = await self._network.saved()
         return Response.redirect("/?done=forgotten")
+
+    # -- her logbook ---------------------------------------------------------------------
+
+    async def _count_conversations(self) -> Summary:
+        """Look at what her logbook holds (for the settings page too). Raises LogbookError."""
+        if self._logbook is None:
+            return Summary()
+        try:
+            self._logged = await asyncio.to_thread(self._logbook.summary)
+        except LogbookError as error:
+            log.warning("setup mode: %s", error)
+            self._logged = None
+            raise
+        return self._logged
+
+    async def _conversations(
+        self, query: Mapping[str, str], *, notice: str = "", error: str = ""
+    ) -> Response:
+        """One page of the conversations Lucy has written down, the latest first."""
+        flagged = query.get("flagged") == "1"
+        number = query.get("page", "")
+        page = int(number) if number.isascii() and number.isdigit() else 1
+        per_page = pages.CONVERSATIONS_PER_PAGE
+        found, count = Summary(), 1
+        shown: list[LoggedConversation] = []
+        try:
+            found = await self._count_conversations()
+            matching = found.flagged if flagged else found.conversations
+            count = max(1, math.ceil(matching / per_page))
+            page = min(max(1, page), count)
+            if self._logbook is not None:
+                shown = await asyncio.to_thread(
+                    partial(
+                        self._logbook.conversations,
+                        limit=per_page,
+                        offset=(page - 1) * per_page,
+                        flagged=flagged,
+                    )
+                )
+        except LogbookError as problem:
+            error = error or str(problem)
+        try:
+            settings = self._store.load().logbook  # as saved on the page a moment ago, perhaps
+        except ConfigError:
+            settings = self._config.logbook
+        view = pages.LogView(
+            token=self._token,
+            conversations=shown,
+            found=found,
+            page=min(max(1, page), count),
+            pages=count,
+            flagged=flagged,
+            recording=settings.enabled,
+            keep_days=settings.keep_days,
+        )
+        status = HTTPStatus.BAD_REQUEST if error else HTTPStatus.OK
+        return Response.html(pages.conversations_page(view, notice=notice, error=error), status)
+
+    async def _clear_conversations(self, form: Mapping[str, str]) -> Response:
+        if "sure" not in form:
+            return await self._conversations({}, error="Tick the box to delete them all.")
+        try:
+            removed = await asyncio.to_thread(self._logbook.clear) if self._logbook else 0
+        except LogbookError as error:
+            return await self._conversations({}, error=str(error))
+        log.info("setup mode: deleted every conversation in the logbook (%d turns)", removed)
+        return Response.redirect("/conversations?done=cleared")
 
     async def _finish(self, form: Mapping[str, str]) -> Response:
         self._tasks.spawn(self._leave(SetupLine.FINISHED, after_s=self._handoff_s), "finish")
@@ -535,6 +619,9 @@ async def run_setup(config: Config, config_path: Path, *, demo: bool = False) ->
 
             b = config.button
             button = GpioButton(b.chip, b.line, active_low=b.active_low, debounce_ms=b.debounce_ms)
+        # Read and deleted here, never written: Lucy rests while setup mode runs.
+        logbook = Logbook(config.logbook.database, keep_days=config.logbook.keep_days)
+        stack.callback(logbook.close)
         mode = SetupMode(
             config=config,
             store=SettingsStore(config_path, credentials),
@@ -543,6 +630,7 @@ async def run_setup(config: Config, config_path: Path, *, demo: bool = False) ->
             hotspot=hotspot,
             address=address,
             button=button,
+            logbook=logbook,
         )
         running = asyncio.create_task(mode.run(), name="setup")
         stopping = asyncio.create_task(stop.wait(), name="stop")

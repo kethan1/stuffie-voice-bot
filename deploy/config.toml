@@ -25,7 +25,8 @@ no_speech_threshold = 0.6      # drop segments Whisper thinks are not speech
 model = "openai/gpt-oss-20b"
 fallback_model = "openai/gpt-oss-120b"   # separate free-tier quota; "" disables fallback
 timeout_s = 10.0
-history_exchanges = 6                    # how many back-and-forths Lucy remembers
+history_exchanges = 6                    # her short-term memory: the most back-and-forths sent
+                                         # word for word (older ones become notes: see [memory])
 
 [llm.params]                             # sent verbatim with every chat request
 reasoning_effort = "low"
@@ -39,6 +40,31 @@ include_reasoning = false
 max_completion_tokens = 512
 temperature = 0.8
 
+[memory]
+# What Lucy remembers of a conversation beyond her short-term memory. Whenever that is full,
+# its older half is folded into a few short notes (a name, a favorite animal, the game being
+# played). They are written in the background between turns, so no answer waits for them, and
+# are kept in RAM only and forgotten with the conversation ([session] forget_after_s).
+notes = true                   # false: she just forgets the oldest back-and-forth each turn
+max_words = 60                 # the notes never grow past this, however long the conversation
+model = "qwen/qwen3.8-27b"     # writes the notes. Not one of the [llm] models: each model has
+                               # its own rate limit, so notes never use up the children's
+timeout_s = 10.0
+
+[memory.params]                # sent verbatim with every note-taking request
+reasoning_effort = "none"      # rewriting notes needs no thinking: quick and cheap
+max_completion_tokens = 160
+temperature = 0.2
+
+[logbook]
+# Lucy's logbook: every conversation, written down for the grown-ups who look after her. Each
+# turn she hears words in is a row in an SQLite file on her memory card: what was said to her,
+# what she answered, and whether a safety screen stepped in. Read and delete them from a phone
+# in setup mode ("Conversations"). She never reads it herself, and no audio is ever kept.
+enabled = true                 # false: nothing more is written (what is there stays until deleted)
+database = "/var/lib/lucy/logbook.db"   # only Lucy and root can read it; it is not encrypted
+keep_days = 30                 # older conversations are deleted; 0 keeps them until you delete them
+
 [local]
 # Lucy's own brain on the Pi, used only when GroqCloud cannot be reached.
 # Installed and switched on by: sudo deploy/install.sh --local-backup
@@ -47,7 +73,7 @@ stt_model = "/opt/lucy/models/faster-whisper-tiny.en"   # speech recognition (fa
 stt_threads = 4
 base_url = "http://127.0.0.1:11434/v1"   # Ollama, localhost only
 model = "gemma3:1b"
-history_exchanges = 2          # a 1B model on a Pi reads long prompts slowly
+history_exchanges = 2          # (and her notes) a 1B model on a Pi reads long prompts slowly
 timeout_s = 60.0
 preload = true                 # load both models at start-up, not during the first offline turn
 
@@ -142,7 +168,8 @@ first_clause_min_words = 0     # 0 = whole sentences (most natural); 4 = start s
 max_chunk_words = 30
 opening_honk_chance = 0.5      # how often she starts a reply with a honk of her own (never a
                                # sad or serious one); 0 leaves honking to the model
-log_transcripts = false        # privacy: keep children's words (and replies) out of the journal
+log_transcripts = false        # keep children's words (and replies) out of the system journal
+                               # (her logbook is where conversations are kept: see [logbook])
 
 [session]
 tap_max_s = 0.3                # a shorter press is a tap: stops Lucy, or explains how to talk
@@ -150,7 +177,7 @@ tap_gap_s = 0.7                # taps this close together, then a squeeze, are "
                                # [setup] voice_command); her how-to-talk hint waits this long
 max_record_s = 15.0
 awake_s = 45.0                 # stay fast this long after a turn, then go dormant
-forget_after_s = 300.0         # then forget the conversation entirely
+forget_after_s = 300.0         # then forget the conversation entirely, notes and all
 max_turns_per_hour = 120       # protects the API quota from a stuck or hammered button
 greet_on_start = true
 earcons = true

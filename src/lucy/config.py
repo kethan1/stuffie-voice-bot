@@ -67,6 +67,43 @@ class LlmSettings:
     fallback_params: dict[str, Any] = field(default_factory=lambda: _gpt_oss_params(512))
     timeout_s: float = 10.0
     history_exchanges: int = 6
+    """Lucy's short-term memory: the most exchanges sent word for word (see ``memory``)."""
+
+
+@dataclass(frozen=True, slots=True)
+class MemorySettings:
+    """What Lucy remembers of a conversation beyond its last few exchanges (lucy.core.notes)."""
+
+    notes: bool = True
+    """When ``llm.history_exchanges`` are held, fold the older half into a few short notes
+    instead of forgetting the oldest one each turn. Written in the background by ``model``."""
+    max_words: int = 60
+    """The notes are never longer than this, however long the conversation runs."""
+    model: str = "qwen/qwen3.8-27b"
+    """Writes the notes. Not ``llm.model``: each model has its own rate limit, so notes
+    never use up the one that answers children, and this model keeps to what may be noted
+    (no school names, no "rules" a child made up) where the gpt-oss models did not."""
+    params: dict[str, Any] = field(
+        default_factory=lambda: {
+            "reasoning_effort": "none",  # rewriting notes needs no thinking: quick and cheap
+            "max_completion_tokens": 160,
+            "temperature": 0.2,
+        }
+    )
+    timeout_s: float = 10.0
+
+
+@dataclass(frozen=True, slots=True)
+class LogbookSettings:
+    """Lucy's logbook: every conversation, kept for grown-ups to read (lucy.adapters.logbook)."""
+
+    enabled: bool = True
+    """Write down what children say and what Lucy answers. Off: nothing is written, and
+    what was written before stays until it is deleted on the Conversations page."""
+    database: Path = Path("/var/lib/lucy/logbook.db")
+    """The SQLite file (lucy.service's ``StateDirectory=``)."""
+    keep_days: int = 30
+    """Rows older than this are deleted. 0 keeps them until a grown-up deletes them."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,7 +118,8 @@ class LocalSettings:
     model: str = "gemma3:1b"
     params: dict[str, Any] = field(default_factory=lambda: {"max_tokens": 100, "temperature": 0.7})
     history_exchanges: int = 2
-    """A 1B model on a Pi 4 reads prompts slowly, so it gets less history than the cloud."""
+    """A 1B model on a Pi 4 reads prompts slowly, so it gets less history than the cloud
+    (and Lucy's notes, which it reads once)."""
     timeout_s: float = 60.0
     preload: bool = True
     """Load both models at start-up, so the first offline answer does not wait for them."""
@@ -238,6 +276,8 @@ class Config:
     api: ApiSettings = field(default_factory=ApiSettings)
     stt: SttSettings = field(default_factory=SttSettings)
     llm: LlmSettings = field(default_factory=LlmSettings)
+    memory: MemorySettings = field(default_factory=MemorySettings)
+    logbook: LogbookSettings = field(default_factory=LogbookSettings)
     local: LocalSettings = field(default_factory=LocalSettings)
     safety: SafetySettings = field(default_factory=SafetySettings)
     tts: TtsSettings = field(default_factory=TtsSettings)
@@ -379,6 +419,7 @@ def _validate(config: Config) -> None:
         problems.append("local.enabled needs audio.input_sample_rate = 16000")
     if config.local.history_exchanges < 0 or config.local.stt_threads < 1:
         problems.append("local.history_exchanges must be >= 0 and local.stt_threads >= 1")
+    problems += _memory_problems(config)
     if config.session.tap_max_s >= config.session.max_record_s:
         problems.append("session.tap_max_s must be shorter than session.max_record_s")
     if not 0 < config.session.tap_gap_s <= 3:
@@ -390,6 +431,21 @@ def _validate(config: Config) -> None:
     problems += _setup_problems(config.setup)
     if problems:
         raise ConfigError("invalid configuration: " + "; ".join(problems))
+
+
+def _memory_problems(config: Config) -> list[str]:
+    problems = []
+    if config.llm.history_exchanges < 0:
+        problems.append("llm.history_exchanges must be 0 or more")
+    if not 10 <= config.memory.max_words <= 200:
+        problems.append("memory.max_words must be between 10 and 200")
+    if config.memory.notes and not config.memory.model.strip():
+        problems.append("memory.model must name a model (or set memory.notes = false)")
+    if config.memory.timeout_s <= 0:
+        problems.append("memory.timeout_s must be positive")
+    if not 0 <= config.logbook.keep_days <= 3650:
+        problems.append("logbook.keep_days must be between 0 (keep everything) and 3650")
+    return problems
 
 
 def _sound_problems(config: Config) -> list[str]:

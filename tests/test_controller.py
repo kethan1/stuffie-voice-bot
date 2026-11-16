@@ -222,6 +222,18 @@ async def test_dozes_then_forgets() -> None:
     await rig.controller.close()
 
 
+async def test_quiet_ends_a_conversation_even_if_nothing_of_it_is_remembered() -> None:
+    # Her logbook numbers conversations by this, and an interrupted safety line (say) is
+    # written there without being remembered: the next child must not share its number.
+    rig = Rig(replace(SETTINGS, awake_s=0.05, forget_after_s=0.1))
+    task = await start(rig)
+    assert rig.conversation.era == 0
+    await rig.turn()
+    await until(lambda: rig.conversation.era == 1)
+    task.cancel()
+    await rig.controller.close()
+
+
 async def test_turn_budget_protects_the_quota() -> None:
     rig = Rig(replace(SETTINGS, max_turns_per_hour=1))
     task = await start(rig)

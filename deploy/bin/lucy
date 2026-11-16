@@ -15,6 +15,7 @@ esac
 exec systemd-run --quiet --pty --wait --collect --working-directory=/opt/lucy \
   --uid=lucy --gid=lucy \
   --property="SupplementaryGroups=audio gpio" \
+  --property=StateDirectory=lucy --property=StateDirectoryMode=0700 \
   --property=LoadCredential=groq_api_key:/etc/lucy/credentials/groq_api_key \
   --property=LoadCredential=speechify_api_key:/etc/lucy/credentials/speechify_api_key \
   --property=AmbientCapabilities=CAP_NET_ADMIN \

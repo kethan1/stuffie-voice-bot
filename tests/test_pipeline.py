@@ -9,19 +9,22 @@ from lucy.core.audio import Pcm
 from lucy.core.conversation import Conversation
 from lucy.core.errors import ContentRefused, RateLimited, ServiceError, ServiceUnreachable
 from lucy.core.metrics import TurnTimer
+from lucy.core.notes import NoteTaker
 from lucy.core.phrases import Phrase, PhraseBook
 from lucy.core.pipeline import SCREENED, Brain, TurnPipeline, TurnSettings, phrase_for
-from lucy.core.safety import ReplyFilter, SafetyScreen
-from lucy.core.types import Concern, Role, Status
+from lucy.core.safety import NoteScreen, ReplyFilter, SafetyScreen
+from lucy.core.types import Concern, Outcome, Role, Status
 from lucy.core.volume import Volume, VolumeSettings
 from lucy.persona import LUCY
 from tests.fakes import (
     FakeChat,
     FakeIndicator,
+    FakeLogbook,
     FakeSetup,
     FakeSpeaker,
     FakeSTT,
     FakeTTS,
+    GatedChat,
     tone,
     until,
 )
@@ -41,6 +44,8 @@ class Rig:
         volume: VolumeSettings | None = None,
         setup: FakeSetup | None = None,
         opening_honk_chance: float = 0.0,
+        note_chat: FakeChat | None = None,
+        logbook: FakeLogbook | None = None,
     ) -> None:
         self.stt = stt or FakeSTT()
         self.chat = chat or FakeChat()
@@ -52,7 +57,16 @@ class Rig:
         self.tts = tts or FakeTTS()
         self.speaker = FakeSpeaker()
         self.indicator = FakeIndicator()
-        self.conversation = Conversation(4)
+        self.conversation = Conversation(4, notes=note_chat is not None)
+        self.logbook = logbook or FakeLogbook()
+        self.note_chat = note_chat
+        self.notes = (
+            NoteTaker(
+                self.conversation, note_chat, screen=NoteScreen(SafetyScreen(), ReplyFilter())
+            )
+            if note_chat is not None
+            else None
+        )
         self.pipeline = TurnPipeline(
             brain=Brain("cloud", self.stt, self.chat, reachable=lambda: self.cloud_reachable),
             backup=backup,
@@ -72,6 +86,8 @@ class Rig:
             reply_screen=reply_screen,
             volume=Volume(self.speaker, volume) if volume is not None else None,
             setup=setup,
+            notes=self.notes,
+            logbook=self.logbook,
             rng=random.Random(7),
         )
         self.timer = TurnTimer()
@@ -360,6 +376,186 @@ async def test_without_a_backup_an_outage_is_reported() -> None:
     assert len(rig.stt.calls) == 1  # with no backup, the cloud is still tried
     assert rig.spoken_phrase(Phrase.OFFLINE)
     assert not rig.spoken_phrase(Phrase.OWN_BRAIN)
+
+
+class TestNotes:
+    """What leaves Lucy's short-term memory is folded into notes, between turns."""
+
+    async def test_what_left_short_term_memory_reaches_the_model_as_notes(self) -> None:
+        rig = Rig(note_chat=FakeChat(["Sam likes geese."]))
+        assert rig.note_chat is not None
+        rig.stt.text = "my name is Sam and I like geese"
+        await rig.respond()
+        rig.stt.text = "why is the sky blue"
+        for _ in range(3):
+            await rig.respond()
+        await until(lambda: rig.conversation.notes != "")  # written once the turn is over
+        assert "Kid: my name is Sam and I like geese" in rig.note_chat.calls[0][1].content
+        await rig.respond()
+        system, *rest = rig.chat.calls[-1]
+        assert system.role is Role.SYSTEM
+        assert system.content.startswith(LUCY.system_prompt)  # her instructions, unchanged
+        assert system.content.endswith("Sam likes geese.")
+        assert not any("my name is Sam" in message.content for message in rest)
+        assert len(rest) == 2 * 2 + 1  # the two latest exchanges word for word, and the question
+
+    async def test_a_reply_never_waits_for_the_notes(self) -> None:
+        notes = GatedChat(["Sam likes geese."])
+        rig = Rig(note_chat=notes)
+        for _ in range(5):  # the fifth turn starts while the notes are still being written
+            await rig.respond()
+        assert len(notes.calls) == 1
+        assert rig.conversation.notes == ""
+        assert len(rig.chat.calls[-1]) == 1 + 2 * 4 + 1  # sent every exchange she still holds
+        notes.opened.set()
+        await until(lambda: rig.conversation.notes == "Sam likes geese.")
+        assert len(rig.conversation) == 3  # the two the notes cover are gone; the fifth is not
+
+    async def test_what_a_safety_screen_answered_is_never_shown_to_the_note_taker(self) -> None:
+        rig = Rig(stt=FakeSTT("my brother hits me"), note_chat=FakeChat(["Sam likes geese."]))
+        assert rig.note_chat is not None
+        await rig.respond()
+        rig.stt.text = "why is the sky blue"
+        for _ in range(3):
+            await rig.respond()
+        await until(lambda: rig.conversation.notes != "")
+        asked = rig.note_chat.calls[0][1].content
+        assert asked.count("Kid:") == 1  # only the exchange the model answered
+        assert SCREENED not in asked
+        assert LUCY.lines[Phrase.TELL_A_GROWN_UP][0] not in asked
+
+    async def test_what_was_heard_before_a_barge_in_is_noted_too(self) -> None:
+        rig = Rig(chat=FakeChat(delay=0.01), note_chat=FakeChat(["Sam likes geese."]))
+        assert rig.note_chat is not None
+        for i in range(3):
+            rig.conversation.record(f"q{i}", f"a{i}")
+        rig.speaker.seconds_per_clip = 0.05
+        task = asyncio.create_task(rig.respond())
+        await until(lambda: len(rig.speaker.played) >= 1)
+        task.cancel()  # the wing is squeezed again mid-answer
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await until(lambda: rig.conversation.notes != "")  # written while the child talks
+        assert len(rig.conversation) == 2
+
+
+class TestLogbook:
+    """Every turn in which Lucy heard words is written down for grown-ups, however it ended."""
+
+    async def test_an_answer_is_written_down_as_it_was_said(self) -> None:
+        rig = Rig()
+        await rig.respond()
+        (turn,) = rig.logbook.turns
+        assert turn.heard == "why is the sky blue"
+        assert turn.said == "Honk! The sky is blue because of sunlight. Neat?"
+        assert (turn.outcome, turn.concern, turn.brain) == (Outcome.ANSWERED, Concern.NONE, "cloud")
+        assert (turn.reasons, turn.drafted) == ((), "")
+
+    async def test_what_a_screen_answered_keeps_the_childs_own_words(self) -> None:
+        rig = Rig(stt=FakeSTT("my brother hits me"))
+        await rig.respond()
+        (turn,) = rig.logbook.turns
+        assert turn.heard == "my brother hits me"  # for a grown-up to read, on the Pi only
+        assert turn.said in LUCY.lines[Phrase.TELL_A_GROWN_UP]
+        assert (turn.outcome, turn.concern) == (Outcome.SCREENED, Concern.NEEDS_GROWN_UP)
+        assert turn.reasons == ("being-hurt",)
+        assert rig.chat.calls == []  # and still never sent to the model,
+        assert rig.conversation.prompt("s", "next")[1].content == SCREENED  # nor remembered
+
+    async def test_a_screened_turn_is_written_down_even_if_its_line_is_interrupted(self) -> None:
+        rig = Rig(stt=FakeSTT("my brother hits me"))
+        rig.speaker.seconds_per_clip = 1.0
+        task = asyncio.create_task(rig.respond())
+        await until(lambda: bool(rig.speaker.queued))
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        (turn,) = rig.logbook.turns
+        assert (turn.heard, turn.outcome) == ("my brother hits me", Outcome.SCREENED)
+        assert turn.said in LUCY.lines[Phrase.TELL_A_GROWN_UP]
+
+    async def test_a_stopped_reply_shows_what_the_model_had_written(self) -> None:
+        chat = FakeChat(("Sure! ", "It is spelled S H I T. ", "Neat?"))
+        rig = Rig(chat=chat, reply_screen=ReplyFilter())
+        await rig.respond()
+        (turn,) = rig.logbook.turns
+        assert (turn.outcome, turn.concern) == (Outcome.STOPPED, Concern.OFF_LIMITS)
+        assert turn.reasons == ("blocked-word",)
+        assert turn.said.startswith("Sure! ")  # what she said, then the line she changed to
+        assert turn.said.removeprefix("Sure! ") in LUCY.lines[Phrase.CHANGE_SUBJECT]
+        assert "S H I T" in turn.drafted
+        assert "S H I T" not in turn.said
+
+    async def test_a_sentence_the_cloud_voice_refused(self) -> None:
+        rig = Rig(tts=RefusingTTS("sunlight"))
+        await rig.respond()
+        (turn,) = rig.logbook.turns
+        assert (turn.outcome, turn.reasons) == (Outcome.STOPPED, ("cloud-screen",))
+
+    async def test_an_interrupted_answer_keeps_what_was_said(self) -> None:
+        rig = Rig(chat=FakeChat(delay=0.01))
+        rig.speaker.seconds_per_clip = 0.05
+        task = asyncio.create_task(rig.respond())
+        await until(lambda: len(rig.speaker.played) >= 1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        (turn,) = rig.logbook.turns
+        assert turn.outcome is Outcome.INTERRUPTED
+        assert turn.said.startswith("Honk!")
+
+    async def test_a_failed_turn_keeps_the_question_and_what_lucy_said_instead(self) -> None:
+        rig = Rig(chat=FakeChat(error=ServiceUnreachable("no wifi")))
+        await rig.respond()
+        (turn,) = rig.logbook.turns
+        assert (turn.heard, turn.outcome) == ("why is the sky blue", Outcome.FAILED)
+        assert turn.said in LUCY.lines[Phrase.OFFLINE]
+
+    async def test_the_local_brain_is_named(self) -> None:
+        rig = Rig(local=(FakeSTT("what do geese eat"), FakeChat(["Grass."])), cloud_reachable=False)
+        await rig.respond()
+        (turn,) = rig.logbook.turns
+        assert (turn.heard, turn.brain) == ("what do geese eat", "local")
+
+    async def test_volume_and_setup_requests(self) -> None:
+        rig = Rig(stt=FakeSTT("louder"), volume=VolumeSettings())
+        await rig.respond()
+        assert rig.logbook.turns[0].outcome is Outcome.VOLUME
+        assert rig.logbook.turns[0].said in LUCY.lines[Phrase.LOUDER]
+        rig = Rig(stt=FakeSTT("Enter into setup mode."), setup=FakeSetup())
+        await rig.respond(knocked=True)
+        assert rig.logbook.turns[0].outcome is Outcome.SETUP
+        assert rig.logbook.turns[0].said in LUCY.lines[Phrase.SETUP]
+
+    async def test_nothing_heard_is_nothing_to_write_down(self) -> None:
+        rig = Rig(stt=FakeSTT(text="  "))
+        await rig.respond()
+        await rig.respond(tone(1.0, dbfs=-80.0))  # silence: not even sent to be transcribed
+        assert rig.logbook.turns == []
+
+    async def test_each_conversation_has_its_own_number(self) -> None:
+        rig = Rig()
+        await rig.respond()
+        await rig.respond()
+        rig.conversation.clear()  # five quiet minutes: the next child starts fresh
+        await rig.respond()
+        assert [turn.conversation for turn in rig.logbook.turns] == [0, 0, 1]
+
+    async def test_a_logbook_that_cannot_be_written_costs_no_answer(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        rig = Rig(logbook=FakeLogbook(error=OSError("read-only file system")))
+        with caplog.at_level(logging.WARNING, logger="lucy.core.pipeline"):
+            await rig.respond()
+        assert rig.tts.texts == ["Honk!", "The sky is blue because of sunlight.", "Neat?"]
+        assert "could not write the turn in the logbook" in caplog.text
+        assert "why is the sky blue" not in caplog.text  # still no words in the journal
+
+    async def test_without_a_logbook_nothing_is_written(self) -> None:
+        rig = Rig()
+        rig.pipeline._logbook = None
+        await rig.respond()
+        assert rig.logbook.turns == []
 
 
 class TestVolumeRequests:

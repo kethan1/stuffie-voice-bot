@@ -3,7 +3,8 @@
 The page offers a hand-picked set of settings (:data:`SECTIONS`), each tied to its key in
 ``config.toml``; a test checks every one against :class:`lucy.config.Config`, so the page
 cannot drift from the real settings. Safety settings are deliberately not among them (they
-are only in the "Advanced" view of the whole file).
+are only in the "Advanced" view of the whole file). The logbook's settings sit beside the
+link to the conversations it holds.
 
 Saving edits ``config.toml`` in place with tomlkit, so its comments and layout survive, and
 checks the result with the same loader Lucy starts with before writing anything: a change
@@ -100,6 +101,13 @@ SECTIONS = (
                 "She goes back to her usual loudness when she is turned off.",
             ),
             Field(
+                "memory.notes",
+                "Remember more of each conversation",
+                bool,
+                "She keeps a few short notes on what a child told her earlier. They are never "
+                "saved, and she forgets them once it has been quiet for a while.",
+            ),
+            Field(
                 "setup.voice_command",
                 "Setup mode can be started by voice",
                 bool,
@@ -182,6 +190,30 @@ SECTIONS = (
                 0,
                 30,
                 0.5,
+            ),
+        ),
+    ),
+    # Shown with a link to the conversations themselves (pages._logbook), not as the others are.
+    Section(
+        "logbook",
+        "Conversations",
+        "Lucy writes down what is said to her and what she answers, on her memory card, for "
+        "grown-ups to read here. She never reads it back herself.",
+        (
+            Field(
+                "logbook.enabled",
+                "Write down every conversation",
+                bool,
+                "Off: nothing more is written. What is already there stays until you delete it.",
+            ),
+            Field(
+                "logbook.keep_days",
+                "Keep them for (days)",
+                int,
+                "Older ones are deleted by themselves. 0 keeps them until you delete them.",
+                0,
+                3650,
+                1,
             ),
         ),
     ),

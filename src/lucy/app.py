@@ -17,6 +17,7 @@ from typing import Protocol, runtime_checkable
 
 from lucy import __version__
 from lucy.adapters.console import KeyboardButton, LogIndicator
+from lucy.adapters.logbook import Logbook
 from lucy.adapters.power import CpuGovernor, NoPowerControl, PowerKnob, PowerManager, WifiPowerSave
 from lucy.adapters.sound import SoundDeviceMicrophone, SoundDeviceSpeaker
 from lucy.brains import Local, build_cloud, build_local
@@ -24,10 +25,11 @@ from lucy.config import Config, device, read_system_prompt
 from lucy.core.controller import Controller, Earcons
 from lucy.core.conversation import Conversation
 from lucy.core.errors import ConfigError, LucyError
+from lucy.core.notes import NoteTaker
 from lucy.core.phrases import Phrase, PhraseBook
 from lucy.core.pipeline import TurnPipeline
-from lucy.core.ports import Button, Indicator, PowerControl
-from lucy.core.safety import AllowAll, ReplyFilter, SafetyScreen
+from lucy.core.ports import Button, Indicator, Moderator, PowerControl
+from lucy.core.safety import AllowAll, NoteScreen, ReplyFilter, SafetyScreen
 from lucy.core.tasks import BackgroundTasks
 from lucy.core.types import PowerMode, Status
 from lucy.core.volume import Volume
@@ -50,6 +52,17 @@ async def open_voice(config: Config, stack: AsyncExitStack) -> Voice:
     if voice.api is not None:
         stack.push_async_callback(voice.api.aclose)
     return voice
+
+
+def open_logbook(config: Config, stack: AsyncExitStack) -> Logbook | None:
+    """Lucy's logbook, if she keeps one. Nothing is read or written until a turn ends."""
+    if not config.logbook.enabled:
+        return None
+    logbook = Logbook(config.logbook.database, keep_days=config.logbook.keep_days)
+    # Closed after the controller (the stack unwinds backwards), so the last turn's row is
+    # on the card before Lucy stops.
+    stack.callback(logbook.close)
+    return logbook
 
 
 def build_power(config: Config) -> PowerControl:
@@ -147,7 +160,23 @@ async def run(config: Config, *, keyboard: bool = False) -> int:
         power = build_power(config)
         stack.push_async_callback(power.restore)
 
-        conversation = Conversation(config.llm.history_exchanges)
+        moderator: Moderator = AllowAll()
+        reply_screen = None
+        if config.safety.screen:
+            moderator = SafetyScreen(extra=config.safety.extra_patterns)
+            reply_screen = ReplyFilter()
+        conversation = Conversation(config.llm.history_exchanges, notes=cloud.notes is not None)
+        notes = None
+        if cloud.notes is not None:
+            notes = NoteTaker(
+                conversation,
+                cloud.notes,
+                max_words=config.memory.max_words,
+                available=cloud.api.reachable,
+                screen=NoteScreen(moderator, reply_screen) if reply_screen is not None else None,
+                log_notes=config.turn.log_transcripts,
+            )
+            stack.push_async_callback(notes.aclose)
         handover = SetupHandover(stop)
         phrases = PhraseBook(LUCY.lines, tts)
         voice.on_recovery(phrases.forget)  # lines cached in the on-device voice: render again
@@ -155,9 +184,7 @@ async def run(config: Config, *, keyboard: bool = False) -> int:
             brain=cloud.brain(),
             backup=local.brain() if local is not None else None,
             tts=tts,
-            moderator=SafetyScreen(extra=config.safety.extra_patterns)
-            if config.safety.screen
-            else AllowAll(),
+            moderator=moderator,
             speaker=speaker,
             indicator=indicator,
             phrases=phrases,
@@ -167,9 +194,11 @@ async def run(config: Config, *, keyboard: bool = False) -> int:
             settings=config.turn
             if config.tts.honks
             else dataclasses.replace(config.turn, opening_honk_chance=0.0),
-            reply_screen=ReplyFilter() if config.safety.screen else None,
+            reply_screen=reply_screen,
             volume=Volume(speaker, config.volume),
             setup=handover if config.setup.enabled and config.setup.voice_command else None,
+            notes=notes,
+            logbook=open_logbook(config, stack),
         )
         controller = Controller(
             pipeline=pipeline,

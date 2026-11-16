@@ -3,17 +3,20 @@
 No JavaScript and no outside resources: a phone's captive-portal window (the sign-in sheet
 that opens by itself) is a limited browser, and Lucy's hotspot has no internet. Plain forms
 post back to Lucy. "Try it" buttons answer 204 No Content, which leaves the page as it is.
-Everything shown is escaped.
+Everything shown is escaped, and nothing more so than the Conversations page: what a child
+said to Lucy is shown to a grown-up exactly as it was heard.
 """
 
 import html
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from lucy.adapters.logbook import LoggedConversation, LoggedTurn, Summary
 from lucy.config import Config
 from lucy.setup.network import SavedNetwork, Security, WifiNetwork
-from lucy.setup.settings import SECTIONS, Field, KeyStatus, Section, current
+from lucy.setup.settings import SECTION, SECTIONS, Field, KeyStatus, Section, current
 
 OTHER_NETWORK = "__other__"
 
@@ -29,6 +32,28 @@ NOTICES = {
     "keys": "Keys saved.",
     "undone": "The last change is undone.",
     "forgotten": "Network forgotten.",
+    "cleared": "Every conversation is deleted.",
+}
+
+CONVERSATIONS_PER_PAGE = 10
+
+# Why a safety screen stepped in (lucy.core.types.Concern), in a grown-up's words.
+_CONCERN_LABELS = {
+    "needs_grown_up": "may need a grown-up",
+    "unsafe": "something dangerous",
+    "private": "personal details",
+    "off_limits": "a grown-up topic or a bad word",
+    "unkind": "being unkind",
+    "trick": "a trick on Lucy",
+}
+# How a turn ended (lucy.core.types.Outcome), when that is worth a remark.
+_OUTCOME_LABELS = {
+    "interrupted": "interrupted",
+    "screened": "a safety screen answered",
+    "stopped": "a safety screen stopped her reply",
+    "failed": "she could not answer",
+    "volume": "asked for her volume",
+    "setup": "asked for setup mode",
 }
 
 _STYLE = """
@@ -74,6 +99,11 @@ ul.saved form { margin: 0; }
 ul.saved button { padding: 6px 12px; }
 code { font-family: ui-monospace, Menlo, monospace; }
 a { color: var(--accent); }
+.turn { border-top: 1px solid var(--line); padding: 8px 0 2px; overflow-wrap: anywhere; }
+.turn.flagged { border-left: 4px solid var(--bad); padding-left: 10px; }
+.turn.flagged .meta { color: var(--bad); font-weight: 600; }
+.who { font-weight: 600; }
+.pager { display: flex; justify-content: space-between; gap: 10px; margin: 14px 0; }
 """
 
 
@@ -91,6 +121,8 @@ class PageState:
     can_undo: bool
     version: str
     idle_minutes: int
+    logged: Summary | None = None
+    """What her logbook holds. None if it could not be read."""
 
 
 def _e(value: object) -> str:
@@ -145,7 +177,9 @@ def page(
                 state, section, messages_for(section.key), posted if where == section.key else {}
             )
             for section in SECTIONS
+            if section.key != "logbook"
         ),
+        _logbook(state, messages_for("logbook"), posted if where == "logbook" else {}),
         _keys(state, messages_for("keys")),
         _advanced(state, messages_for("advanced"), posted if where == "advanced" else {}),
         _finish(state),
@@ -250,6 +284,34 @@ def _section(state: PageState, section: Section, messages: str, posted: Mapping[
 <div class="buttons"><button>Save</button>{trial}</div></form></details>"""
 
 
+def _count(number: int, noun: str) -> str:
+    return f"{number} {noun}" if number == 1 else f"{number} {noun}s"
+
+
+def _logbook(state: PageState, messages: str, posted: Mapping[str, str]) -> str:
+    """Her logbook: how much it holds, the way to the conversations, and its two settings."""
+    section = SECTION["logbook"]
+    fields = "".join(
+        _field(field, current(state.config, field.path), posted) for field in section.fields
+    )
+    found = state.logged
+    if found is None:
+        held = "Her logbook could not be read."
+    elif not found.turns:
+        held = "Nothing is written down yet."
+    else:
+        held = f"{_count(found.conversations, 'conversation')} written down"
+        if found.flagged:
+            held += f", {found.flagged} of them with a safety screen stepping in"
+        held += "."
+    return f"""<section id="logbook"><h2>{_e(section.title)}</h2>
+<p class="help">{_e(section.intro)}</p>
+<p>{_e(held)} <a href="/conversations">Read them</a></p>{messages}
+<form method="post" action="/save">{_token(state)}
+<input type="hidden" name="section" value="{_e(section.key)}">{fields}
+<div class="buttons"><button>Save</button></div></form></section>"""
+
+
 def _key_line(status: KeyStatus) -> str:
     if not status.present:
         return "Not set."
@@ -300,6 +362,123 @@ def _finish(state: PageState) -> str:
 <p class="meta">Lucy {_e(state.version)} · setup Wi-Fi {_e(state.hotspot_name)} · setup ends by
 itself after {state.idle_minutes} minutes with nothing to do, or if you hold her wing for two
 seconds.</p></section>"""
+
+
+@dataclass(frozen=True, slots=True)
+class LogView:
+    """One page of Lucy's logbook, as the Conversations page shows it."""
+
+    token: str
+    conversations: Sequence[LoggedConversation]
+    found: Summary
+    page: int
+    """From 1 (the latest conversations) to ``pages``."""
+    pages: int
+    flagged: bool
+    """Only the conversations in which a safety screen stepped in."""
+    recording: bool
+    keep_days: int
+
+
+def _clock_time(at: float) -> str:
+    return time.strftime("%H:%M", time.localtime(at))
+
+
+def _turn(turn: LoggedTurn) -> str:
+    remarks = [_clock_time(turn.at)]
+    if outcome := _OUTCOME_LABELS.get(turn.outcome, ""):
+        remarks.append(outcome)
+    if turn.flagged:
+        concern = _CONCERN_LABELS.get(turn.concern, turn.concern)
+        remarks.append(f"{concern} ({turn.reasons})" if turn.reasons else concern)
+    if turn.brain == "local":
+        remarks.append("answered offline")
+    drafted = (
+        f'<p class="help">The model had written: {_e(turn.drafted)}</p>' if turn.drafted else ""
+    )
+    said = _e(turn.said) if turn.said else '<span class="meta">(nothing)</span>'
+    return f"""<div class="turn{" flagged" if turn.flagged else ""}">
+<p class="meta">{_e(" · ".join(remarks))}</p>
+<p><span class="who">Heard:</span> {_e(turn.heard)}</p>
+<p><span class="who">Lucy:</span> {said}</p>{drafted}</div>"""
+
+
+def _conversation(conversation: LoggedConversation) -> str:
+    started = time.strftime("%a %d %b %Y, %H:%M", time.localtime(conversation.started))
+    turns = "".join(_turn(turn) for turn in conversation.turns)
+    return f"""<section><h2>{_e(started)}</h2>
+<p class="meta">{_count(len(conversation.turns), "turn")}</p>{turns}</section>"""
+
+
+def conversations_page(view: LogView, *, notice: str = "", error: str = "") -> str:
+    """Lucy's logbook: what was said to her and what she answered, the latest first."""
+
+    def link(page: int, flagged: bool, text: str, *, here: bool = False) -> str:
+        if here:
+            return f"<strong>{_e(text)}</strong>"
+        parts = [f"page={page}"] if page > 1 else []
+        if flagged:
+            parts.append("flagged=1")
+        query = "?" + "&amp;".join(parts) if parts else ""
+        return f'<a href="/conversations{query}">{_e(text)}</a>'
+
+    found = view.found
+    recording = (
+        (
+            f"She deletes them after {_count(view.keep_days, 'day')}."
+            if view.keep_days
+            else "She keeps them until you delete them."
+        )
+        if view.recording
+        else "Writing them down is turned off, so nothing new is added."
+    )
+    filters = " · ".join(
+        (
+            link(1, False, f"All ({found.conversations})", here=not view.flagged),
+            link(
+                1,
+                True,
+                f"Where a safety screen stepped in ({found.flagged})",
+                here=view.flagged,
+            ),
+        )
+    )
+    if view.conversations:
+        listed = "".join(_conversation(conversation) for conversation in view.conversations)
+    elif view.flagged and found.turns:
+        listed = "<section><p>No safety screen has stepped in.</p></section>"
+    else:
+        listed = "<section><p>Nothing is written down yet.</p></section>"
+    newer = link(view.page - 1, view.flagged, "← Newer") if view.page > 1 else "<span></span>"
+    older = link(view.page + 1, view.flagged, "Older →") if view.page < view.pages else ""
+    pager = (
+        f'<p class="pager">{newer}<span class="meta">Page {view.page} of {view.pages}</span>'
+        f"{older or '<span></span>'}</p>"
+        if view.pages > 1
+        else ""
+    )
+    delete = (
+        f"""<details><summary>Delete every conversation</summary>
+<p class="help">For good: they cannot be brought back.</p>
+<form method="post" action="/conversations/clear">
+<input type="hidden" name="token" value="{_e(view.token)}">
+<label class="check"><input type="checkbox" name="sure" required>
+<span>Yes, delete all {_count(found.conversations, "conversation")}</span></label>
+<div class="buttons"><button>Delete them</button></div></form></details>"""
+        if found.turns
+        else ""
+    )
+    messages = (f'<p class="notice" role="status">{_e(notice)}</p>' if notice else "") + (
+        f'<p class="error" role="alert">{_e(error)}</p>' if error else ""
+    )
+    return _document(
+        "Lucy's conversations",
+        f"""<h1>&#x1FABF; Conversations</h1>
+<p class="lead">What was said to Lucy and what she answered, the latest first. Times are by
+her own clock. {_e(recording)}</p>
+<p><a href="/">← Back to her settings</a></p>{messages}
+<p>{filters}</p>{listed}{pager}{delete}""",
+    )
 
 
 def joining_page(network: str) -> str:

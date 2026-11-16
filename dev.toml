@@ -27,6 +27,9 @@ manage_wifi = false
 [turn]
 log_transcripts = true         # show what Lucy heard and what the model replied (in your own terminal)
 
+[logbook]
+database = "logbook.db"        # beside this file, and gitignored; `make setup` shows what is in it
+
 [local]
 # The offline brain, as on the Pi. To try it: `make stt-model`, install Ollama
 # (https://ollama.com), `ollama pull gemma3:1b`, then set enabled = true.

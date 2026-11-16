@@ -15,4 +15,7 @@ voices/
 models/
 # make setup (setup mode with pretend Wi-Fi)
 setup-dev.toml
+# Lucy's logbook on a laptop (dev.toml): what was said to her
+logbook.db
+logbook.db-journal
 .lucy-setup-demo/

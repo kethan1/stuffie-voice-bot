@@ -1,7 +1,8 @@
 """Assembling Lucy's brains: Groq in the cloud, and an optional local backup on the Pi.
 
 The cloud brain is Groq: Whisper for speech, gpt-oss for replies, with the
-120B model as a rate-limit fallback. The local brain is faster-whisper
+120B model as a rate-limit fallback, and a third model that writes Lucy's notes
+on an allowance of its own. The local brain is faster-whisper
 ``tiny.en`` in-process plus a small LLM (Gemma 3 1B) served by Ollama on
 localhost. Ollama speaks the same OpenAI-compatible protocol as Groq, so both
 brains use the same chat adapter and differ only in configuration.
@@ -26,6 +27,8 @@ class Cloud:
     api: ApiClient
     stt: WhisperTranscriber
     chat: ChatModel
+    notes: ChatModel | None = None
+    """Writes Lucy's notes (lucy.core.notes). None when ``memory.notes`` is off."""
 
     def brain(self) -> Brain:
         return Brain("cloud", self.stt, self.chat, reachable=self.api.reachable)
@@ -107,7 +110,14 @@ def build_cloud(config: Config) -> Cloud:
             api, ChatModelSpec(llm.fallback_model, llm.fallback_params), timeout_s=llm.timeout_s
         )
         chat = FallbackChat(chat, fallback)
-    return Cloud(api, stt, chat)
+    memory = config.memory
+    # No fallback model for the notes: they can wait, and children's answers cannot.
+    notes = (
+        StreamingChat(api, ChatModelSpec(memory.model, memory.params), timeout_s=memory.timeout_s)
+        if memory.notes
+        else None
+    )
+    return Cloud(api, stt, chat, notes)
 
 
 def build_local(config: Config) -> Local | None:

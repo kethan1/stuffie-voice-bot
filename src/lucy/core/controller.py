@@ -288,9 +288,12 @@ class Controller:
             await self._power.apply(PowerMode.DORMANT)
 
     def _forget(self) -> None:
-        if not self.busy and len(self._conversation):
+        if self.busy:
+            return
+        if len(self._conversation):
             log.info("conversation forgotten after %.0fs of quiet", self._settings.forget_after_s)
-            self._conversation.clear()
+        # Even with nothing remembered: whatever is said next belongs to a new conversation.
+        self._conversation.clear()
 
     def _cancel_timers(self) -> None:
         timers = (self._record_limit, self._hint_timer, self._dormant_timer, self._forget_timer)

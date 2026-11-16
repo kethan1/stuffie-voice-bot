@@ -19,7 +19,7 @@ latency, power, safety, and reliability were engineered.
 |---|---|
 | **Low response latency** | A child should hear Lucy start talking within about 1–1.5 s of letting go of the wing, and get instant feedback (a chime) at 0 ms. Silence makes a toy feel broken. |
 | **Low power** | It may run from a USB power bank. A Pi 4 cannot suspend, so every avoidable wake-up, radio, and busy loop is removed. |
-| **Child safety and privacy** | Audio is recorded only while the wing is squeezed and never stored. Signs of distress get a fixed, caring answer without involving the LLM. Children's words stay out of the logs. |
+| **Child safety and privacy** | Audio is recorded only while the wing is squeezed and never stored. Signs of distress get a fixed, caring answer without involving the LLM. Children's words stay out of the system logs, and are kept in one place: a logbook on the Pi that only grown-ups read, in setup mode (§5.10). |
 | **Reliability** | No silent failure modes. Lucy says what is wrong ("can a grown-up check the Wi-Fi?"), restarts herself if wedged, and survives being unplugged. |
 | **Maintainability** | A student team can read, test, and change it. The core logic is pure Python and is tested without hardware. |
 
@@ -55,6 +55,7 @@ that never fails (§3, §5.5).
             │ whisper-large-v3-turbo  (speech→text) │   │ simba-3.2 (Lucy's voice,  │
             │ openai/gpt-oss-20b      (reply)       │   │ streamed as raw PCM)      │
             │ openai/gpt-oss-120b     (fallback)    │   └───────────────────────────┘
+            │ qwen/qwen3.8-27b        (her notes)   │
             └───────────────────────────────────────┘
 ```
 
@@ -80,6 +81,7 @@ by Ollama. It is slower, so it is used only when GroqCloud cannot be reached
 | **Speech-to-text** | Groq `whisper-large-v3-turbo` | Fast (hundreds of times real time), accurate on children's speech, and on the same API and connection as the LLM. Local Whisper on a Pi 4 would take seconds per utterance and eat the RAM Piper needs. |
 | **LLM** | Groq `openai/gpt-oss-20b`, `reasoning_effort=low` | About 1,000 tokens/s on Groq, so a whole 40-word answer arrives in well under a second. Low reasoning effort keeps hidden "thinking" to a few dozen tokens. |
 | **LLM fallback** | Groq `openai/gpt-oss-120b` | Free-tier limits are per model, so falling back on a 429 roughly doubles the usable daily quota. It accepts the same request parameters. (`llama-3.1-8b-instant` was retired from the free tier in Aug 2026.) |
+| **Notes** (memory) | Groq `qwen/qwen3.8-27b`, `reasoning_effort=none` | Rewrites Lucy's notes on a conversation every third turn, in the background (§5.9). A model of its own because Groq's limits are per model: note-taking never uses up the tokens-per-minute allowance of the models that answer children. With reasoning off, a rewrite takes 0.15–0.5 s. It was also the most careful of the three models tried: on the same test conversations both gpt-oss models wrote down a school's name and a "rule" a child had made up for Lucy, and Qwen left both out. |
 | **Offline brain** (optional) | faster-whisper `tiny.en` (int8) + Ollama serving `gemma3:1b` | Used only when Groq is unreachable. Gemma 3 1B (~0.8 GB) is the local model the research chose, and it fits in 4 GB beside Piper. Ollama is what the Raspberry Pi Foundation tutorial uses, detects the Pi 4's CPU features at run time, and speaks the same OpenAI-compatible protocol, so no new chat code was needed. Local speech recognition is required too: without the cloud, Groq's Whisper is gone as well. faster-whisper installs from prebuilt wheels; whisper.cpp would have to be compiled on the Pi. |
 | **Voice** (text-to-speech) | Speechify `simba-3.2`, voice `harper_32`, streamed as 22.05 kHz PCM | Natural: 11th of 103 voices in Artificial Analysis's blind TTS arena (Nov 2026). Built for streaming: about 60 ms from request to first audio on Speechify's side. Free plan: 500,000 characters a month (roughly 3,000 replies) with no credit card, and requests are refused rather than billed when it runs out. Rejected: **Kokoro** (82M, the best open model for its size) runs slower than real time even on an unoptimised Pi 5, and a Pi 4 is 2–3× slower. **Groq Orpheus** allows 100 requests a day. **ElevenLabs** and **Cartesia** offer about 20,000 free characters a month. **OpenAI** `gpt-4o-mini-tts` was slow to first audio in independent tests (p95 near 4 s). **Gemini TTS** terms forbid apps likely to be used by under-18s. **Google Chirp 3 HD** needs a credit card and ranks well below. **Azure**'s free tier excludes its HD voices. |
 | **Backup voice** | Piper (`piper-tts` 1.x), voice `en_US-lessac-medium` | Runs faster than real time on a Pi 4 with no network, key, or quota. Always loaded, so it can take over mid-conversation. Lessac (trained on a professional narrator's recordings) replaced the original `amy` voice. |
@@ -89,6 +91,7 @@ by Ollama. It is slower, so it is used only when GroqCloud cannot be reached
 | **Motors** | L293D dual H-bridge; the Pi's hardware PWM (`pwm-2chan` overlay, sysfs) at 20 kHz on its enable pins | Two small DC motors (beak, body) on their own battery. Hardware PWM uses no CPU, thread, or timer, and at 20 kHz it is above hearing, so the motors do not whine. Each speed change is one sysfs write of a few microseconds. Rejected: software PWM (`lgpio`, `pigpio`) needs a thread or daemon that wakes the CPU thousands of times a second; a servo HAT adds an I2C chip and needs a different mechanism; on/off drive cannot open the beak part-way. One PWM channel on the enable pin plus two direction lines per motor covers both directions, and lets a stopped motor coast instead of braking (§5.7). |
 | **Concurrency** | `asyncio` + a few dedicated threads | Network streaming, timers, and button events are all I/O-bound and event-driven. CPU-bound synthesis runs in one worker thread (onnxruntime releases the GIL). |
 | **HTTP** | `httpx` with HTTP/2 (thin client, no vendor SDK) | One multiplexed TLS connection for every request, pre-warmed on button press. Avoiding the SDK avoids its pydantic import cost and keeps the client provider-neutral (Groq, OpenAI, Ollama all speak this protocol). |
+| **Conversation log** | SQLite, one file, through Python's built-in `sqlite3` | No new dependency. Each turn is one atomic, crash-safe insert, so a toy that gets unplugged never leaves a broken file. Paging, counting, and deleting are single queries, and any SQLite tool can read it. Rejected: a JSON-lines file (a power cut can tear its last line, and deleting or paging means rewriting it); the system journal (kept in RAM by `--tune`, mixed with everything else, and readable by any admin tool). |
 | **Config** | One strict TOML file + systemd credentials | Typos fail at start-up. API keys are never in the file or the environment of other processes. |
 | **Process supervision** | systemd (`Type=notify`, watchdog, sandbox) | Readiness, self-healing restarts, log capture, and a tight security sandbox, all built into the OS. |
 | **Packaging** | uv, `uv.lock`, the `uv_build` backend | One universal, hash-locked lock for the laptop and the Pi. Installs in seconds, nothing compiles on the Pi, and tampered packages are refused. |
@@ -112,6 +115,7 @@ interfaces, and a single composition root wires them together.
                  │       │                  │  thinks with: Brain (cloud) → Brain (local) │
                  │       │                  │  speaks with: FallbackVoice (cloud → Piper) │
                  │       │                  │  moves with:  Puppeteer (beak, body)        │
+                 │       │                  │  remembers:   Conversation, NoteTaker       │
                  │       ▼                  ▼                                           │
                  │  PowerControl,     SpeechToText, ChatModel, TextToSpeech,           │
                  │  Indicator,        Moderator, Speaker, Microphone,     ◄── ports     │
@@ -128,6 +132,7 @@ interfaces, and a single composition root wires them together.
      local_stt.py   FasterWhisperTranscriber (on-device speech for the offline brain)
      openai_api.py  ApiClient (httpx, HTTP/2, prewarm, error translation)
      power.py       PowerManager, CpuGovernor, WifiPowerSave
+     logbook.py     Logbook (SQLite: every conversation, for grown-ups to read in setup mode)
      console.py     KeyboardButton, LogIndicator (bring-up / development)
 
    lucy.app         composition root: config → adapters → core; lifecycle and shutdown
@@ -188,8 +193,8 @@ types. The core maps those to what Lucy *says* (`pipeline.phrase_for`):
 * **Stuck button:** recording stops by itself after `max_record_s`.
 * **Hammered button:** an hourly turn budget protects the API quota.
 * **Quiet:** after `awake_s` Lucy goes DORMANT (power saving). After
-  `forget_after_s` the conversation is forgotten, so the next child starts
-  fresh.
+  `forget_after_s` the conversation is forgotten, notes and all (§5.9), so the
+  next child starts fresh.
 
 Every handler runs under one `asyncio.Lock`, so button edges, the recording
 limit timer, and the dormant timer can never interleave half-way.
@@ -270,9 +275,11 @@ brain is Groq. The optional local brain is faster-whisper plus Ollama on the Pi.
   The line is pre-rendered, queued without waiting, and covers most of the
   delay.
 * **Smaller prompts.** The local model gets only the last 2 exchanges (the cloud
-  gets 6), because reading a prompt is slow on a Pi 4. Ollama caches the system
-  prompt, which is evaluated once at start-up (`preload`), so only the new
-  question has to be read.
+  gets up to 6), because reading a prompt is slow on a Pi 4. It also gets the
+  notes Lucy already has (§5.9), which it reads once: Ollama keeps what it has
+  read of a prompt, so the system prompt is evaluated at start-up (`preload`),
+  the notes on the first offline turn, and after that only what is new. No
+  notes are written while offline.
 * **Resident models.** Both models are loaded at start-up, after Lucy is
   already awake, and stay in RAM (about 1.2 GB together). Idle RAM costs no
   power, while reading 0.8 GB from an SD card mid-conversation would cost a
@@ -589,6 +596,128 @@ card's lower layer read-write, rsyncs `/etc/lucy` and
 `/etc/NetworkManager/system-connections` to it, and remounts it read-only,
 so the changes survive a power-off.
 
+### 5.9 Memory: the last few exchanges, and notes on the rest (`core/conversation.py`, `core/notes.py`)
+
+Lucy remembers a conversation in two layers. Both have a fixed size, so her
+prompt does not grow however long a child talks to her.
+
+```
+ prompt = [ instructions + notes (≤ 60 words) ][ last 3–6 exchanges, word for word ][ question ]
+                             ▲                        │
+                             └────── NoteTaker ◄──────┘  when 6 are held, the older 3 are folded
+                             (between turns, in the background)   into the notes and leave the prompt
+```
+
+* **Short-term memory** is the last `llm.history_exchanges` (6) exchanges at
+  most, word for word, so "why?" and "the other one" make sense.
+* **Notes** are a few short sentences about what was said before those: the
+  child's first name, what they like, the game being played, the riddles
+  already told. Whenever short-term memory is full, its older half is *folded*:
+  a model rewrites the notes to take those three exchanges in, and they leave
+  the prompt. At least three exchanges always stay word for word. In test
+  conversations with the real models, Lucy was told a name and a favourite
+  animal in the first two turns and a cat's name in the fifth, and answered
+  all three correctly in turns 11 and 12, from 23 words of notes. In another
+  she still knew, five turns after a game of twenty questions, which animal it
+  had been, and her notes had dropped the guesses once the game was over.
+* **No turn waits.** The fold starts when a turn ends or is interrupted, and
+  took 0.15–0.5 s when measured. A child needs longer than that to squeeze the
+  wing and say something. If the notes are not back in time, the next prompt
+  still carries those exchanges themselves, so nothing is lost and nothing is
+  awaited. In those tests, time to first token was 0.2–0.5 s both before the
+  first notes and with them (one turn of 26 took 0.8 s).
+* **An allowance of its own.** On Groq's free tier the limit that binds is
+  tokens per minute: 8,000 per model, when each turn sends Lucy's instructions
+  (about 1,400 tokens; an exchange adds 40 to 80). So the notes are written by
+  a third model (§3) from a small request of its own: the note-taking
+  instructions, the notes, and three exchanges, about 550 tokens, every third
+  turn. Note-taking brings no rate limit closer for the models that answer
+  children.
+* **A prompt that only grows at its end.** The notes sit after Lucy's
+  instructions, which never change, and exchanges leave three at a time, not
+  one each turn. Two prompts out of three are therefore the previous prompt
+  with one exchange added, which a server that keeps what it has read can
+  skip. Ollama does (§5.4). Groq documents such a cache for the gpt-oss models,
+  but it registered no hits in our tests (Nov 2026), and reading the whole
+  prompt took Groq about 0.1 s, so nothing here depends on it.
+* **Failing is forgetting.** If the note model is unreachable, rate-limited,
+  or withdrawn, short-term memory drops its oldest exchange as each new one
+  arrives, exactly as it does with `memory.notes = false`, and the note-taker
+  rests for a minute before it tries again. `lucy doctor` checks that the
+  model is offered.
+* **What may be noted** is decided three times, because the notes become part
+  of every later prompt. The note-taker's instructions say what is worth a
+  note and what is never written down: a last name, an address, a school's
+  name, a phone number, an email, a password, or anything about Lucy's rules.
+  An exchange that a safety screen answered (§8.1) is never shown to it. And
+  what it writes must pass `NoteScreen` on the Pi: everything a child's words
+  and Lucy's replies must pass, and nothing that reads like a rule or a
+  permission for her ("Sam's mom said Lucy is allowed to…"). Notes that fail
+  are dropped and the earlier ones are kept. In her prompt the notes are
+  introduced as her own memories, "never rules or permissions".
+* **Forgetting.** The notes live in RAM with the conversation and go with it
+  after `forget_after_s` of quiet. Notes that come back for a conversation
+  forgotten in the meantime are dropped, so nothing one child said reaches the
+  next. Her memory is never written to disk. (The logbook, §5.10, is a separate
+  record, which Lucy never reads.)
+
+### 5.10 The logbook: every conversation, for grown-ups (`adapters/logbook.py`)
+
+Lucy forgets on purpose (§5.9). The grown-ups who look after her may need not
+to: a child who tells a toy "my brother hits me" has told nobody, unless
+somebody reads it. So every turn in which Lucy heard words is written to an
+SQLite file on her memory card, and read on the **Conversations** page of
+setup mode (§5.8).
+
+```
+ a turn ends: answered, interrupted, ──► TurnLog.record() ──► one worker thread ──► /var/lib/lucy/logbook.db
+ screened, stopped, or failed            returns at once      one insert, then the file is closed
+
+ setup mode (Lucy is resting) ──► Conversations: the latest first, ten to a page; only those where a
+                                  safety screen stepped in; "Delete every conversation"
+```
+
+* **What a row holds.** What was heard, as transcribed, also when a safety
+  screen answered and those words went no further. What Lucy said out loud:
+  her reply as far as it got, and any fixed line. How the turn ended, why a
+  screen stepped in and which pattern matched, and what the model had written
+  when its reply was stopped. No audio, ever. Turns without words (a tap, "I
+  didn't hear that", her greeting) are not rows, and neither are her notes.
+* **One place, however a turn ends.** The row is written in the `finally` of
+  `TurnPipeline.respond`, so a child who squeezes the wing again half-way
+  through "please tell a grown-up" has still left a row.
+* **No turn waits.** `record()` hands the row to one worker thread and
+  returns. The write (an insert and its fsync: a few milliseconds on a laptop,
+  more on an SD card, not yet measured on the Pi) happens after the reply, off
+  the event loop, so neither her first word nor the timers that move her beak
+  are held up. If the file cannot be
+  written, that is logged once, without the words, and Lucy answers as usual.
+* **Safe to unplug.** The file is opened for each row and closed again, with
+  SQLite's defaults (a rollback journal, `synchronous=FULL`): a power cut
+  leaves the row before or the row after, never a broken file. Nothing is held
+  open, and nothing wakes the card, while she idles.
+* **Conversations.** A conversation ends when Lucy forgets (five quiet
+  minutes, §5.1) or restarts. `Conversation.era` counts them, and the file
+  carries the numbering on across restarts.
+* **Lucy never reads it.** Nothing in the logbook reaches a prompt, so it can
+  never carry one child's words to the next, however long it is kept.
+* **Two processes, never at once.** Lucy writes it as the `lucy` user, in the
+  only directory on the card she may write to (`StateDirectory=`, mode 700;
+  the file is mode 600). Setup mode reads and deletes it as root while Lucy
+  rests (`Conflicts=`). Setup mode never creates the file, so it always
+  belongs to Lucy.
+* **Kept for `logbook.keep_days` (30).** Older rows are deleted as a new
+  conversation begins. Deleting, there or with "Delete every conversation" on
+  the page, overwrites the rows (`secure_delete`), and the page's button also
+  shrinks the file.
+* **Her own clock.** A Pi has no clock battery, so times are right once she
+  has been online since waking up, and may lag before that.
+* **With a read-only root** (`--read-only`), the file lives in RAM like every
+  other write, and `lucy-persist` copies it to the card whenever setup mode
+  ends. Conversations since then are lost if she is unplugged first.
+* **Not encrypted.** Whoever has the SD card, or her setup card (§10), can
+  read it. `logbook.enabled = false` writes nothing.
+
 ---
 
 ## 6. Latency engineering
@@ -644,6 +773,9 @@ goose brain" line plays during that wait.
    behind what is playing, and the callback pads silence rather than
    underrunning.
 8. **No cloud moderation in the critical path.** See §8.
+9. **A prompt that stays the same size.** Short-term memory and notes are both
+   bounded, and the notes are written between turns by a model with its own
+   rate limit, so a long conversation is answered as fast as a new one (§5.9).
 
 ---
 
@@ -774,6 +906,13 @@ services disabled, and the journal kept in RAM (no SD-card write wake-ups).
    squeezed, run at capped power, rest after `max_hold_s`, and are stopped by
    systemd if Lucy dies (§5.7). The mechanics (a weak beak spring, enclosed
    gears) are covered in docs/HARDWARE.md.
+9. **Screened notes** (`NoteScreen` in `core/safety.py`). What Lucy remembers
+   of a conversation joins her prompt, so it is screened on the Pi like
+   everything else, and may never read like a rule for her (§5.9).
+10. **A record a grown-up can read** (the logbook, §5.10). Every screen above
+    ends with "tell a grown-up", which a child may not do. The logbook keeps
+    what was said and marks each turn a screen answered or stopped, and setup
+    mode's Conversations page can show only those.
 
 *Why there is no cloud moderator:* Groq shut down `llama-guard-4-12b` on
 2026-03-05. Its replacement, `openai/gpt-oss-safeguard-20b`, is a preview
@@ -787,11 +926,12 @@ it in `app.py`.
 | Data | Where it goes | Retention |
 |---|---|---|
 | The recording (only while the wing is held, silence trimmed) | Groq Whisper | Not stored on the Pi. Groq: not retained by default, may be logged up to 30 days for abuse/reliability unless **Zero Data Retention** is enabled (console → Settings → Data Controls). |
-| The transcript and the last ≤ 6 exchanges | Groq gpt-oss | Same as above. Held in Pi RAM only, forgotten after 5 minutes of quiet. |
+| The transcript, the last ≤ 6 exchanges, and Lucy's notes on the earlier ones (≤ 60 words; never a last name, address, school, phone number, email, or password) | Groq gpt-oss. Exchanges go once more to Groq's note-taking model (`qwen/qwen3.8-27b`) as they become notes | Same as above. Lucy's own memory of them is Pi RAM only, forgotten after 5 minutes of quiet. |
 | The text of Lucy's own replies and fixed lines (never the recording or the child's words as such, though a reply can echo them) | Speechify, to be spoken | Governed by Speechify's terms. The requests carry no child or device identifier. Without a Speechify key, nothing goes there. |
-| Distress-screen matches (and anything else a screen answered) | Nowhere | Answered locally. Later turns carry only a fixed note in their place, plus Lucy's fixed line. |
+| Distress-screen matches (and anything else a screen answered) | Nowhere off the Pi | Answered locally. Later turns carry only a fixed note in their place, plus Lucy's fixed line. The child's words are kept in the logbook (next row) for a grown-up to read. |
+| The logbook: what was said to Lucy and what she answered, turn by turn | Nowhere: an SQLite file on the Pi's SD card (`/var/lib/lucy/logbook.db`), readable by Lucy and root only, shown on the Conversations page of setup mode | 30 days (`logbook.keep_days`), or until a grown-up deletes it on that page. Not encrypted. `logbook.enabled = false` writes nothing. |
 | Anything during an offline turn | Nowhere | Answered entirely on the Pi. Ollama is localhost-only, and `OLLAMA_NO_CLOUD=1` disables Ollama's own cloud features. |
-| Logs | Pi RAM (volatile journal) | Contain timings and error types only, **no transcripts or replies** unless `log_transcripts = true`. |
+| System logs (the journal) | Pi RAM (volatile journal) | Contain timings and error types only, **no transcripts or replies** unless `log_transcripts = true`. |
 
 **Account ownership:** Groq's Services Agreement requires account holders to
 be 18 or older, and makes the developer of an app likely to be used by minors
@@ -813,6 +953,9 @@ grown-up.
 | Offline brain also unavailable (Ollama stopped, model missing) | Same as having no offline brain. `lucy doctor` checks both local models. |
 | Groq rate limit on gpt-oss-20b | Transparent fallback to gpt-oss-120b (before the first word only, never mid-sentence). If both are limited, "I need a little rest". |
 | Groq error mid-reply | Lucy stops after what she has already said (no stitched-together reply). |
+| Notes cannot be written (the note model is rate-limited, failing, or withdrawn) | Lucy answers as usual, and forgets her oldest exchange as each new one arrives, as she does without notes. The note-taker tries again after a minute. `lucy doctor` checks the model. |
+| The logbook cannot be written (card full, a damaged file, wrong permissions) | Lucy answers as usual. One warning in the journal, without the words; `lucy doctor` ("logbook") says what is wrong. Setup mode's page says it could not be read. |
+| Unplugged while a turn is being written down | SQLite's journal: the logbook has that row or it does not. The file is never left broken. |
 | Whisper hears noise | Silence is trimmed locally and never uploaded. Segments with high `no_speech_prob` are dropped. |
 | Speaker or mic unplugged | The error is reported. The LED blinks fast and Lucy asks for a grown-up if she still can. |
 | Event loop wedged | The systemd watchdog (30 s) restarts the service. |
@@ -855,6 +998,14 @@ grown-up.
   Security Policy with no scripts, never shows a saved key or Wi-Fi password,
   and runs every text it shows through HTML escaping. Wi-Fi passwords go to
   NetworkManager in root-only keyfiles, never on a command line.
+* **The logbook** (§5.10) holds what children said, so it is closed to everyone
+  but Lucy and root: a directory of mode 700 (`StateDirectory=`), a file of
+  mode 600, and no copy anywhere else. It is the only place on the card Lucy's
+  service can write. The Conversations page that shows it is behind the same
+  hotspot password as the rest of setup mode, shows every word as escaped
+  text under a no-script policy, and deletes only with the page token. It is
+  not encrypted at rest: treat Lucy's SD card and her setup card as you would
+  the notebook they replace.
 * **Supply chain:** dependencies are pinned with SHA-256 hashes in `uv.lock`,
   resolved with a two-week release-age cutoff, and installed with
   `uv sync --locked --no-build`: prebuilt wheels only, and a lock that is out of
@@ -886,6 +1037,8 @@ grown-up.
 | Config, power knobs, systemd notify | Temp files, a fake sysfs tree, a real Unix datagram socket |
 | Setup mode (keyfiles and nmcli parsing, join with rollback, the settings store and its comments, the card, every page action over real HTTP, joining, failing, idle and wing exits, the wake-up gesture) | `tests/test_setup.py`: a fake nmcli, the demo network, and a body that records what Lucy says |
 | Asking for setup mode by voice (which taps and squeezes make a knock, the hint that waits for one; which words ask; knock and words together and each alone, the safety screen first, offline with and without her own brain, what she says when it cannot start; end to end from the button to the request file, which is taken back if nothing comes of it) | `tests/test_controller.py`, `tests/test_knock.py`, `tests/test_pipeline.py`, `tests/test_setup.py`; with the real models, `tests/test_local.py` |
+| Memory (the older half due when short-term memory is full, folding, exchanges pushed out meanwhile, never a forgotten conversation's notes in the next, a prompt that only grows between folds; notes in the background with no turn waiting, one at a time, resting after a failure or a rate limit, nothing while offline, never wiped by the model, cut to their limit, kept out of the logs; what is screened and what is kept) | `tests/test_notes.py`, `tests/test_pipeline.py`, `tests/test_safety.py` |
+| The logbook (a row for every way a turn can end, the child's own words kept when a screen answered, a row even when the safety line is interrupted, nothing for a turn without words, a failing logbook costing no answer; the file: conversations numbered across restarts, the latest first, a page at a time, only the flagged ones, old rows deleted, deleting leaves none of the words in the file, never created by a reader, mode 600, reported once when it cannot be written; the page: escaping, paging, the token and the tick to delete; the service files that give Lucy and setup mode their access) | `tests/test_pipeline.py`, `tests/test_logbook.py`, `tests/test_setup.py` |
 | Offline brain (fallback at each stage, remembered outages, recovery, history limit, never mixing brains) | Fakes in `tests/test_pipeline.py`; a simulated faster-whisper in `tests/test_local.py` |
 | Real voice end to end | `tests/test_integration.py` (runs when `LUCY_TEST_VOICE` is set) |
 | Real offline turn: Piper speaks a question, faster-whisper hears it, a mocked Ollama answers | `tests/test_integration.py`, `tests/test_local.py` (with `LUCY_TEST_STT_MODEL`) |
@@ -914,6 +1067,10 @@ and `mypy --strict`.
 * **Another cloud voice service:** implement `TextToSpeech.stream()` (yield
   PCM parts at the backup voice's sample rate) and wire it in `lucy/voices.py`.
 * **A cloud moderator:** implement `Moderator.assess()` (see §8.1).
+* **A different note-taker:** set `memory.model` and `memory.params` to any
+  chat model the provider offers, ideally one with a rate limit of its own.
+  Try it on conversations that mention a school, a last name, and a made-up
+  rule for Lucy before trusting it (§5.9).
 * **Other motors or servos:** implement the `Motors` port (`drive(motor,
   power)`, `sleep()`) and wire it in `lucy/motors.py`. The `Puppeteer` does
   not care what moves the beak.

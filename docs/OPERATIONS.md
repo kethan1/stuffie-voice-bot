@@ -157,6 +157,14 @@ grown-ups go: whoever has it can change her settings.
      stays quick to answer, the questions-per-hour limit, and the beak and
      body powers. **Hear her** and **Test motors** try the numbers on the
      page before you save them.
+   * **Conversations:** how many conversations Lucy has written down, and
+     **Read them**: what was said to her and what she answered, the latest
+     first, ten conversations to a page. Turns where a safety screen stepped
+     in are marked in red with the reason (for example "may need a grown-up
+     (being-hurt)"), and **Where a safety screen stepped in** shows only those
+     conversations. **Delete every conversation** removes them for good. The
+     two settings beside the link turn the writing off, and set how many days
+     conversations are kept (30; 0 keeps them until you delete them).
    * **API keys:** paste a new Groq or Speechify key. The page never shows a
      saved key, only its last four characters.
    * **Advanced:** the whole `config.toml`, with its notes. Lucy refuses
@@ -171,10 +179,30 @@ grown-ups go: whoever has it can change her settings.
 | Wi-Fi networks | NetworkManager: `/etc/NetworkManager/system-connections/` |
 | Settings | `/etc/lucy/config.toml` (the version before the last change: `config.toml.previous`) |
 | API keys | `/etc/lucy/credentials/` |
+| Conversations (her logbook) | `/var/lib/lucy/logbook.db`, written by Lucy as she talks; setup mode only reads and deletes it |
 
 With a read-only root (`--read-only`), these changes would otherwise be lost at
 power-off, so setup mode copies them to the SD card when it ends
-(`/usr/local/sbin/lucy-persist`).
+(`/usr/local/sbin/lucy-persist`). That includes her logbook, and it is the only
+time the logbook reaches the card: with a read-only root, conversations since
+setup mode last ended are lost if she is unplugged. To keep them, open setup
+mode (and tap **Finish setup**) before unplugging her, or leave the root
+writable.
+
+**Her logbook.** Lucy writes down every turn in which she hears words, also the
+ones a safety screen answers for her, so that a child who tells her something
+serious has told a grown-up too. Read it regularly. It holds what children
+said, by first name if they gave one, so:
+
+* tell the families and the school that she keeps it, as you would for any
+  other record of children;
+* keep her setup card, and her SD card, where only grown-ups go: either one
+  opens the logbook, which is not encrypted;
+* delete it from the page when it has served its purpose, or shorten
+  `logbook.keep_days`.
+
+No audio is ever kept, the logbook never leaves the Pi, and Lucy never reads it
+back: what one child said is never repeated to another.
 
 **School networks.** Lucy can log in to networks that ask for a username and
 password (WPA2-Enterprise with PEAP, the usual kind); she does not check the
@@ -203,6 +231,7 @@ password of `wrong-password` pretends to fail.
 
 | Task | Command |
 |---|---|
+| Read what was said | Setup mode, **Conversations** (section 5). Over SSH: `sudo sqlite3 /var/lib/lucy/logbook.db "SELECT datetime(at,'unixepoch','localtime'), outcome, concern, heard, said FROM turns ORDER BY id DESC LIMIT 20"` (after `sudo apt-get install sqlite3`) |
 | Live logs | `journalctl -u lucy -f` (and `journalctl -u ollama -f` for the offline brain) |
 | Status | `systemctl status lucy` |
 | Restart after a config change | `sudo systemctl restart lucy` |
@@ -212,9 +241,14 @@ password of `wrong-password` pretends to fail.
 Every turn logs one line such as
 `turn complete (cloud brain): stt=0.41s first_token=0.68s first_synth=0.93s first_audio=0.93s total=7.12s`.
 Offline turns say `(local brain)` and include `fallback=…`.
-Children's words and the model's replies are **not** logged unless
+Children's words and the model's replies are **not** in this journal unless
 `turn.log_transcripts = true`, which adds `child said: …` and `cloud brain replied: …`
-(or `local brain replied: …`) lines to each turn.
+(or `local brain replied: …`) lines to each turn. They are kept in her logbook
+instead (section 5), which only root and Lucy can read.
+In a longer conversation, every third turn or so is followed by
+`folded 3 exchange(s) into the notes (23 words) in 0.19s`: Lucy's memory of what
+was said earlier (ARCHITECTURE.md §5.9). The notes themselves are logged
+(`Lucy's notes: …`) only with `turn.log_transcripts = true`.
 
 ## 7. Tuning
 
@@ -235,7 +269,12 @@ All settings are in `/etc/lucy/config.toml` (documented inline).
 | Slower, clearer speech for little ones | `tts.length_scale = 1.15` (on-device voice); pick a calmer cloud voice with `lucy voices` |
 | Fewer "I didn't hear that" | Lower `turn.speech_threshold_dbfs` (e.g. `-55`), or raise mic gain in `alsamixer` |
 | Answers that are less creative and more steady | `llm.params.temperature = 0.5` |
-| More context for follow-ups | `llm.history_exchanges = 10` (slightly slower and costlier) |
+| A conversation remembered for longer after it goes quiet | `session.forget_after_s` (300: she forgets everything five minutes after the last answer) |
+| More of a conversation word for word | `llm.history_exchanges = 10` (each exchange adds 40 to 80 tokens to every request; the older half still becomes notes when it is full) |
+| Longer or shorter notes on the earlier parts | `memory.max_words` (60) |
+| Conversations kept for longer, or not as long | `logbook.keep_days` (30; 0 keeps them until you delete them), or **Conversations** in setup mode |
+| No record of what is said to her | `logbook.enabled = false`, or untick **Write down every conversation** in setup mode. Then delete what is already there on the Conversations page |
+| No notes, only the last few exchanges | `memory.notes = false`, or untick **Remember more of each conversation** in setup mode |
 | Faster offline answers | `sudo ollama pull gemma3:270m`, then `local.model = "gemma3:270m"` (quicker but simpler answers); `local.params.max_tokens = 60` |
 | More accurate offline hearing | A `base.en` faster-whisper model in `local.stt_model` (about twice as slow as `tiny.en`) |
 | A beak that opens wider, or snaps less | `motors.motion.beak_max_power` (up or down). If small syllables don't move it, raise `beak_min_power` until `lucy motors` just moves it |
@@ -254,6 +293,9 @@ sudo deploy/install.sh --read-only && sudo reboot           # only if it was rea
 
 Edited config files are never overwritten. If the template changed, the new
 version is written next to yours as `config.toml.new` so you can compare them.
+Settings your file does not have take their defaults. One of those is new and
+worth knowing about: from this version Lucy **writes down every conversation**
+in her logbook (section 5) unless your file says `[logbook]` `enabled = false`.
 A config from before the cloud voice still works (missing settings take their
 defaults), but it sets `first_clause_min_words = 4`. Change that to `0` so Lucy
 speaks in whole sentences, which sounds more natural.
@@ -273,6 +315,11 @@ installed and up to date without `--local-backup`.
 | Crackles or gaps | CPU starved or weak power | `vcgencmd get_throttled` (non-zero = under-voltage); raise `audio.output_latency_s` to `0.12` |
 | Button does nothing | Wiring or pin number | `lucy doctor`; `gpioinfo` shows `lucy-button` on line 17 |
 | `CPU governor ... not writable` in doctor | Service never started since boot | Start it once; its `ExecStartPre` grants access |
+| Lucy forgets a name she was told a few minutes ago, mid-conversation | Her notes are not being written (the note model is rate-limited or no longer offered), or they were screened | `journalctl -u lucy -g notes`; `sudo lucy doctor` ("AI service") names a missing model: set `memory.model` to one the provider offers |
+| The Conversations page says nothing is written down | Writing is turned off, nobody has talked to her since it was turned on, or the file cannot be written | `sudo lucy doctor` ("logbook") counts what is there, or says why it cannot be written; `journalctl -u lucy -g logbook` |
+| Conversations are gone after unplugging her | With `--read-only`, the logbook is in RAM until setup mode ends | Open setup mode and tap **Finish setup** before unplugging her (section 5) |
+| The times on the Conversations page are wrong | The Pi has no clock battery: until she has been online, her clock carries on from when she was last shut down | They are right for turns made after she connects. Set the time zone with `sudo raspi-config nonint do_change_timezone Europe/London` (yours) |
+| Lucy has forgotten everything after a pause | More than `session.forget_after_s` (five minutes) of quiet | Working as intended, so the next child starts fresh. Raise it for longer memories |
 | Lucy "thinks on her own" though the Wi-Fi works | Groq is blocked (firewall, DNS) | `curl -sI https://api.groq.com`; the next press re-checks automatically |
 | Lucy is much louder or quieter than usual | A child asked her to ("louder", "too loud") | Ask her ("quieter"), or `sudo systemctl restart lucy`: she always wakes up at her usual loudness |
 | Lucy sounds robotic | Her cloud voice is unavailable, so the on-device voice speaks: no Speechify key, the month's free characters are used up, or Speechify is blocked | `lucy doctor` ("cloud voice"); `journalctl -u lucy -g "cloud voice"`; usage at <https://platform.speechify.ai/usage> |
@@ -299,6 +346,7 @@ installed and up to date without `--local-backup`.
 sudo systemctl disable --now lucy ollama
 sudo systemctl disable --now lucy-setup.path lucy-setup-offline.service
 sudo nmcli connection delete "Lucy setup hotspot"
+sudo rm -rf /var/lib/lucy   # her logbook: every conversation she wrote down
 sudo rm -rf /opt/lucy /etc/lucy /var/cache/lucy /usr/local/bin/lucy /etc/systemd/system/lucy.service \
   /etc/systemd/journald.conf.d/lucy.conf /etc/systemd/system/lucy-setup.service \
   /etc/systemd/system/lucy-setup.path /etc/systemd/system/lucy-setup-offline.service \
