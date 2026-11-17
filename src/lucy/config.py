@@ -178,6 +178,12 @@ class AudioSettings:
     input_device: str = ""
     """PortAudio device name (substring) or index; empty means the ALSA default."""
     output_device: str = ""
+    speaker_card: str = ""
+    """With no ``output_device``: the ALSA card id (in brackets in ``aplay -l``) of her speaker.
+    When it is not plugged in, or this is empty, any USB speaker that is plugged in is used
+    instead, so a speaker can be swapped for another without changing anything."""
+    microphone_card: str = ""
+    """The same for her microphone (``arecord -l``)."""
     input_sample_rate: int = 16_000
     output_latency_s: float = 0.08
     output_blocksize: int = 1024

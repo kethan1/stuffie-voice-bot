@@ -145,6 +145,7 @@ async def run(config: Config, *, keyboard: bool = False) -> int:
         speaker = SoundDeviceSpeaker(
             sample_rate=tts.sample_rate,
             device=device(config.audio.output_device),
+            card=config.audio.speaker_card,
             latency_s=config.audio.output_latency_s,
             blocksize=config.audio.output_blocksize,
             listener=puppeteer,
@@ -152,6 +153,7 @@ async def run(config: Config, *, keyboard: bool = False) -> int:
         mic = SoundDeviceMicrophone(
             sample_rate=config.audio.input_sample_rate,
             device=device(config.audio.input_device),
+            card=config.audio.microphone_card,
             max_seconds=config.session.max_record_s + 1.0,
         )
         indicator = build_indicator(config, stack)

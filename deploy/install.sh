@@ -168,6 +168,18 @@ drop_drv8833_settings() {
   warn "an L293D, wired as docs/HARDWARE.md shows (pins 15, 16, 18 and 22 changed jobs)"
 }
 
+# Set [audio] $1 = "$2" in the installed config (keeping a comment after it), or add it.
+set_audio_setting() {
+  local key=$1 value=$2 config="$ETC/config.toml"
+  if sed -n '/^\[audio\]/,/^\[/p' "$config" | grep -Eq "^$key *="; then
+    sed -i -E "/^\[audio\]/,/^\[/ s|^$key *= *\"[^\"]*\"|$key = \"$value\"|" "$config"
+  elif grep -q '^\[audio\]' "$config"; then
+    sed -i "/^\[audio\]/a $key = \"$value\"" "$config"
+  else
+    printf '\n[audio]\n%s = "%s"\n' "$key" "$value" >>"$config"
+  fi
+}
+
 # The id of an ALSA card with a PCM of the given kind (p = playback, c = capture).
 # USB devices win over the onboard outputs; HDMI audio is never chosen.
 detect_card() {
@@ -310,7 +322,10 @@ if [[ -n $PLAYBACK_CARD && -n $CAPTURE_CARD ]]; then
   [[ ! -e /etc/asound.conf || -e /etc/asound.conf.lucy-backup ]] || cp -a /etc/asound.conf /etc/asound.conf.lucy-backup
   sed -e "s/@PLAYBACK_CARD@/$PLAYBACK_CARD/g" -e "s/@CAPTURE_CARD@/$CAPTURE_CARD/g" \
     "$REPO_DIR/deploy/alsa/asound.conf" >/etc/asound.conf
+  set_audio_setting speaker_card "$PLAYBACK_CARD"
+  set_audio_setting microphone_card "$CAPTURE_CARD"
   log "speaker card: $PLAYBACK_CARD, microphone card: $CAPTURE_CARD (change with --playback-card/--capture-card)"
+  log "when one is unplugged, Lucy uses any other USB speaker or microphone that is plugged in"
 else
   warn "could not find a speaker and a microphone (see 'aplay -l' and 'arecord -l'); re-run once they are plugged in"
 fi

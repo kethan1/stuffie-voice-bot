@@ -6,6 +6,7 @@ from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import ClassVar
 
+import numpy as np
 import pytest
 
 from lucy.adapters.motors import HBridge, L293d, SysfsPwm, open_l293d
@@ -156,6 +157,16 @@ class TestHBridge:
         events.clear()
         bridge.drive(-3.0)  # clamped to full reverse
         assert events == ["EN 1"]
+
+    def test_takes_the_numpy_powers_the_beak_is_given(self) -> None:
+        # The beak's power comes from the loudness of the sound, as a NumPy scalar.
+        bridge, events = self.bridge()
+        events.clear()
+        bridge.drive(np.float64(0.5))
+        assert events == ["EN 0", "1A high", "2A low", "EN 0.5"]
+        events.clear()
+        bridge.drive(np.float64(-0.5))
+        assert events == ["EN 0", "1A low", "2A high", "EN 0.5"]
 
     def test_turns_the_outputs_off_before_changing_direction(self) -> None:
         # Both inputs at the same level with the enable pin high would brake the motor.

@@ -2,11 +2,14 @@
 
 import asyncio
 import importlib.abc
+import logging
+import os
 import sys
 import threading
 import time
 import types
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -26,35 +29,73 @@ class _Status:
 class FakeStream:
     """Calls ``callback`` from its own thread, like PortAudio does."""
 
-    def __init__(self, *, callback: Callable[..., None], blocksize: int, **_: Any) -> None:
+    def __init__(
+        self,
+        *,
+        callback: Callable[..., None],
+        blocksize: int,
+        finished_callback: Callable[[], None] | None = None,
+        **_: Any,
+    ) -> None:
         self.callback = callback
+        self.finished_callback = finished_callback
         self.blocksize = blocksize
         self.output = bytearray()
         self.feed = [bytes([i % 256, 0]) * blocksize for i in range(1000)]
         self.timing: Any = None  # PortAudio's time info, as the callback is handed it
+        self.start_error: Exception | None = None
+        self.unplug_at_start = False
+        self.unplugged = False
+        self.stalled = False
+        self.let_go = threading.Event()  # set when PortAudio gives up on a stalled stream
+        self.closed = False
         self._running = threading.Event()
         self._thread: threading.Thread | None = None
 
     def start(self) -> None:
+        if self.start_error is not None:
+            raise self.start_error
+        if self.unplug_at_start:
+            self.unplugged = True
+            if self.finished_callback is not None:
+                self.finished_callback()
+            return
         self._running.set()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
     def _run(self) -> None:
         while self._running.is_set():
-            self.tick()
+            if not self.stalled:
+                self.tick()
             time.sleep(0.0005)
+        if self.finished_callback is not None:
+            self.finished_callback()  # as PortAudio does, however the stream came to stop
 
     def tick(self) -> None:
         raise NotImplementedError
 
+    def unplug(self) -> None:
+        """The sound card goes away: PortAudio's audio thread gives up."""
+        self.unplugged = True
+        self._running.clear()
+
+    def stall(self) -> None:
+        """The sound card goes away, as ALSA shows it: nothing more is asked for, and
+        PortAudio says nothing (and cannot stop the stream) until it gives up, much later."""
+        self.stalled = True
+
     def stop(self) -> None:
+        if self.stalled:
+            self.let_go.wait(5.0)  # (a failing test must not leave this thread waiting for ever)
         self._running.clear()
         if self._thread:
             self._thread.join()
+        if self.unplugged or self.stalled:
+            raise OSError("no such device")
 
     def close(self) -> None:
-        pass
+        self.closed = True
 
 
 class FakeOutput(FakeStream):
@@ -71,24 +112,73 @@ class FakeInput(FakeStream):
 
 
 @pytest.fixture
-def sounddevice(monkeypatch: pytest.MonkeyPatch) -> types.SimpleNamespace:
+def sounddevice(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> types.SimpleNamespace:
+    """A stand-in for the ``sounddevice`` module.
+
+    ``fail``: no stream can be opened. ``listed``: the sound cards are on PortAudio's list.
+    ``plugged_in``: they are there to be found when it lists them again (``lists`` counts).
+    ``default``: the name of PortAudio's default device on ALSA (None: not on ALSA).
+    ``cards``: /proc/asound, empty until a test plugs cards in. ``card_at_open``: the
+    card ALSA's default device named as each stream opened.
+    """
+    from lucy.adapters import sound, sound_cards
+
+    monkeypatch.setattr(sound_cards, "PROC_ASOUND", tmp_path)
+    monkeypatch.setattr(sound_cards, "_router", sound_cards._Router())
+    monkeypatch.delenv("LUCY_SPEAKER_CARD", raising=False)
+    monkeypatch.delenv("LUCY_MICROPHONE_CARD", raising=False)
+
     streams: list[FakeStream] = []
-    module = types.SimpleNamespace(fail=False, streams=streams, timing=None)
+    module = types.SimpleNamespace(
+        fail=False,
+        fail_start=False,
+        unplug_at_start=False,
+        listed=True,
+        plugged_in=False,
+        lists=0,
+        streams=streams,
+        timing=None,
+        default=None,
+        cards=tmp_path,
+        card_at_open=[],
+    )
 
     def make(kind: type[FakeStream]) -> Callable[..., FakeStream]:
         def factory(**kwargs: Any) -> FakeStream:
+            variable = "LUCY_SPEAKER_CARD" if kind is FakeOutput else "LUCY_MICROPHONE_CARD"
+            module.card_at_open.append(os.environ.get(variable))
             if module.fail:
                 raise OSError("no such device")
             stream = kind(**kwargs)
             stream.timing = module.timing
+            if module.fail_start:
+                stream.start_error = OSError("the device went away")
+            stream.unplug_at_start = module.unplug_at_start
             streams.append(stream)
             return stream
 
         return factory
 
+    def query_devices(device: Any = None, kind: str | None = None) -> dict[str, Any]:
+        if not module.listed:
+            raise OSError("Error querying device -1")
+        if module.default is not None:
+            return {"name": module.default, "hostapi": 0}
+        return {"name": "fake"}
+
+    def initialize() -> None:
+        module.lists += 1
+        if module.plugged_in:
+            module.fail, module.listed = False, True
+
     module.RawOutputStream = make(FakeOutput)
     module.RawInputStream = make(FakeInput)
+    module.query_devices = query_devices
+    module.query_hostapis = lambda index: {"name": "ALSA"}
+    module._terminate = lambda: None
+    module._initialize = initialize
     monkeypatch.setitem(sys.modules, "sounddevice", module)
+    monkeypatch.setattr(sound, "_streams", sound._Streams())  # no streams left from other tests
     return module
 
 
@@ -261,6 +351,336 @@ async def test_open_failure_fails_waiting_clips(sounddevice: types.SimpleNamespa
         await speaker.open()
 
 
+async def test_an_unplugged_speaker_fails_what_was_queued(
+    sounddevice: types.SimpleNamespace, caplog: pytest.LogCaptureFixture
+) -> None:
+    from lucy.adapters.sound import SoundDeviceSpeaker
+
+    listener = Listener()
+    speaker = SoundDeviceSpeaker(sample_rate=8_000, blocksize=BLOCK, listener=listener)
+    playing = speaker.enqueue(clip(1, 8_000 * 60))
+    waiting = speaker.enqueue(clip(2, 10))
+    await until(lambda: len(listener.played) == 1)
+    sounddevice.streams[0].unplug()
+    # Neither clip will ever be played: they fail now, instead of waiting for ever.
+    for future in (playing, waiting):
+        with pytest.raises(AudioDeviceError, match="stopped working"):
+            await asyncio.wait_for(future, 2.0)
+    assert listener.stops == 1  # her beak stops with the sound
+    assert "the speaker stopped working" in caplog.text
+    await until(lambda: sounddevice.streams[0].closed)  # the dead stream is not left open
+    await speaker.close()
+
+
+async def test_a_speaker_plugged_back_in_plays_the_next_clip(
+    sounddevice: types.SimpleNamespace,
+) -> None:
+    from lucy.adapters.sound import SoundDeviceSpeaker
+
+    speaker = SoundDeviceSpeaker(sample_rate=8_000, blocksize=BLOCK)
+    await asyncio.wait_for(speaker.enqueue(clip(1, 10)), 2.0)
+    sounddevice.streams[0].unplug()  # between two sounds, while Lucy is still awake
+    await until(lambda: sounddevice.streams[0].closed)
+    await asyncio.wait_for(speaker.enqueue(clip(2, 10)), 2.0)
+    await speaker.close()
+    assert len(sounddevice.streams) == 2  # a new stream, with no restart and no doze
+    assert b"\x02\x00" * 10 in sounddevice.streams[1].output
+    assert sounddevice.lists == 0  # it was on PortAudio's list all along
+
+
+async def test_no_sound_while_the_speaker_is_unplugged_then_sound_again(
+    sounddevice: types.SimpleNamespace,
+) -> None:
+    from lucy.adapters.sound import SoundDeviceSpeaker
+
+    speaker = SoundDeviceSpeaker(sample_rate=8_000, blocksize=BLOCK)
+    await speaker.open()
+    sounddevice.streams[0].unplug()
+    sounddevice.fail = True
+    await until(lambda: sounddevice.streams[0].closed)
+    with pytest.raises(AudioDeviceError, match="cannot open the speaker"):
+        await asyncio.wait_for(speaker.enqueue(clip(1, 10)), 2.0)
+    sounddevice.fail = False  # plugged back in
+    await asyncio.wait_for(speaker.enqueue(clip(2, 10)), 2.0)
+    await speaker.close()
+
+
+async def test_a_speaker_unplugged_as_it_opens_is_noticed(
+    sounddevice: types.SimpleNamespace,
+) -> None:
+    from lucy.adapters.sound import SoundDeviceSpeaker
+
+    # PortAudio reports the stream stopped before the event loop has been handed it.
+    sounddevice.unplug_at_start = True
+    speaker = SoundDeviceSpeaker(sample_rate=8_000, blocksize=BLOCK)
+    with pytest.raises(AudioDeviceError, match="stopped working"):
+        await asyncio.wait_for(speaker.enqueue(clip(1, 10)), 2.0)
+    await until(lambda: sounddevice.streams[0].closed)
+    sounddevice.unplug_at_start = False  # plugged back in: the next sound opens it again
+    await asyncio.wait_for(speaker.enqueue(clip(2, 10)), 2.0)
+    await speaker.close()
+
+
+@pytest.fixture
+def quick_to_notice(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Count a stream as stalled after 50 ms without a callback, not a second."""
+    from lucy.adapters import sound
+
+    monkeypatch.setattr(sound, "_STALLED_S", 0.05)
+
+
+@pytest.mark.usefixtures("quick_to_notice")
+async def test_a_stream_that_stops_asking_for_audio_is_replaced(
+    sounddevice: types.SimpleNamespace, caplog: pytest.LogCaptureFixture
+) -> None:
+    from lucy.adapters.sound import SoundDeviceSpeaker
+
+    listener = Listener()
+    speaker = SoundDeviceSpeaker(sample_rate=8_000, blocksize=BLOCK, listener=listener)
+    cut_off = speaker.enqueue(clip(1, 8_000 * 60))
+    await until(lambda: len(listener.played) == 1)
+    dead = sounddevice.streams[0]
+    dead.stall()  # unplugged in the middle of a sentence, and plugged straight back in
+    # PortAudio has not noticed, and no new sound is queued: the watchdog gives up on it.
+    with pytest.raises(AudioDeviceError, match="stopped working"):
+        await asyncio.wait_for(cut_off, 2.0)
+    assert listener.stops == 1
+    await asyncio.wait_for(speaker.enqueue(clip(2, 10)), 2.0)  # the next sound: a new stream
+    await until(lambda: b"\x02\x00" * 10 in sounddevice.streams[1].output)
+    assert not dead.closed  # PortAudio is still holding on to it, in the background
+    dead.let_go.set()
+    await until(lambda: dead.closed)
+    assert "did not close cleanly" not in caplog.text  # expected of a dead stream: not a warning
+    await speaker.close()
+
+
+@pytest.mark.usefixtures("quick_to_notice")
+async def test_closing_does_not_wait_for_a_stream_that_has_stalled(
+    sounddevice: types.SimpleNamespace,
+) -> None:
+    from lucy.adapters.sound import SoundDeviceSpeaker
+
+    speaker = SoundDeviceSpeaker(sample_rate=8_000, blocksize=BLOCK)
+    await speaker.open()
+    dead = sounddevice.streams[0]
+    dead.stall()
+    await asyncio.sleep(0.1)
+    await asyncio.wait_for(speaker.close(), 1.0)  # Lucy dozes at once; PortAudio takes its time
+    assert not dead.closed
+    dead.let_go.set()
+    await until(lambda: dead.closed)
+
+
+async def test_a_quiet_speaker_is_not_taken_for_a_stalled_one(
+    sounddevice: types.SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from lucy.adapters import sound
+
+    monkeypatch.setattr(sound, "_STALLED_S", 0.2)
+    speaker = sound.SoundDeviceSpeaker(sample_rate=8_000, blocksize=BLOCK)
+    await asyncio.wait_for(speaker.enqueue(clip(1, 10)), 2.0)
+    await asyncio.sleep(0.4)  # awake with nothing to say: the stream still asks, for silence
+    await asyncio.wait_for(speaker.enqueue(clip(2, 10)), 2.0)
+    await speaker.close()
+    assert len(sounddevice.streams) == 1
+
+
+async def test_closing_the_speaker_is_not_taken_for_unplugging(
+    sounddevice: types.SimpleNamespace, caplog: pytest.LogCaptureFixture
+) -> None:
+    from lucy.adapters.sound import SoundDeviceSpeaker
+
+    speaker = SoundDeviceSpeaker(sample_rate=8_000, blocksize=BLOCK)
+    await asyncio.wait_for(speaker.enqueue(clip(1, 10)), 2.0)
+    await speaker.close()  # Lucy dozes: PortAudio reports this stream stopped, too
+    waiting = speaker.enqueue(clip(2, 8_000 * 60))
+    await until(lambda: len(sounddevice.streams) == 2 and b"\x02" in sounddevice.streams[1].output)
+    await asyncio.sleep(0.01)
+    assert not waiting.done()  # the new stream is not mistaken for the one that was closed
+    assert "stopped working" not in caplog.text
+    await speaker.close()
+
+
+async def test_close_survives_a_speaker_that_cannot_be_stopped(
+    sounddevice: types.SimpleNamespace, caplog: pytest.LogCaptureFixture
+) -> None:
+    from lucy.adapters.sound import SoundDeviceSpeaker
+
+    speaker = SoundDeviceSpeaker(sample_rate=8_000, blocksize=BLOCK)
+    await speaker.open()
+    stream = sounddevice.streams[0]
+    stream.finished_callback = None  # unplugged, and PortAudio never said
+    stream.unplug()
+    await speaker.close()  # Lucy still dozes, and still shuts down
+    assert stream.closed
+    assert "did not close cleanly" in caplog.text
+
+
+async def test_a_speaker_plugged_in_after_start_up_is_found(
+    sounddevice: types.SimpleNamespace,
+) -> None:
+    from lucy.adapters.sound import SoundDeviceSpeaker
+
+    sounddevice.fail, sounddevice.listed = True, False  # Lucy started without her speaker
+    speaker = SoundDeviceSpeaker(sample_rate=8_000, blocksize=BLOCK)
+    with pytest.raises(AudioDeviceError):
+        await asyncio.wait_for(speaker.enqueue(clip(1, 10)), 2.0)
+    assert sounddevice.lists == 1  # looked for it, and it is still not there
+    sounddevice.plugged_in = True
+    await asyncio.wait_for(speaker.enqueue(clip(2, 10)), 2.0)
+    assert sounddevice.lists == 2
+    await speaker.close()
+
+
+async def test_the_sound_cards_are_not_listed_again_while_recording(
+    sounddevice: types.SimpleNamespace,
+) -> None:
+    from lucy.adapters.sound import SoundDeviceMicrophone, SoundDeviceSpeaker
+
+    mic = SoundDeviceMicrophone(sample_rate=8_000, block_s=BLOCK / 8_000)
+    speaker = SoundDeviceSpeaker(sample_rate=8_000, blocksize=BLOCK)
+    await mic.start()
+    sounddevice.fail, sounddevice.listed, sounddevice.plugged_in = True, False, True
+    with pytest.raises(AudioDeviceError):
+        await asyncio.wait_for(speaker.enqueue(clip(1, 10)), 2.0)
+    assert sounddevice.lists == 0  # a new list would have cut the recording off
+    assert (await mic.stop()).frames > 0
+    await asyncio.wait_for(speaker.enqueue(clip(2, 10)), 2.0)  # the wing is let go: now it may
+    assert sounddevice.lists == 1
+    await speaker.close()
+
+
+async def test_a_listed_speaker_that_will_not_open_is_not_looked_for(
+    sounddevice: types.SimpleNamespace,
+) -> None:
+    from lucy.adapters.sound import SoundDeviceSpeaker
+
+    sounddevice.fail = True  # unplugged, but on the list: plugging it back in is enough
+    speaker = SoundDeviceSpeaker(sample_rate=8_000)
+    with pytest.raises(AudioDeviceError):
+        await asyncio.wait_for(speaker.enqueue(clip(1, 10)), 2.0)
+    assert sounddevice.lists == 0
+
+
+async def test_a_stream_that_will_not_start_is_closed(sounddevice: types.SimpleNamespace) -> None:
+    from lucy.adapters.sound import SoundDeviceSpeaker
+
+    sounddevice.fail_start = True
+    speaker = SoundDeviceSpeaker(sample_rate=8_000)
+    with pytest.raises(AudioDeviceError, match="the device went away"):
+        await asyncio.wait_for(speaker.enqueue(clip(1, 10)), 2.0)
+    assert sounddevice.streams[0].closed  # left open, it would keep the sound card busy
+    sounddevice.fail_start = False
+    await asyncio.wait_for(speaker.enqueue(clip(2, 10)), 2.0)
+    await speaker.close()
+
+
+def plug_in(cards: Path, number: int, card_id: str, *, record: bool = False) -> None:
+    folder = cards / f"card{number}"
+    folder.mkdir()
+    (folder / "id").write_text(card_id)
+    (folder / "usbid").write_text("4c4a:4155")
+    (folder / ("pcm0c" if record else "pcm0p")).mkdir()
+
+
+async def test_a_different_speaker_is_used_when_hers_is_gone(
+    sounddevice: types.SimpleNamespace,
+) -> None:
+    from lucy.adapters.sound import SoundDeviceSpeaker
+
+    plug_in(sounddevice.cards, 2, "LucyMic", record=True)
+    plug_in(sounddevice.cards, 3, "UACDemoV10")  # LucySpeaker was swapped for this one
+    speaker = SoundDeviceSpeaker(sample_rate=8_000, blocksize=BLOCK, card="LucySpeaker")
+    assert os.environ["LUCY_SPEAKER_CARD"] == "UACDemoV10"  # before PortAudio lists the cards
+    await asyncio.wait_for(speaker.enqueue(clip(1, 10)), 2.0)
+    assert sounddevice.card_at_open == ["UACDemoV10"]
+    await speaker.close()
+
+    plug_in(sounddevice.cards, 4, "LucySpeaker")  # her own is back: the next stream uses it
+    await asyncio.wait_for(speaker.enqueue(clip(2, 10)), 2.0)
+    assert sounddevice.card_at_open == ["UACDemoV10", "LucySpeaker"]
+    await speaker.close()
+
+
+async def test_a_speaker_swapped_while_lucy_is_awake_is_used_for_the_next_sound(
+    sounddevice: types.SimpleNamespace,
+) -> None:
+    from lucy.adapters.sound import SoundDeviceSpeaker
+
+    plug_in(sounddevice.cards, 3, "LucySpeaker")
+    speaker = SoundDeviceSpeaker(sample_rate=8_000, blocksize=BLOCK, card="LucySpeaker")
+    await asyncio.wait_for(speaker.enqueue(clip(1, 10)), 2.0)
+    sounddevice.streams[0].unplug()
+    (sounddevice.cards / "card3" / "id").unlink()
+    (sounddevice.cards / "card3").rename(sounddevice.cards / "gone")
+    plug_in(sounddevice.cards, 4, "Device")  # a new speaker, in another port
+    await until(lambda: sounddevice.streams[0].closed)
+    await asyncio.wait_for(speaker.enqueue(clip(2, 10)), 2.0)
+    assert sounddevice.card_at_open == ["LucySpeaker", "Device"]
+    await speaker.close()
+
+
+async def test_with_no_speaker_anywhere_the_error_says_so(
+    sounddevice: types.SimpleNamespace, caplog: pytest.LogCaptureFixture
+) -> None:
+    from lucy.adapters.sound import SoundDeviceSpeaker
+
+    sounddevice.fail = True
+    speaker = SoundDeviceSpeaker(sample_rate=8_000, blocksize=BLOCK, card="LucySpeaker")
+    for value in range(3):
+        with pytest.raises(AudioDeviceError, match="no speaker found: LucySpeaker and every USB"):
+            await asyncio.wait_for(speaker.enqueue(clip(value, 10)), 2.0)
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert len(errors) == 1  # every sound tries again; it is said once
+    sounddevice.fail = False
+    plug_in(sounddevice.cards, 3, "UACDemoV10")
+    await asyncio.wait_for(speaker.enqueue(clip(4, 10)), 2.0)
+    await speaker.close()
+    assert "the speaker works again" in caplog.text
+
+
+async def test_a_gone_speaker_is_not_asked_for(sounddevice: types.SimpleNamespace) -> None:
+    """PortAudio can abort the process when asked to open a card that has just gone."""
+    from lucy.adapters.sound import SoundDeviceSpeaker
+
+    speaker = SoundDeviceSpeaker(sample_rate=8_000, blocksize=BLOCK, card="LucySpeaker")
+    with pytest.raises(AudioDeviceError, match="no speaker found"):
+        await asyncio.wait_for(speaker.enqueue(clip(1, 10)), 2.0)
+    assert sounddevice.card_at_open == []
+    assert sounddevice.lists == 0
+    await speaker.close()
+
+
+async def test_a_list_made_without_the_speaker_is_made_again(
+    sounddevice: types.SimpleNamespace,
+) -> None:
+    """PortAudio listed the cards while ALSA's default had no speaker behind it, so its
+    default output is a raw card that cannot convert sample rates. That list is stale."""
+    from lucy.adapters.sound import SoundDeviceSpeaker
+
+    sounddevice.fail, sounddevice.default = True, "UACDemoV1.0: USB Audio (hw:3,0)"
+
+    def initialize() -> None:
+        sounddevice.lists += 1
+        sounddevice.fail, sounddevice.default = False, "default"
+
+    sounddevice._initialize = initialize
+    speaker = SoundDeviceSpeaker(sample_rate=8_000, blocksize=BLOCK)
+    await asyncio.wait_for(speaker.enqueue(clip(1, 10)), 2.0)
+    assert sounddevice.lists == 1
+    await speaker.close()
+
+
+async def test_a_named_device_is_not_routed(sounddevice: types.SimpleNamespace) -> None:
+    from lucy.adapters.sound import SoundDeviceSpeaker
+
+    plug_in(sounddevice.cards, 3, "UACDemoV10")
+    speaker = SoundDeviceSpeaker(sample_rate=8_000, blocksize=BLOCK, device="Jieli")
+    await asyncio.wait_for(speaker.enqueue(clip(1, 10)), 2.0)
+    assert sounddevice.card_at_open == [None]
+    await speaker.close()
+
+
 async def test_microphone_records_until_stopped(sounddevice: types.SimpleNamespace) -> None:
     from lucy.adapters.sound import SoundDeviceMicrophone
 
@@ -280,3 +700,28 @@ async def test_microphone_open_failure(sounddevice: types.SimpleNamespace) -> No
     sounddevice.fail = True
     with pytest.raises(AudioDeviceError):
         await SoundDeviceMicrophone().start()
+
+
+async def test_a_different_microphone_is_used_when_hers_is_gone(
+    sounddevice: types.SimpleNamespace,
+) -> None:
+    from lucy.adapters.sound import SoundDeviceMicrophone
+
+    plug_in(sounddevice.cards, 2, "Device", record=True)
+    mic = SoundDeviceMicrophone(sample_rate=8_000, block_s=BLOCK / 8_000, card="LucyMic")
+    await mic.start()
+    await mic.stop()
+    assert sounddevice.card_at_open == ["Device"]
+
+
+async def test_a_microphone_plugged_in_after_start_up_is_found(
+    sounddevice: types.SimpleNamespace,
+) -> None:
+    from lucy.adapters.sound import SoundDeviceMicrophone
+
+    sounddevice.fail, sounddevice.listed, sounddevice.plugged_in = True, False, True
+    mic = SoundDeviceMicrophone(sample_rate=8_000, block_s=BLOCK / 8_000)
+    await mic.start()
+    assert sounddevice.lists == 1
+    await until(lambda: len(sounddevice.streams[0].feed) < 990)
+    assert (await mic.stop()).frames > 0

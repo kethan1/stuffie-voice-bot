@@ -75,7 +75,10 @@ to `/boot/firmware/config.txt`, and turns on `[motors]` in
 for `MAX98357A`), and that the PWM did with `ls /sys/class/pwm` (`pwmchip0`).
 
 Using a USB speaker instead: skip `--i2s-amp`. The installer picks USB sound
-cards automatically, or pass `--playback-card <id>` (see `aplay -l`).
+cards automatically, or pass `--playback-card <id>` (see `aplay -l`). A USB
+speaker can later be swapped for another, or moved to another port, without
+re-installing: when the configured card is missing, Lucy uses whichever USB
+speaker is plugged in.
 
 ## Motors
 

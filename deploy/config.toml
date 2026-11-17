@@ -110,6 +110,8 @@ rest_s = 60.0                  # after a failure, the on-device voice speaks thi
 [audio]
 input_device = ""              # "" = ALSA default (configured by deploy/alsa/asound.conf)
 output_device = ""
+speaker_card = ""              # ALSA card id (aplay -l, in brackets); install.sh sets it. If it
+microphone_card = ""           # is unplugged (or ""), any USB speaker/mic plugged in is used
 input_sample_rate = 16000      # Whisper's native rate
 output_latency_s = 0.08
 output_blocksize = 1024

@@ -146,7 +146,8 @@ class HBridge:
         backward.set(False)
 
     def drive(self, power: float) -> None:
-        power = min(1.0, max(-1.0, power))
+        # float(): the beak's power is a NumPy scalar, whose comparisons cannot be subtracted.
+        power = float(min(1.0, max(-1.0, power)))
         way = (power > 0) - (power < 0)
         if way and way != self._way:
             self._pwm.set(0.0)  # outputs off while the inputs change, so it never brakes

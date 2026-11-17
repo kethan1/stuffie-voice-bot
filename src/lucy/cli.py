@@ -134,6 +134,7 @@ async def _say(config: Config, text: str, *, on_device: bool) -> int:
         speaker = SoundDeviceSpeaker(
             sample_rate=tts.sample_rate,
             device=device(config.audio.output_device),
+            card=config.audio.speaker_card,
             latency_s=config.audio.output_latency_s,
             listener=puppeteer,
         )

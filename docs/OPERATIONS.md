@@ -40,7 +40,7 @@ sudo reboot
 |---|---|
 | `--i2s-amp` | You wired the MAX98357A amplifier |
 | `--motors` | You wired the beak and body motors to an L293D (HARDWARE.md, "Motors"). Adds the hardware PWM overlay, lets the `gpio` group use PWM, and turns on `[motors]` |
-| `--playback-card ID`, `--capture-card ID` | Auto-detection picked the wrong sound card (`aplay -l`, `arecord -l`) |
+| `--playback-card ID`, `--capture-card ID` | Auto-detection picked the wrong sound card (`aplay -l`, `arecord -l`). Written to `audio.speaker_card`/`audio.microphone_card` and `/etc/asound.conf`; when that card is unplugged, Lucy uses any other USB speaker (or mic) that is plugged in |
 | `--voice en_US-hfc_female-medium` | You want a different on-device (backup) Piper voice |
 | `--tune` | Always, for a finished toy: boot-time power savings, unused services off, journal in RAM |
 | `--local-backup` | You want Lucy to keep answering when GroqCloud is unreachable (no Wi-Fi, school firewall, outage). Installs Ollama with Gemma 3 1B and an on-device speech model: about 2 GB of SD card space and a ~2.5 GB one-time download. Answers offline take several seconds. |
@@ -313,6 +313,8 @@ installed and up to date without `--local-backup`.
 | Often "I didn't hear that" | Mic too quiet | `lucy doctor --listen`, then `alsamixer` (F4 for capture) |
 | Lucy hears herself | Mic too close to the speaker | Move them apart. Lucy only listens while the wing is held |
 | Crackles or gaps | CPU starved or weak power | `vcgencmd get_throttled` (non-zero = under-voltage); raise `audio.output_latency_s` to `0.12` |
+| Goes silent in the middle of talking | The speaker came unplugged (a USB cable working loose) | Plug it back in and squeeze her wing: she opens it again for her next sound, with no restart. `journalctl -u lucy -g speaker` shows when it stopped; `journalctl -k -g 'USB disconnect'` shows a cable that keeps dropping out. Two USB devices that drop out together, or `device descriptor read/64, error -32` again and again, point to a hub without enough power |
+| Silent after swapping in a different speaker | Usually nothing: she uses any USB speaker in place of the configured one. `sudo lucy doctor` names the card she uses. If it works but is quiet, a new card starts at its own mixer level: `alsamixer -c <id>` (F6 picks the card), then `sudo alsactl store` | To make the new speaker the configured one, re-run the installer with `--playback-card <id>` |
 | Button does nothing | Wiring or pin number | `lucy doctor`; `gpioinfo` shows `lucy-button` on line 17 |
 | `CPU governor ... not writable` in doctor | Service never started since boot | Start it once; its `ExecStartPre` grants access |
 | Lucy forgets a name she was told a few minutes ago, mid-conversation | Her notes are not being written (the note model is rate-limited or no longer offered), or they were screened | `journalctl -u lucy -g notes`; `sudo lucy doctor` ("AI service") names a missing model: set `memory.model` to one the provider offers |

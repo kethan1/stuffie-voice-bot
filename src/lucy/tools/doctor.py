@@ -15,6 +15,7 @@ import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
+from lucy.adapters import sound_cards
 from lucy.adapters.logbook import Logbook
 from lucy.adapters.power import CPUFREQ_ROOT
 from lucy.adapters.sound import import_sounddevice
@@ -158,27 +159,63 @@ async def cloud_voice(config: Config) -> str:
 
 
 def speaker(config: Config) -> str:
-    sd = import_sounddevice()
     out = device(config.audio.output_device)
-    info = sd.query_devices(out, "output")
-    sd.check_output_settings(device=out, samplerate=22_050, channels=1, dtype="int16")
-    return str(info["name"])
+    route = None if out is not None else sound_cards.route("output", config.audio.speaker_card)
+    if route is not None and (busy := _in_use(route)):
+        return busy
+    try:
+        sd = import_sounddevice()
+        info = sd.query_devices(out, "output")
+        sd.check_output_settings(device=out, samplerate=22_050, channels=1, dtype="int16")
+    except Exception as error:
+        raise LucyError(f"{error} ({route})" if route is not None else str(error)) from error
+    return _routed(str(info["name"]), route, "speaker_card")
 
 
 def microphone(config: Config) -> str:
-    sd = import_sounddevice()
     mic = device(config.audio.input_device)
-    info = sd.query_devices(mic, "input")
+    route = None if mic is not None else sound_cards.route("input", config.audio.microphone_card)
+    if route is not None and (busy := _in_use(route)):
+        return busy
     rate = config.audio.input_sample_rate
-    sd.check_input_settings(device=mic, samplerate=rate, channels=1, dtype="int16")
-    return f"{info['name']} at {rate} Hz"
+    try:
+        sd = import_sounddevice()
+        info = sd.query_devices(mic, "input")
+        sd.check_input_settings(device=mic, samplerate=rate, channels=1, dtype="int16")
+    except Exception as error:
+        raise LucyError(f"{error} ({route})" if route is not None else str(error)) from error
+    return _routed(f"{info['name']} at {rate} Hz", route, "microphone_card")
+
+
+def _in_use(route: sound_cards.Route) -> str | None:
+    """Say so if another process (Lucy's service, most likely) holds the card: then it can be
+    neither opened nor checked from here, though it works."""
+    pid = sound_cards.user(route)
+    if pid is None:
+        return None
+    try:
+        name = Path(f"/proc/{pid}/comm").read_text(encoding="utf-8").strip()
+    except OSError:
+        name = "a process"
+    return f"{route}, in use by {name} (pid {pid})"
+
+
+def _routed(detail: str, route: sound_cards.Route | None, setting: str) -> str:
+    if route is None or route.card is None:
+        return detail
+    detail = f"{detail} → {route}"
+    if route.stand_in:  # it works, but the configuration names a card that has gone
+        raise Warning(f'{detail}; to keep it, set audio.{setting} = "{route.card.id}"')
+    return detail
 
 
 async def microphone_level(config: Config) -> str:
     from lucy.adapters.sound import SoundDeviceMicrophone
 
     mic = SoundDeviceMicrophone(
-        sample_rate=config.audio.input_sample_rate, device=device(config.audio.input_device)
+        sample_rate=config.audio.input_sample_rate,
+        device=device(config.audio.input_device),
+        card=config.audio.microphone_card,
     )
     print("   … speak normally for 3 seconds")
     await mic.start()
