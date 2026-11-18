@@ -17,6 +17,7 @@ from pathlib import Path
 
 from lucy.adapters import sound_cards
 from lucy.adapters.logbook import Logbook
+from lucy.adapters.mixer import Mixer
 from lucy.adapters.power import CPUFREQ_ROOT
 from lucy.adapters.sound import import_sounddevice
 from lucy.adapters.speechify_tts import SpeechifySpeech
@@ -162,14 +163,28 @@ def speaker(config: Config) -> str:
     out = device(config.audio.output_device)
     route = None if out is not None else sound_cards.route("output", config.audio.speaker_card)
     if route is not None and (busy := _in_use(route)):
-        return busy
+        return busy + _speaker_volume(config, route)
     try:
         sd = import_sounddevice()
         info = sd.query_devices(out, "output")
         sd.check_output_settings(device=out, samplerate=22_050, channels=1, dtype="int16")
     except Exception as error:
         raise LucyError(f"{error} ({route})" if route is not None else str(error)) from error
-    return _routed(str(info["name"]), route, "speaker_card")
+    return _routed(str(info["name"]), route, "speaker_card") + _speaker_volume(config, route)
+
+
+def _speaker_volume(config: Config, route: sound_cards.Route | None) -> str:
+    """Where the speaker's own volume is, which Lucy sets when she opens it."""
+    if route is None or route.card is None or not config.volume.speaker_mixer:
+        return ""
+    mixer = Mixer(route.card.id)
+    level = mixer.get_db()
+    if level is None:
+        return "; it has no volume of its own, so Lucy's volume is in software"
+    return (
+        f"; its own volume ({mixer.control()}) is at {level:.1f} dB "
+        f"(Lucy sets {config.volume.speaker_db:.1f} dB for her usual loudness)"
+    )
 
 
 def microphone(config: Config) -> str:

@@ -209,7 +209,7 @@ log "installing system packages"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq --no-install-recommends \
-  python3 libportaudio2 alsa-utils iw ca-certificates curl rsync zstd dnsmasq-base >/dev/null
+  python3 libportaudio2 libasound2-plugins alsa-utils iw ca-certificates curl rsync zstd dnsmasq-base >/dev/null
 
 log "creating the '$SERVICE_USER' service account"
 getent group gpio >/dev/null || groupadd --system gpio

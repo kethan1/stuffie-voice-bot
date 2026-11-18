@@ -1,6 +1,7 @@
 """The PortAudio adapters, driven by a simulated audio thread instead of a sound card."""
 
 import asyncio
+import dataclasses
 import importlib.abc
 import logging
 import os
@@ -329,6 +330,149 @@ async def test_withdrawing_a_clip_part_way_tells_the_listener(
     await until(lambda: len(listener.played) == 1)
     playing.cancel()
     await until(lambda: listener.stops == 1)
+    await speaker.close()
+
+
+class FakeMixer:
+    """A sound card's own volume, from ``low`` to ``high`` dB (None: it has none)."""
+
+    def __init__(self, card: str, low: float = -60.0, high: float | None = 0.0) -> None:
+        self.card = card
+        self.low, self.high = low, high
+        self.levels: list[float] = []
+
+    def set_db(self, db: float) -> float | None:
+        if self.high is None:
+            return None
+        level = min(self.high, max(self.low, db))
+        self.levels.append(level)
+        return level
+
+
+LOUD = 30_000  # a clip near full scale, as her voice arrives
+
+
+async def peak_of(speaker: Any, sounddevice: types.SimpleNamespace) -> int:
+    """The loudest sample of a near-full-scale clip as the speaker plays it now."""
+    import numpy as np
+
+    await asyncio.sleep(0.02)  # let a volume change reach the card
+    clip = Pcm(np.full(256, LOUD, dtype="<i2").tobytes(), 8_000)
+    if sounddevice.streams:
+        sounddevice.streams[-1].output.clear()
+    await asyncio.wait_for(speaker.enqueue(clip), 2.0)
+    return int(np.abs(np.frombuffer(bytes(sounddevice.streams[-1].output), dtype="<i2")).max())
+
+
+def db_below(peak: int) -> float:
+    import math
+
+    return round(20 * math.log10(peak / LOUD), 1)
+
+
+@pytest.fixture
+def mixers() -> list[FakeMixer]:
+    return []
+
+
+def speaker_with_mixer(
+    sounddevice: types.SimpleNamespace,
+    mixers: list[FakeMixer],
+    *,
+    low: float = -60.0,
+    high: float | None = 0.0,
+    **settings: Any,
+) -> Any:
+    from lucy.adapters.sound import SoundDeviceSpeaker
+    from lucy.core.volume import VolumeSettings
+
+    def make(card: str) -> FakeMixer:
+        mixers.append(FakeMixer(card, low, high))
+        return mixers[-1]
+
+    plug_in(sounddevice.cards, 3, "UACDemoV10")
+    volume = VolumeSettings(max_db=9.0, min_db=-15.0, speaker_db=-9.0, speaker_max_db=-3.0)
+    volume = dataclasses.replace(volume, **settings)
+    return SoundDeviceSpeaker(
+        sample_rate=8_000, blocksize=BLOCK, card="LucySpeaker", volume=volume, mixer=make
+    )
+
+
+async def test_louder_turns_up_the_speaker_first_then_software(
+    sounddevice: types.SimpleNamespace, mixers: list[FakeMixer]
+) -> None:
+    speaker = speaker_with_mixer(sounddevice, mixers)
+    assert db_below(await peak_of(speaker, sounddevice)) == -3.0  # room for 3 dB on top
+    assert mixers[0].card == "UACDemoV10"
+    assert mixers[0].levels == [-9.0]  # her usual loudness, set as the speaker opened
+
+    speaker.set_volume(6.0)  # all of it from the speaker's own volume
+    assert db_below(await peak_of(speaker, sounddevice)) == -3.0
+    assert mixers[0].levels[-1] == -3.0
+
+    speaker.set_volume(9.0)  # the speaker is at its ceiling: the last 3 dB in software
+    assert await peak_of(speaker, sounddevice) == LOUD  # full scale, nothing rounded off
+    assert mixers[0].levels[-1] == -3.0
+
+    speaker.set_volume(-15.0)  # quieter: the speaker's own volume goes down
+    assert db_below(await peak_of(speaker, sounddevice)) == -3.0
+    assert mixers[0].levels[-1] == -24.0
+    await speaker.close()
+
+
+async def test_software_makes_up_what_the_card_cannot_do(
+    sounddevice: types.SimpleNamespace, mixers: list[FakeMixer]
+) -> None:
+    speaker = speaker_with_mixer(sounddevice, mixers, low=-12.0)
+    speaker.set_volume(-15.0)  # the card stops at -12 dB: the other 12 dB in software
+    await peak_of(speaker, sounddevice)
+    assert mixers[0].levels[-1] == -12.0
+    assert db_below(await peak_of(speaker, sounddevice)) == -15.0
+    await speaker.close()
+
+
+async def test_a_card_with_no_volume_of_its_own_uses_software_alone(
+    sounddevice: types.SimpleNamespace, mixers: list[FakeMixer]
+) -> None:
+    speaker = speaker_with_mixer(sounddevice, mixers, high=None)  # an I2S amplifier
+    await peak_of(speaker, sounddevice)
+    assert db_below(await peak_of(speaker, sounddevice)) == -9.0  # all of max_db in hand
+    speaker.set_volume(9.0)
+    assert await peak_of(speaker, sounddevice) == LOUD
+    await speaker.close()
+
+
+async def test_the_speaker_mixer_can_be_turned_off(
+    sounddevice: types.SimpleNamespace, mixers: list[FakeMixer]
+) -> None:
+    speaker = speaker_with_mixer(sounddevice, mixers, speaker_mixer=False)
+    assert db_below(await peak_of(speaker, sounddevice)) == -9.0
+    speaker.set_volume(9.0)
+    assert await peak_of(speaker, sounddevice) == LOUD
+    assert mixers == []
+    await speaker.close()
+
+
+async def test_a_speaker_plugged_back_in_gets_her_volume_again(
+    sounddevice: types.SimpleNamespace, mixers: list[FakeMixer]
+) -> None:
+    speaker = speaker_with_mixer(sounddevice, mixers)
+    speaker.set_volume(3.0)
+    await peak_of(speaker, sounddevice)
+    sounddevice.streams[0].unplug()  # the card comes back at its own default volume
+    await until(lambda: sounddevice.streams[0].closed)
+    await peak_of(speaker, sounddevice)
+    assert mixers[0].levels == [-6.0, -6.0]  # set again as the new stream opened
+    await speaker.close()
+
+
+async def test_without_settings_the_speaker_plays_at_full_scale(
+    sounddevice: types.SimpleNamespace,
+) -> None:
+    from lucy.adapters.sound import SoundDeviceSpeaker
+
+    speaker = SoundDeviceSpeaker(sample_rate=8_000, blocksize=BLOCK)
+    assert await peak_of(speaker, sounddevice) == LOUD
     await speaker.close()
 
 

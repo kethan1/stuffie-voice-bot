@@ -147,6 +147,7 @@ async def run(config: Config, *, keyboard: bool = False) -> int:
             device=device(config.audio.output_device),
             card=config.audio.speaker_card,
             latency_s=config.audio.output_latency_s,
+            volume=config.volume,
             blocksize=config.audio.output_blocksize,
             listener=puppeteer,
         )

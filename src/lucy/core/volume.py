@@ -33,10 +33,27 @@ class VolumeSettings:
     step_db: float = 3.0
     """How much louder or quieter each request makes her."""
     max_db: float = 9.0
-    """The loudest a child can make her, above her usual loudness. Above 0 her loudest peaks
-    are rounded off rather than clipped, so she sounds louder without sounding harsh."""
+    """The loudest a child can make her, above her usual loudness."""
     min_db: float = -15.0
     """The quietest a child can make her, below her usual loudness."""
+    speaker_mixer: bool = True
+    """Change the speaker's own volume (its ALSA mixer) first, with software gain on top
+    once it is as loud as ``speaker_max_db``. Off, or on a card with no volume of its own
+    (an I2S amplifier), the volume is software alone."""
+    speaker_db: float = -9.0
+    """The speaker's own volume at her usual loudness, in dB as ``alsamixer`` shows it. Lucy
+    sets it each time she opens her speaker, so a speaker swapped or plugged back in gets it."""
+    speaker_max_db: float = -3.0
+    """The loudest the speaker's own volume goes. A small USB speaker driven harder can draw
+    more power than its USB port gives, and drop off the bus (Lucy's did, at 0 dB)."""
+
+    @property
+    def software_headroom_db(self) -> float:
+        """How far below full scale her usual loudness plays, so that the software part of the
+        loudest volume reaches full scale and no further: louder in software only by playing
+        closer to full scale, never by rounding off peaks, which distorts."""
+        hardware = self.speaker_max_db - self.speaker_db if self.speaker_mixer else 0.0
+        return max(0.0, self.max_db - max(0.0, hardware))
 
 
 _CURLY = "\N{RIGHT SINGLE QUOTATION MARK}"  # speech-to-text writes "can\u2019t" for "can't"

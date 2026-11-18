@@ -263,6 +263,7 @@ All settings are in `/etc/lucy/config.toml` (documented inline).
 | More or fewer honks | `turn.opening_honk_chance` (0 to 1): how often she starts a reply with a honk of her own. The prompt asks for honks in most answers too |
 | Louder or softer chimes | `session.earcon_volume` (1 is a little louder than her voice) |
 | Children may not change her volume, or not as much | `volume.commands = false`; or a smaller range with `volume.max_db` and `volume.min_db` |
+| Louder or softer as usual | `volume.speaker_db`: the speaker's own volume (dB, as `alsamixer` shows) at her usual loudness. Lucy sets it each time she opens her speaker, so changes made in `alsamixer` do not last. "Louder" raises it up to `volume.speaker_max_db`, then adds software gain on top |
 | Longer or shorter answers | A `system_prompt_file` with a different length rule (the built-in prompt asks for at most 40 words) |
 | Faster first word from the on-device voice | `turn.first_clause_min_words = 4` (the first sentence may be split at a comma, which sounds less natural); a `-low` Piper voice |
 | Longer battery life | Shorter `session.awake_s`; `power.standby_governor = "powersave"` |
@@ -314,7 +315,7 @@ installed and up to date without `--local-backup`.
 | Lucy hears herself | Mic too close to the speaker | Move them apart. Lucy only listens while the wing is held |
 | Crackles or gaps | CPU starved or weak power | `vcgencmd get_throttled` (non-zero = under-voltage); raise `audio.output_latency_s` to `0.12` |
 | Goes silent in the middle of talking | The speaker came unplugged (a USB cable working loose) | Plug it back in and squeeze her wing: she opens it again for her next sound, with no restart. `journalctl -u lucy -g speaker` shows when it stopped; `journalctl -k -g 'USB disconnect'` shows a cable that keeps dropping out. Two USB devices that drop out together, or `device descriptor read/64, error -32` again and again, point to a hub without enough power |
-| Silent after swapping in a different speaker | Usually nothing: she uses any USB speaker in place of the configured one. `sudo lucy doctor` names the card she uses. If it works but is quiet, a new card starts at its own mixer level: `alsamixer -c <id>` (F6 picks the card), then `sudo alsactl store` | To make the new speaker the configured one, re-run the installer with `--playback-card <id>` |
+| Silent after swapping in a different speaker | Usually nothing: she uses any USB speaker in place of the configured one. `sudo lucy doctor` names the card she uses. Lucy sets its own volume to `volume.speaker_db` when she opens it, so it should be as loud as the old one if both report decibels; `lucy doctor` shows the level | To make the new speaker the configured one, re-run the installer with `--playback-card <id>` |
 | Button does nothing | Wiring or pin number | `lucy doctor`; `gpioinfo` shows `lucy-button` on line 17 |
 | `CPU governor ... not writable` in doctor | Service never started since boot | Start it once; its `ExecStartPre` grants access |
 | Lucy forgets a name she was told a few minutes ago, mid-conversation | Her notes are not being written (the note model is rate-limited or no longer offered), or they were screened | `journalctl -u lucy -g notes`; `sudo lucy doctor` ("AI service") names a missing model: set `memory.model` to one the provider offers |

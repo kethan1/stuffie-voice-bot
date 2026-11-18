@@ -470,6 +470,11 @@ def _sound_problems(config: Config) -> list[str]:
         problems.append("volume.max_db must be between 0 and 12")
     if not -40 <= volume.min_db <= 0:
         problems.append("volume.min_db must be between -40 and 0")
+    if not -60 <= volume.speaker_db <= volume.speaker_max_db <= 12:
+        problems.append(
+            "volume.speaker_db must be between -60 and volume.speaker_max_db, "
+            "and volume.speaker_max_db at most 12"
+        )
     return problems
 
 

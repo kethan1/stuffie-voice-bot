@@ -24,6 +24,23 @@ Its master volume (:meth:`SoundDeviceSpeaker.set_volume`, which a child changes 
 asking, :mod:`lucy.core.volume`) scales each clip as it is queued. The listener is
 told about the clip as it was made, so Lucy's beak opens just as wide at any volume.
 
+The volume is in two parts (:class:`~lucy.core.volume.VolumeSettings`):
+
+* The speaker's own volume (its ALSA mixer, :mod:`lucy.adapters.mixer`). Lucy sets it to
+  ``speaker_db`` plus whatever a child asked for, up to ``speaker_max_db``, each time she
+  opens the speaker (so a speaker swapped or plugged back in gets it too) and whenever the
+  volume changes. Turning it down goes as far as the card does.
+* Software gain on top, for the rest: louder than ``speaker_max_db`` allows, or quieter
+  than the card goes. Her voice arrives with its peaks near full scale, so software can
+  only make her louder cleanly by playing closer to full scale: her usual loudness plays
+  just far enough below it (``software_headroom_db``) for the loudest a child can ask for
+  to reach full scale and no further. Rounding off the peaks of a voice made 9 dB louder
+  instead distorted it by about 25% (measured), and the extra power knocked Lucy's USB
+  speaker off the bus.
+
+A card with no volume of its own (an I2S amplifier) uses software alone, keeping all of
+``volume.max_db`` as headroom.
+
 A speaker that comes unplugged (a USB speaker's cable works loose inside a stuffed goose)
 is opened again for the next sound once it is back, with no restart:
 
@@ -58,10 +75,12 @@ from time import monotonic
 from typing import Any
 
 from lucy.adapters import sound_cards
+from lucy.adapters.mixer import CardVolume, Mixer
 from lucy.adapters.sound_cards import Kind
 from lucy.core.audio import SAMPLE_WIDTH, Pcm, adjust_volume
 from lucy.core.errors import AudioDeviceError
 from lucy.core.ports import PlaybackListener
+from lucy.core.volume import VolumeSettings
 
 log = logging.getLogger(__name__)
 
@@ -95,6 +114,8 @@ class _Streams:
     def __init__(self) -> None:
         self._lock = threading.Lock()  # one stream is opened at a time, so the count is right
         self._open = 0
+        self.cards: dict[Kind, str | None] = {}
+        """The card each kind of stream last opened on, if known (for its volume)."""
 
     def open(
         self, sd: Any, device: Device, kind: Kind, create: Callable[[], Any], card: str = ""
@@ -126,6 +147,7 @@ class _Streams:
                     raise AudioDeviceError(f"{error} ({route})") from error
                 raise
             self._open += 1
+            self.cards[kind] = route.card.id if route is not None and route.card else None
             return stream
 
     def shut(self, stream: Any) -> None:
@@ -254,7 +276,9 @@ class SoundDeviceSpeaker:
         card: str = "",
         latency_s: float = 0.08,
         blocksize: int = 1024,
+        volume: VolumeSettings | None = None,
         listener: PlaybackListener | None = None,
+        mixer: Callable[[str], CardVolume] = Mixer,
     ) -> None:
         if device is None:
             sound_cards.route("output", card)  # before PortAudio first lists the sound cards
@@ -277,11 +301,24 @@ class SoundDeviceSpeaker:
         self._watchdog: asyncio.Task[None] | None = None
         self._discarding: set[asyncio.Task[None]] = set()
         self._loop: asyncio.AbstractEventLoop | None = None
-        self._volume_db = 0.0
+        # Without settings: software alone, at full scale (a tool playing a sound once).
+        self._settings = volume or VolumeSettings(max_db=0.0, speaker_mixer=False)
+        self._volume_db = 0.0  # what a child asked for, above or below her usual loudness
+        self._raised_db = 0.0  # how far the speaker's own volume is above speaker_db
+        self._card_id: str | None = None  # the card of the open stream
+        self._has_mixer = self._settings.speaker_mixer  # until a card says it has none
+        self._make_mixer = mixer
+        self._mixers: dict[str, CardVolume] = {}
+        self._tuning = asyncio.Lock()
         self._failing = False  # the last try to open the speaker failed (said once, not again)
 
     def set_volume(self, db: float) -> None:
+        """The speaker's own volume first, then software on top (see the module's notes)."""
         self._volume_db = db
+        if self._has_mixer:
+            self._raised_db = self._hardware_db()  # as asked; corrected once the card answers
+            if self._stream is not None:
+                self._tune_soon()
 
     def enqueue(self, audio: Pcm) -> asyncio.Future[None]:
         if audio.sample_rate != self._sample_rate:
@@ -289,7 +326,7 @@ class SoundDeviceSpeaker:
         self._loop = asyncio.get_running_loop()
         self._check_stream()  # before this clip is queued: it is for the speaker as it is now
         future: asyncio.Future[None] = self._loop.create_future()
-        played = adjust_volume(audio, self._volume_db)
+        played = adjust_volume(audio, self._software_db())
         clip = _Clip(audio, memoryview(played.data), future)
         with self._lock:
             self._queue.append(clip)
@@ -353,10 +390,12 @@ class SoundDeviceSpeaker:
             self._fail_queued(f"cannot open the speaker: {error}")
             return
         self._stream, self._ended = stream, ended
+        self._card_id = _streams.cards.get("output")
         if self._failing:
             self._failing = False
             log.warning("the speaker works again")
         log.debug("speaker opened")
+        self._tune_soon()  # each time: a card swapped or plugged back in has its own volume
         if ended.is_set():
             self._lost()  # it stopped before the event loop knew it had started
 
@@ -381,6 +420,51 @@ class SoundDeviceSpeaker:
         self._delay_s = float(getattr(stream, "latency", None) or self._latency_s)
         self._asked_at = monotonic()
         return _started(stream)
+
+    def _hardware_db(self) -> float:
+        """How far above ``speaker_db`` the speaker's own volume should be for this volume."""
+        settings = self._settings
+        return min(self._volume_db, max(0.0, settings.speaker_max_db - settings.speaker_db))
+
+    def _software_db(self) -> float:
+        """The gain for clips queued now: the rest of the volume, below full scale."""
+        if not self._has_mixer:
+            return self._volume_db - self._settings.max_db  # software alone: all the headroom
+        return self._volume_db - self._raised_db - self._settings.software_headroom_db
+
+    def _tune_soon(self) -> None:
+        if self._settings.speaker_mixer and self._loop is not None:
+            task = asyncio.create_task(self._tune(), name="speaker-volume")
+            self._discarding.add(task)  # kept until done, like a stream being closed
+            task.add_done_callback(self._discarding.discard)
+
+    async def _tune(self) -> None:
+        """Set the speaker's own volume for the current volume, and learn where it went."""
+        async with self._tuning:  # one at a time, each for the volume as it is by then
+            card = self._card_id
+            if card is None:  # a device named by hand, or a card asound.conf names
+                self._has_mixer, self._raised_db = False, 0.0
+                return
+            mixer = self._mixers.setdefault(card, self._make_mixer(card))
+            settings = self._settings
+            wanted = settings.speaker_db + self._hardware_db()
+            level = await asyncio.to_thread(mixer.set_db, wanted)
+            if card != self._card_id:
+                return  # the speaker changed meanwhile: its own tune follows
+            if level is None:
+                self._has_mixer, self._raised_db = False, 0.0
+                return
+            self._has_mixer, self._raised_db = True, level - settings.speaker_db
+            log.debug(
+                "speaker volume: %s at %.1f dB, %+.1f dB in software",
+                card,
+                level,
+                self._software_db(),
+            )
+            if abs(level - wanted) > 0.5:  # the card does not go that far: software makes it up
+                log.info(
+                    "the %s card's volume stops at %.1f dB (asked for %.1f)", card, level, wanted
+                )
 
     def _stream_ended(self, ended: threading.Event) -> None:
         """Event loop: a stream has stopped. If close() did not stop it, the speaker is gone."""

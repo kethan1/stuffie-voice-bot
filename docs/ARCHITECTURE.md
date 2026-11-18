@@ -372,9 +372,22 @@ model involved. Questions ("which is louder, a lion or a whale?") and other
 subjects ("can a whale be louder than a jet?") are not requests. The change is
 a master volume on the speaker (`Speaker.set_volume`): 3 dB a step, from −15 dB
 to +9 dB by default (`[volume]`), applied to everything she plays, chimes
-included. Lucy has only a few decibels of room below full scale, so above 0 dB
-her peaks are rounded off (`soft_limit`, a tanh knee) rather than clipped. The
-motors see each clip as it was made, so her beak opens as wide at any volume.
+included. The volume is in two parts. First the speaker's own volume (its ALSA
+mixer, `adapters/mixer.py`, through `amixer`): Lucy sets it to
+`volume.speaker_db` plus whatever a child asked for, up to
+`volume.speaker_max_db`, whenever the volume changes and each time she opens
+her speaker, so a speaker swapped or plugged back in gets her level, not its
+own default. Then software gain on top for the rest: what lies beyond
+`speaker_max_db`, or below the card's lowest level, or all of it on a card with
+no volume of its own (an I2S amplifier). Her voice arrives with its peaks near
+full scale, so software can make her louder cleanly only by playing closer to
+full scale: her usual loudness plays just far enough below it
+(`software_headroom_db`, 3 dB by default) for the loudest volume to reach full
+scale and no further. Rounding off the peaks of a voice made 9 dB louder
+instead measured about 25% distortion, and the extra power knocked a USB
+speaker off the bus; so did a full-scale tone with the speaker's own volume at
+0 dB, hence the ceiling. The motors see each clip as it was made, so her beak opens as
+wide at any volume.
 She confirms at the new level ("Honk! Is this better?", or "this is as loud as
 this goose goes!"). The volume lasts until she is turned off, so a grown-up's
 setting always comes back.

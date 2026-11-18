@@ -190,8 +190,14 @@ earcon_volume = 1.0            # the chimes: 1.0 = a little louder than her voic
 # applies to everything she plays, and lasts until she is turned off.
 commands = true
 step_db = 3.0                  # each request
-max_db = 9.0                   # loudest, above her usual loudness (peaks are rounded off, not clipped)
+max_db = 9.0                   # loudest, above her usual loudness
 min_db = -15.0                 # quietest
+# "Louder" turns up the speaker's own volume (its ALSA mixer) first, then software gain on
+# top. Lucy sets the mixer each time she opens her speaker, so alsamixer changes don't stick:
+# change these instead. A card without a volume of its own uses software alone.
+speaker_mixer = true
+speaker_db = -9.0              # the speaker's own volume at her usual loudness (dB, as alsamixer shows)
+speaker_max_db = -3.0          # never above this: a USB speaker driven harder can drop off the bus
 
 [setup]
 # Setup mode: Lucy turns on her own Wi-Fi and a grown-up's phone opens her settings page (Wi-Fi
