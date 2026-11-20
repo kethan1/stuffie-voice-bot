@@ -7,7 +7,6 @@ from typing import Any
 import pytest
 
 from lucy.adapters.mixer import Mixer
-from lucy.core.volume import VolumeSettings
 
 # What amixer printed for Lucy's USB speaker (a Jieli "UACDemoV1.0").
 SCONTENTS = """Simple mixer control 'PCM',0
@@ -109,12 +108,3 @@ def test_a_level_without_decibels_is_unknown() -> None:
     amixer = Amixer()
     amixer.level = "x"  # no "[...dB]" on the line
     assert Mixer("UACDemoV10", run=amixer).get_db() is None
-
-
-def test_software_headroom_covers_what_the_speaker_cannot() -> None:
-    settings = VolumeSettings(max_db=9.0, speaker_db=-9.0, speaker_max_db=-3.0)
-    assert settings.software_headroom_db == 3.0
-    assert (
-        VolumeSettings(max_db=9.0, speaker_db=-12.0, speaker_max_db=0.0).software_headroom_db == 0
-    )
-    assert VolumeSettings(max_db=9.0, speaker_mixer=False).software_headroom_db == 9.0

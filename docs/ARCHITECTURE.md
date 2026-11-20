@@ -331,15 +331,16 @@ like a goose, taken from the same measurements of real geese as her honk (§5.6)
   is escaped). Piper takes a `length_scale`, which slows it by less than the
   number says (the short gaps it puts between sounds do not stretch), so
   `piper_tts.py` holds the measured relation and asks for what is meant.
-* **Honky.** A linear-phase FIR filter (255 taps) gives her voice a goose's
-  resonances: the windpipe's ring at 1.35 kHz (up to +12 dB), the dip near
-  2.9 kHz, and the brassy second peak near 4 kHz, and takes out the chest
-  tones below 300 Hz. It also removes anything the resampler would fold back
+* **Honky.** A shorter, gentler linear-phase FIR filter (127 taps) gives her
+  voice a goose's resonances: a modest windpipe ring at 1.35 kHz (up to +6 dB),
+  a shallow dip near 2.9 kHz, and a mild second peak near 4 kHz. It reduces
+  chest tones below 180 Hz and removes anything the resampler would fold back
   down (aliasing).
 * **Raspy.** A goose's voice starts as a growl and breaks upward into the honk,
   and drops back into period doubling in between. `Rasp` does that to her
   voice: every other cycle comes out weaker, which is heard as a rasp an octave
-  below her pitch. It finds the cycles the way a guitar's octave pedal does (a
+  below her pitch, with less cycle-to-cycle modulation to keep speech smooth.
+  It finds the cycles the way a guitar's octave pedal does (a
   low-pass filter leaves only the fundamental, and a trigger with hysteresis
   counts its upward zero crossings), so the rasp follows her pitch instead of
   buzzing over it. It is deepest for the first 150 ms after a silence, as a
@@ -348,8 +349,9 @@ like a goose, taken from the same measurements of real geese as her honk (§5.6)
 
 The filter is normalised so speech comes out at the level it went in: her beak
 (§5.7) opens as wide as before, and the volume settings mean what they did. To
-the ear she is 2 to 4 dB louder, because the sound has moved to where ears are
-keenest. Peaks are rounded off (`soft_limit`), not clipped.
+the ear she is a little louder, because the sound has moved to where ears are
+keenest. Peak limiting starts near full scale (`soft_limit`, 0.85) to reduce
+audible compression while still preventing digital clipping.
 
 Each stage carries its state from one streamed part to the next (the filters'
 histories, the resampler's fractional position, the trigger and its switch, the
@@ -371,23 +373,14 @@ safety screen, `volume_request` matches short requests aimed at Lucy, with no
 model involved. Questions ("which is louder, a lion or a whale?") and other
 subjects ("can a whale be louder than a jet?") are not requests. The change is
 a master volume on the speaker (`Speaker.set_volume`): 3 dB a step, from −15 dB
-to +9 dB by default (`[volume]`), applied to everything she plays, chimes
-included. The volume is in two parts. First the speaker's own volume (its ALSA
-mixer, `adapters/mixer.py`, through `amixer`): Lucy sets it to
-`volume.speaker_db` plus whatever a child asked for, up to
+to +9 dB by default (`[volume]`), applied by changing the sound card's ALSA
+mixer. Lucy sets it to `volume.speaker_db` plus the requested change, up to
 `volume.speaker_max_db`, whenever the volume changes and each time she opens
 her speaker, so a speaker swapped or plugged back in gets her level, not its
-own default. Then software gain on top for the rest: what lies beyond
-`speaker_max_db`, or below the card's lowest level, or all of it on a card with
-no volume of its own (an I2S amplifier). Her voice arrives with its peaks near
-full scale, so software can make her louder cleanly only by playing closer to
-full scale: her usual loudness plays just far enough below it
-(`software_headroom_db`, 3 dB by default) for the loudest volume to reach full
-scale and no further. Rounding off the peaks of a voice made 9 dB louder
-instead measured about 25% distortion, and the extra power knocked a USB
-speaker off the bus; so did a full-scale tone with the speaker's own volume at
-0 dB, hence the ceiling. The motors see each clip as it was made, so her beak opens as
-wide at any volume.
+own default. Audio samples are never amplified or attenuated for these volume
+commands. If a card has no playback mixer, such as the I2S amplifier, voice
+commands cannot change its volume. The motors see each clip as it was made, so
+her beak opens as wide at any volume.
 She confirms at the new level ("Honk! Is this better?", or "this is as loud as
 this goose goes!"). The volume lasts until she is turned off, so a grown-up's
 setting always comes back.

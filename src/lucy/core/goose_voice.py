@@ -41,17 +41,18 @@ Samples = npt.NDArray[np.float64]
 
 _PITCH_UP = 0.25  # at full strength: about four semitones higher
 # The goose in the filter, at full strength: (Hz as she is heard, dB, width in octaves).
+# Keep the resonances gentle: strong narrow boosts made loud speech hit the limiter often.
 _BANDS = (
-    (1350.0, 12.0, 0.33),  # the windpipe's ring: honky
-    (2900.0, -4.0, 0.25),  # the dip above it
-    (4000.0, 6.0, 0.3),  # the brassy edge
+    (1350.0, 6.0, 0.5),  # the windpipe's ring: honky
+    (2900.0, -2.0, 0.4),  # the dip above it
+    (4000.0, 3.0, 0.45),  # the brassy edge
 )
-_LOW_CUT_HZ = 300.0
-_TAPS = 255  # FIR length: fine enough for these shapes, and 6 ms of delay at 22 kHz
+_LOW_CUT_HZ = 180.0
+_TAPS = 127  # shorter FIR: less ringing and 3 ms of delay at 22 kHz
 
 # The rasp, at full strength: how much weaker every other cycle of her voice is.
-_RASP = 0.45  # all the time (it comes and goes: see _RASP_SWAY_HZ)
-_RASP_ONSET = 0.5  # more, as she starts a phrase
+_RASP = 0.25  # all the time (it comes and goes: see _RASP_SWAY_HZ)
+_RASP_ONSET = 0.3  # more, as she starts a phrase
 _RASP_SWAY_HZ = 0.8
 _ONSET_S = 0.15  # how long the start of a phrase lasts
 _PITCH_TOP_HZ = 330.0  # her pitch is below this (as she is heard); her overtones are above
@@ -148,7 +149,7 @@ class Goosifier:
 
     def process(self, samples: npt.NDArray[np.floating]) -> Samples:
         """The goose version of the next part of the speech (a little shorter than it)."""
-        return soft_limit(self._rasp.process(self._resample(self._filter(samples))))
+        return soft_limit(self._rasp.process(self._resample(self._filter(samples))), knee=0.85)
 
     def finish(self) -> Samples:
         """The end of the utterance, still inside the filter (half its length)."""

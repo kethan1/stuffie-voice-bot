@@ -192,9 +192,9 @@ commands = true
 step_db = 3.0                  # each request
 max_db = 9.0                   # loudest, above her usual loudness
 min_db = -15.0                 # quietest
-# "Louder" turns up the speaker's own volume (its ALSA mixer) first, then software gain on
-# top. Lucy sets the mixer each time she opens her speaker, so alsamixer changes don't stick:
-# change these instead. A card without a volume of its own uses software alone.
+# "Louder" changes only the speaker's ALSA mixer. Lucy sets it each time she opens her
+# speaker, so alsamixer changes don't stick: change these instead. A card without a mixer
+# cannot be made louder or quieter by voice commands.
 speaker_mixer = true
 speaker_db = -9.0              # the speaker's own volume at her usual loudness (dB, as alsamixer shows)
 speaker_max_db = -3.0          # never above this: a USB speaker driven harder can drop off the bus

@@ -26,6 +26,7 @@ LOUDEST, QUIETEST = VolumeRequest.LOUDEST, VolumeRequest.QUIETEST
         ("I can\N{RIGHT SINGLE QUOTATION MARK}t hear you.", LOUDER),  # how Whisper writes it
         ("Turn it up!", LOUDER),
         ("Turn up the volume", LOUDER),
+        ("Increase the volume", LOUDER),
         ("Turn your volume up", LOUDER),
         ("Volume up", LOUDER),
         ("Be louder", LOUDER),

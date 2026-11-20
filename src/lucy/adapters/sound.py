@@ -20,26 +20,10 @@ motors) when each clip will actually be heard. The callback knows when the
 buffer it fills reaches the DAC (PortAudio's ``outputBufferDacTime``), so the
 report is accurate to a sample, however much audio is queued ahead of it.
 
-Its master volume (:meth:`SoundDeviceSpeaker.set_volume`, which a child changes by
-asking, :mod:`lucy.core.volume`) scales each clip as it is queued. The listener is
-told about the clip as it was made, so Lucy's beak opens just as wide at any volume.
-
-The volume is in two parts (:class:`~lucy.core.volume.VolumeSettings`):
-
-* The speaker's own volume (its ALSA mixer, :mod:`lucy.adapters.mixer`). Lucy sets it to
-  ``speaker_db`` plus whatever a child asked for, up to ``speaker_max_db``, each time she
-  opens the speaker (so a speaker swapped or plugged back in gets it too) and whenever the
-  volume changes. Turning it down goes as far as the card does.
-* Software gain on top, for the rest: louder than ``speaker_max_db`` allows, or quieter
-  than the card goes. Her voice arrives with its peaks near full scale, so software can
-  only make her louder cleanly by playing closer to full scale: her usual loudness plays
-  just far enough below it (``software_headroom_db``) for the loudest a child can ask for
-  to reach full scale and no further. Rounding off the peaks of a voice made 9 dB louder
-  instead distorted it by about 25% (measured), and the extra power knocked Lucy's USB
-  speaker off the bus.
-
-A card with no volume of its own (an I2S amplifier) uses software alone, keeping all of
-``volume.max_db`` as headroom.
+Volume commands change only the sound card's ALSA mixer, up to ``speaker_max_db``. They do
+not change the audio samples in software. A card with no playback volume control, such as
+the MAX98357A I2S amplifier, cannot be made louder or quieter by these commands. The listener
+is told about each clip as it was made, so Lucy's beak opens just as wide at any volume.
 
 A speaker that comes unplugged (a USB speaker's cable works loose inside a stuffed goose)
 is opened again for the next sound once it is back, with no restart:
@@ -77,7 +61,7 @@ from typing import Any
 from lucy.adapters import sound_cards
 from lucy.adapters.mixer import CardVolume, Mixer
 from lucy.adapters.sound_cards import Kind
-from lucy.core.audio import SAMPLE_WIDTH, Pcm, adjust_volume
+from lucy.core.audio import SAMPLE_WIDTH, Pcm
 from lucy.core.errors import AudioDeviceError
 from lucy.core.ports import PlaybackListener
 from lucy.core.volume import VolumeSettings
@@ -301,7 +285,7 @@ class SoundDeviceSpeaker:
         self._watchdog: asyncio.Task[None] | None = None
         self._discarding: set[asyncio.Task[None]] = set()
         self._loop: asyncio.AbstractEventLoop | None = None
-        # Without settings: software alone, at full scale (a tool playing a sound once).
+        # Without settings: play the audio as given (a tool playing a sound once).
         self._settings = volume or VolumeSettings(max_db=0.0, speaker_mixer=False)
         self._volume_db = 0.0  # what a child asked for, above or below her usual loudness
         self._raised_db = 0.0  # how far the speaker's own volume is above speaker_db
@@ -326,8 +310,7 @@ class SoundDeviceSpeaker:
         self._loop = asyncio.get_running_loop()
         self._check_stream()  # before this clip is queued: it is for the speaker as it is now
         future: asyncio.Future[None] = self._loop.create_future()
-        played = adjust_volume(audio, self._software_db())
-        clip = _Clip(audio, memoryview(played.data), future)
+        clip = _Clip(audio, memoryview(audio.data), future)
         with self._lock:
             self._queue.append(clip)
         future.add_done_callback(partial(self._withdraw, clip))
@@ -426,12 +409,6 @@ class SoundDeviceSpeaker:
         settings = self._settings
         return min(self._volume_db, max(0.0, settings.speaker_max_db - settings.speaker_db))
 
-    def _software_db(self) -> float:
-        """The gain for clips queued now: the rest of the volume, below full scale."""
-        if not self._has_mixer:
-            return self._volume_db - self._settings.max_db  # software alone: all the headroom
-        return self._volume_db - self._raised_db - self._settings.software_headroom_db
-
     def _tune_soon(self) -> None:
         if self._settings.speaker_mixer and self._loop is not None:
             task = asyncio.create_task(self._tune(), name="speaker-volume")
@@ -455,13 +432,8 @@ class SoundDeviceSpeaker:
                 self._has_mixer, self._raised_db = False, 0.0
                 return
             self._has_mixer, self._raised_db = True, level - settings.speaker_db
-            log.debug(
-                "speaker volume: %s at %.1f dB, %+.1f dB in software",
-                card,
-                level,
-                self._software_db(),
-            )
-            if abs(level - wanted) > 0.5:  # the card does not go that far: software makes it up
+            log.debug("speaker volume: %s at %.1f dB", card, level)
+            if abs(level - wanted) > 0.5:
                 log.info(
                     "the %s card's volume stops at %.1f dB (asked for %.1f)", card, level, wanted
                 )

@@ -1,14 +1,13 @@
 """A sound card's own volume (its ALSA mixer), set with ``amixer`` from alsa-utils.
 
-Lucy's volume is in two parts (:class:`~lucy.adapters.sound.SoundDeviceSpeaker`): the speaker's
-own volume, which this sets, and software gain on top. Levels are in decibels as ``alsamixer``
-and ``amixer`` show them, which is what the card reports, so they mean the same on any card
-that reports decibels. ``amixer`` keeps a level inside the card's range, and :meth:`Mixer.set_db`
-says where it ended up, so the software part can make up the difference.
+Lucy changes only the sound card's own volume through this adapter. Levels are in decibels as
+``alsamixer`` and ``amixer`` show them, which is what the card reports, so they mean the same
+on any card that reports decibels. ``amixer`` keeps a level inside the card's range, and
+:meth:`Mixer.set_db` says where it ended up.
 
 ``amixer`` is run rather than linked against: Lucy only changes the volume when she opens
-her speaker or a child asks, and a missing control, card, or program is just a speaker whose
-volume Lucy cannot change (an I2S amplifier has none), so she uses software alone.
+her speaker or a child asks, and a missing control, card, or program means she cannot change
+that speaker's volume (an I2S amplifier has no mixer).
 """
 
 import logging
@@ -50,7 +49,7 @@ class Mixer:
             self._control = _playback_volume(output) if output is not None else None
             self._looked = output is not None  # a card that was not there: look again next time
             if self._looked and self._control is None:
-                log.info("the %s card has no volume of its own: software volume only", self.card)
+                log.info("the %s card has no volume control", self.card)
         return self._control
 
     def get_db(self) -> float | None:

@@ -83,9 +83,9 @@ def test_gives_her_a_gooses_resonances_and_drops_the_chest_tones() -> None:
         before = band_power(speech, low / ratio, high / ratio)
         return float(10 * np.log10(band_power(out, low, high) / before))
 
-    assert gain_db(1350) > gain_db(2900) + 6  # honky: the windpipe's ring, over the dip
-    assert gain_db(4000) > gain_db(2900) + 3  # brassy: the second peak
-    assert gain_db(1350) > gain_db(200) + 8  # and no deep chest tones
+    assert gain_db(1350) > gain_db(2900) + 3  # a gentler windpipe ring, over the dip
+    assert gain_db(4000) > gain_db(2900) + 0.5  # a gentler brassy edge
+    assert gain_db(1350) > gain_db(200) + 6  # and less emphasis on deep chest tones
 
 
 @pytest.mark.parametrize("strength", [0.3, 0.7, 1.0])
@@ -138,15 +138,15 @@ class TestRasp:
     def test_follows_the_pitch_of_her_voice(self, period: int) -> None:
         voice = self.voice(period)
         assert self.alternation(voice, period, 0.3, 1.0) < 0.001  # none to begin with
-        assert self.alternation(Rasp(RATE, 1.0).process(voice), period, 0.3, 1.0) > 0.12
+        assert self.alternation(Rasp(RATE, 1.0).process(voice), period, 0.3, 1.0) > 0.08
 
     def test_is_strongest_as_she_starts_a_phrase(self) -> None:
         phrase = np.concatenate((np.zeros(50 * 100), self.voice(100, 1.6)))
         out = Rasp(RATE, 0.7).process(phrase)
         starting = self.alternation(out, 100, 0.24, 0.32)  # her first 100 ms
         later = self.alternation(out, 100, 0.55, 1.8)  # a whole sway of the steady rasp
-        assert starting > 0.3
-        assert 0.08 < later < starting / 2
+        assert starting > 0.18
+        assert 0.05 < later < starting / 2
 
     def test_scales_with_strength_down_to_nothing(self) -> None:
         voice = self.voice(100)

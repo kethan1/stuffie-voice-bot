@@ -263,7 +263,7 @@ All settings are in `/etc/lucy/config.toml` (documented inline).
 | More or fewer honks | `turn.opening_honk_chance` (0 to 1): how often she starts a reply with a honk of her own. The prompt asks for honks in most answers too |
 | Louder or softer chimes | `session.earcon_volume` (1 is a little louder than her voice) |
 | Children may not change her volume, or not as much | `volume.commands = false`; or a smaller range with `volume.max_db` and `volume.min_db` |
-| Louder or softer as usual | `volume.speaker_db`: the speaker's own volume (dB, as `alsamixer` shows) at her usual loudness. Lucy sets it each time she opens her speaker, so changes made in `alsamixer` do not last. "Louder" raises it up to `volume.speaker_max_db`, then adds software gain on top |
+| Louder or softer as usual | `volume.speaker_db`: the speaker's own volume (dB, as `alsamixer` shows) at her usual loudness. Lucy sets it each time she opens her speaker, so changes made in `alsamixer` do not last. "Louder" raises it up to `volume.speaker_max_db`; volume commands do not amplify audio in software. A card without a mixer cannot change volume this way |
 | Longer or shorter answers | A `system_prompt_file` with a different length rule (the built-in prompt asks for at most 40 words) |
 | Faster first word from the on-device voice | `turn.first_clause_min_words = 4` (the first sentence may be split at a comma, which sounds less natural); a `-low` Piper voice |
 | Longer battery life | Shorter `session.awake_s`; `power.standby_governor = "powersave"` |

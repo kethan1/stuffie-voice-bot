@@ -398,47 +398,52 @@ def speaker_with_mixer(
     )
 
 
-async def test_louder_turns_up_the_speaker_first_then_software(
+async def test_louder_changes_only_the_system_mixer(
     sounddevice: types.SimpleNamespace, mixers: list[FakeMixer]
 ) -> None:
     speaker = speaker_with_mixer(sounddevice, mixers)
-    assert db_below(await peak_of(speaker, sounddevice)) == -3.0  # room for 3 dB on top
-    assert mixers[0].card == "UACDemoV10"
-    assert mixers[0].levels == [-9.0]  # her usual loudness, set as the speaker opened
+    try:
+        original_peak = await peak_of(speaker, sounddevice)
+        assert mixers[0].card == "UACDemoV10"
+        assert mixers[0].levels == [-9.0]  # her usual loudness, set as the speaker opened
 
-    speaker.set_volume(6.0)  # all of it from the speaker's own volume
-    assert db_below(await peak_of(speaker, sounddevice)) == -3.0
-    assert mixers[0].levels[-1] == -3.0
+        speaker.set_volume(6.0)  # all of it from the speaker's own volume
+        assert await peak_of(speaker, sounddevice) == original_peak
+        assert mixers[0].levels[-1] == -3.0
 
-    speaker.set_volume(9.0)  # the speaker is at its ceiling: the last 3 dB in software
-    assert await peak_of(speaker, sounddevice) == LOUD  # full scale, nothing rounded off
-    assert mixers[0].levels[-1] == -3.0
+        speaker.set_volume(9.0)  # at the system mixer ceiling; no software increase
+        assert await peak_of(speaker, sounddevice) == original_peak
+        assert mixers[0].levels[-1] == -3.0
 
-    speaker.set_volume(-15.0)  # quieter: the speaker's own volume goes down
-    assert db_below(await peak_of(speaker, sounddevice)) == -3.0
-    assert mixers[0].levels[-1] == -24.0
-    await speaker.close()
+        speaker.set_volume(-15.0)  # quieter: the speaker's own volume goes down
+        assert await peak_of(speaker, sounddevice) == original_peak
+        assert mixers[0].levels[-1] == -24.0
+    finally:
+        await speaker.close()
 
 
-async def test_software_makes_up_what_the_card_cannot_do(
+async def test_system_mixer_stops_at_its_limit_without_software_gain(
     sounddevice: types.SimpleNamespace, mixers: list[FakeMixer]
 ) -> None:
     speaker = speaker_with_mixer(sounddevice, mixers, low=-12.0)
     speaker.set_volume(-15.0)  # the card stops at -12 dB: the other 12 dB in software
     await peak_of(speaker, sounddevice)
     assert mixers[0].levels[-1] == -12.0
-    assert db_below(await peak_of(speaker, sounddevice)) == -15.0
+    peak = await peak_of(speaker, sounddevice)
+    speaker.set_volume(9.0)
+    assert await peak_of(speaker, sounddevice) == peak
+    assert mixers[0].levels[-1] == -12.0
     await speaker.close()
 
 
-async def test_a_card_with_no_volume_of_its_own_uses_software_alone(
+async def test_a_card_with_no_volume_control_does_not_change_software_audio(
     sounddevice: types.SimpleNamespace, mixers: list[FakeMixer]
 ) -> None:
     speaker = speaker_with_mixer(sounddevice, mixers, high=None)  # an I2S amplifier
     await peak_of(speaker, sounddevice)
-    assert db_below(await peak_of(speaker, sounddevice)) == -9.0  # all of max_db in hand
+    original_peak = await peak_of(speaker, sounddevice)
     speaker.set_volume(9.0)
-    assert await peak_of(speaker, sounddevice) == LOUD
+    assert await peak_of(speaker, sounddevice) == original_peak
     await speaker.close()
 
 
@@ -446,9 +451,9 @@ async def test_the_speaker_mixer_can_be_turned_off(
     sounddevice: types.SimpleNamespace, mixers: list[FakeMixer]
 ) -> None:
     speaker = speaker_with_mixer(sounddevice, mixers, speaker_mixer=False)
-    assert db_below(await peak_of(speaker, sounddevice)) == -9.0
+    original_peak = await peak_of(speaker, sounddevice)
     speaker.set_volume(9.0)
-    assert await peak_of(speaker, sounddevice) == LOUD
+    assert await peak_of(speaker, sounddevice) == original_peak
     assert mixers == []
     await speaker.close()
 
